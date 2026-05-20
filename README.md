@@ -61,13 +61,23 @@ api gateway cli, openai codex relay switcher, 卡密兑换, 中转切换, 注入
 
 ## Install
 
+**一键 (curl)** ← 推荐, 不用 clone:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh | sh
+pip3 install --user requests websocket-client
+```
+
+**或从 clone 装:**
+
 ```bash
 git clone https://github.com/r266-tech/sub2cli
 cd sub2cli
 ./install.sh
-# 装 Python 依赖 (sub2cli 主体 / sub2cli-redeem 需要; sub2cli-inject 零依赖)
 pip3 install --user requests websocket-client
 ```
+
+3 个 binary 装到 `~/.local/bin/` (覆盖位置走 `SUB2CLI_INSTALL_DIR` env). `sub2cli-inject` 零依赖, 另俩需要 `requests` + `websocket-client`.
 
 启动:
 
