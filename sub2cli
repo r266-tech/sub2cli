@@ -23,11 +23,17 @@ import select
 import shutil
 import subprocess
 import sys
-import termios
 import time
-import tty
 import urllib.request
 from urllib.parse import urlparse
+
+if os.name == "nt":
+    import msvcrt
+    termios = None
+    tty = None
+else:
+    import termios
+    import tty
 
 try:
     import readline  # noqa: F401  启用 input() 的行编辑 (退格/CJK 宽度/Ctrl-U/方向键)
@@ -486,6 +492,8 @@ def read_input(prompt: str) -> str | None:
         first = input(prompt)
     except EOFError:
         return None
+    if os.name == "nt":
+        return first
     chunks = [first]
     deadline = time.time() + 0.2
     while True:
@@ -522,7 +530,7 @@ def ask_choice(prompt: str, n: int, default: int | None = None) -> int | None:
         print(color(f"  请输入 1..{n} 之间的整数", C_YELLOW))
 
 
-# ==================== TUI 菜单（基于 termios，参考 codex-provider-macos）====================
+# ==================== TUI 菜单（Unix termios / Windows msvcrt）====================
 
 def clear_screen() -> None:
     if not sys.stdout.isatty():
@@ -535,6 +543,22 @@ def read_key() -> str:
     """阻塞读一个键。返回: up / down / enter / quit / back / 或单字符串。"""
     if not sys.stdin.isatty():
         return "quit"
+    if os.name == "nt":
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            code = msvcrt.getwch()
+            if code in ("H", "K"):
+                return "up"
+            if code in ("P", "M"):
+                return "down"
+            return "back"
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch in ("q", "Q", "\x03"):
+            return "quit"
+        if ch in ("b", "B", "\x08"):
+            return "back"
+        return ""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -985,9 +1009,9 @@ def cmd_export(token: str, cfg: dict) -> None:
     print(color("shell 片段:", C_BOLD))
     for ln in snippet.splitlines():
         print(f"  {ln}")
-    # pbcopy
+    clipboard_cmd = ["clip.exe"] if os.name == "nt" else ["pbcopy"]
     try:
-        subprocess.run(["pbcopy"], input=snippet, text=True, check=True, timeout=3)
+        subprocess.run(clipboard_cmd, input=snippet, text=True, check=True, timeout=3)
         print(color("  ✓ 已复制到剪贴板", C_GREEN))
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         print(color("  (剪贴板复制失败，自己粘上方文本)", C_DIM))
@@ -998,12 +1022,13 @@ def _resolve_inject_bin() -> str | None:
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(here, "sub2cli-inject"),
+        os.path.join(here, "sub2cli-inject.cmd"),
         os.path.expanduser("~/.local/bin/sub2cli-inject"),
         os.path.expanduser("~/.local/bin/codex-provider"),  # 兼容已装 codex-provider 的用户
         shutil.which("sub2cli-inject"),
         shutil.which("codex-provider"),
     ]
-    return next((p for p in candidates if p and os.path.isfile(p) and os.access(p, os.X_OK)), None)
+    return next((p for p in candidates if p and os.path.isfile(p) and (os.name == "nt" or os.access(p, os.X_OK))), None)
 
 
 def _run_inject(inject_bin: str, url: str, api_key: str, source_label: str) -> None:
