@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.swp
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# 用户运行产物 (永不进 repo)
+*.env
+*.env.*
+*.bak
+*.backup
+config.json
+*.token
+.codex/
+auth.json
+auth.*.json
+state.jsonl
+redeem.jsonl
+
+# 误粘贴 / 敏感凭据 / 防呆
+secrets/
+credentials/
+*.key
+*.pem
+*.pfx

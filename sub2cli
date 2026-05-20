@@ -1,0 +1,1512 @@
+#!/usr/bin/env python3
+"""sub2cli — Sub2API 系列网关订阅 → Codex CLI 注入控制台。
+
+把任意 Sub2API 兼容网关 (codex2api.com / 其他自部署实例 等) 里的 key+url，
+一条命令注入到本机 Codex CLI / Codex App 用。
+
+用法:
+    sub2cli                # 进入 REPL
+    sub2cli --help
+
+REPL 菜单:
+    刷新 / 中转 / url / 分组 / 名称 / 兑换历史 / 注入 codex /
+    粘 hex 兑换码 兑换 / 退出
+
+鉴权: 从 Edge CDP (127.0.0.1:9222) 实时读 localStorage.auth_token；
+      也支持 SUB2CLI_TOKEN 环境变量覆盖。
+"""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+import urllib.request
+from urllib.parse import urlparse
+
+try:
+    import readline  # noqa: F401  启用 input() 的行编辑 (退格/CJK 宽度/Ctrl-U/方向键)
+except ImportError:
+    pass
+
+import requests
+
+# ---- 加载 sub2cli-redeem 作为 lib ----
+_BIN_DIR = os.path.dirname(os.path.realpath(__file__))
+_lib_path = os.path.join(_BIN_DIR, "sub2cli-redeem")
+_loader = importlib.machinery.SourceFileLoader("sub2cli_lib", _lib_path)
+_spec = importlib.util.spec_from_loader("sub2cli_lib", _loader)
+c2a = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+_loader.exec_module(c2a)
+
+# ---- 路径 ----
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "sub2cli",
+)
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+# ---- 全局变量（被 apply_domain 改写）----
+DOMAIN = f"https://{c2a.SITE}"
+API_BASE = f"https://{c2a.SITE}/api/v1"
+
+# ---- ANSI 颜色 ----
+C_RESET = "\033[0m"
+C_DIM = "\033[2m"
+C_BOLD = "\033[1m"
+C_GREEN = "\033[32m"
+C_RED = "\033[31m"
+C_YELLOW = "\033[33m"
+C_CYAN = "\033[36m"
+C_BLUE = "\033[34m"
+C_MAGENTA = "\033[35m"
+
+
+def color(s: str, c: str) -> str:
+    if not sys.stdout.isatty():
+        return s
+    return f"{c}{s}{C_RESET}"
+
+
+# ==================== 配置 ====================
+
+RELAY_FIELDS = (
+    "default_key_id",
+    "default_key_name",
+    "default_endpoint_name",
+    "default_endpoint_url",
+)
+
+
+def load_config() -> dict | None:
+    if not os.path.exists(CONFIG_PATH):
+        return None
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    # 迁移：旧版无 relays 字段 → 把当前 domain 的设置打包成第一个 relay
+    if "relays" not in cfg and cfg.get("domain"):
+        cfg["relays"] = {cfg["domain"]: {f: cfg.get(f) for f in RELAY_FIELDS}}
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    # 自动把当前 top-level default_* 同步进 relays[domain]
+    domain = cfg.get("domain", "")
+    if domain:
+        relays = cfg.setdefault("relays", {})
+        relays[domain] = {f: cfg.get(f) for f in RELAY_FIELDS}
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def apply_domain(domain: str) -> None:
+    """根据 domain 更新全局 + c2a lib 的 SITE/API。"""
+    global DOMAIN, API_BASE
+    host = urlparse(domain).hostname or domain.replace("https://", "").replace("http://", "").rstrip("/")
+    DOMAIN = f"https://{host}"
+    API_BASE = f"https://{host}/api/v1"
+    c2a.SITE = host
+    c2a.API = f"https://{host}/api/v1/redeem"
+
+
+# ==================== API 调用 ====================
+
+def _auth_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def fetch_user(token: str) -> dict | None:
+    try:
+        r = requests.get(f"{API_BASE}/auth/me", headers=_auth_headers(token), timeout=8)
+        if r.status_code == 200:
+            return r.json().get("data", {})
+    except requests.RequestException:
+        pass
+    return None
+
+
+def fetch_keys(token: str) -> list[dict]:
+    try:
+        r = requests.get(f"{API_BASE}/keys", headers=_auth_headers(token), timeout=8)
+        if r.status_code == 200:
+            return (r.json().get("data") or {}).get("items", []) or []
+    except requests.RequestException:
+        pass
+    return []
+
+
+def fetch_settings(token: str) -> dict | None:
+    try:
+        r = requests.get(
+            f"{API_BASE}/settings/public", headers=_auth_headers(token), timeout=8
+        )
+        if r.status_code == 200:
+            return r.json().get("data", {})
+    except requests.RequestException:
+        pass
+    return None
+
+
+def fetch_groups(token: str) -> list[dict]:
+    try:
+        r = requests.get(
+            f"{API_BASE}/groups/available", headers=_auth_headers(token), timeout=10
+        )
+        if r.status_code == 200:
+            return r.json().get("data", []) or []
+    except requests.RequestException:
+        pass
+    return []
+
+
+def fetch_history(token: str, limit: int = 10) -> list[dict]:
+    try:
+        r = requests.get(
+            f"{API_BASE}/redeem/history", headers=_auth_headers(token), timeout=8
+        )
+        if r.status_code == 200:
+            return (r.json().get("data") or [])[:limit]
+    except requests.RequestException:
+        pass
+    return []
+
+
+def create_key(token: str, name: str = "sub2cli") -> dict | None:
+    """POST /api/v1/keys with {name}. Server auto-fills group_id/quota defaults."""
+    try:
+        r = requests.post(
+            f"{API_BASE}/keys",
+            headers={**_auth_headers(token), "Content-Type": "application/json"},
+            json={"name": name},
+            timeout=10,
+        )
+        if r.status_code in (200, 201):
+            body = r.json() if r.content else {}
+            return body.get("data") if isinstance(body, dict) else None
+    except requests.RequestException:
+        pass
+    return None
+
+
+def update_key_group(token: str, key_id: int, group_id: int) -> tuple[bool, str]:
+    """PUT /api/v1/keys/{id} with {group_id}. Returns (ok, detail)."""
+    try:
+        r = requests.put(
+            f"{API_BASE}/keys/{key_id}",
+            headers={**_auth_headers(token), "Content-Type": "application/json"},
+            json={"group_id": group_id},
+            timeout=10,
+        )
+        try:
+            body = r.json()
+        except ValueError:
+            body = {"raw": r.text[:200]}
+        if r.status_code == 200 and body.get("code") == 0:
+            return True, ""
+        return False, body.get("message") or body.get("detail") or f"HTTP {r.status_code}"
+    except requests.RequestException as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def test_chat(base_url: str, api_key: str, model: str = "gpt-5.5") -> dict:
+    """POST /v1/chat/completions, tiny. Returns probe-result dict."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "stream": False,
+    }
+    t0 = time.perf_counter()
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        dt = int((time.perf_counter() - t0) * 1000)
+        try:
+            body = r.json()
+        except ValueError:
+            body = {"raw": r.text[:200]}
+        if r.status_code == 200:
+            content = (
+                body.get("choices", [{}])[0].get("message", {}).get("content", "")
+            )
+            return {"ok": True, "status": 200, "latency_ms": dt, "summary": f"ok"}
+        det = body.get("error", {}).get("message") or body.get("message") or body.get("detail") or r.text[:80]
+        return {"ok": False, "status": r.status_code, "latency_ms": dt, "summary": str(det)[:100]}
+    except requests.RequestException as exc:
+        return {"ok": False, "status": -1, "latency_ms": int((time.perf_counter()-t0)*1000),
+                "summary": f"{type(exc).__name__}: {exc}"}
+
+
+def test_image(base_url: str, api_key: str, model: str = "gpt-image-2") -> dict:
+    """POST /v1/images/generations, tiny."""
+    url = base_url.rstrip("/") + "/images/generations"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {"model": model, "prompt": "ok", "n": 1, "size": "1024x1024"}
+    t0 = time.perf_counter()
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        dt = int((time.perf_counter() - t0) * 1000)
+        try:
+            body = r.json()
+        except ValueError:
+            body = {"raw": r.text[:200]}
+        if r.status_code == 200 and (body.get("data") or body.get("created")):
+            return {"ok": True, "status": 200, "latency_ms": dt, "summary": "ok"}
+        det = body.get("error", {}).get("message") or body.get("message") or body.get("detail") or r.text[:80]
+        return {"ok": False, "status": r.status_code, "latency_ms": dt, "summary": str(det)[:120]}
+    except requests.RequestException as exc:
+        return {"ok": False, "status": -1, "latency_ms": int((time.perf_counter()-t0)*1000),
+                "summary": f"{type(exc).__name__}: {exc}"}
+
+
+def probe_endpoint(base_url: str, api_key: str | None = None) -> dict:
+    """探测 OpenAI 兼容端点 /models。200=通+有 key，401=可达需鉴权，其他=有问题。"""
+    url = base_url.rstrip("/") + "/models"
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    t0 = time.perf_counter()
+    try:
+        r = requests.get(url, headers=headers, timeout=8)
+        dt = int((time.perf_counter() - t0) * 1000)
+        if r.status_code == 200:
+            try:
+                n = len(r.json().get("data", []))
+            except ValueError:
+                n = "?"
+            return {"status": 200, "latency_ms": dt, "ok": True, "summary": f"{n} 个模型"}
+        if r.status_code == 401:
+            return {"status": 401, "latency_ms": dt, "ok": True, "summary": "可达（需鉴权）"}
+        return {"status": r.status_code, "latency_ms": dt, "ok": False, "summary": r.text[:60]}
+    except requests.RequestException as exc:
+        dt = int((time.perf_counter() - t0) * 1000)
+        return {
+            "status": -1, "latency_ms": dt, "ok": False,
+            "summary": f"{type(exc).__name__}: {str(exc)[:60]}",
+        }
+
+
+# ==================== 工具 ====================
+
+def mask_key(k: str) -> str:
+    if not k:
+        return "?"
+    if len(k) <= 12:
+        return k
+    return f"{k[:8]}...{k[-4:]}"
+
+
+def find_key_by_name(keys: list[dict], name: str) -> dict | None:
+    for k in keys:
+        if k.get("name") == name:
+            return k
+    return None
+
+
+def find_key_by_id(keys: list[dict], kid) -> dict | None:
+    for k in keys:
+        if k.get("id") == kid:
+            return k
+    return None
+
+
+def find_endpoint(endpoints: list[dict], name: str) -> dict | None:
+    for e in endpoints:
+        if e.get("name") == name:
+            return e
+    return None
+
+
+def normalize_v1(url: str) -> str:
+    """与 web UI 一致：先剥掉尾部 /v1 和斜杠，再统一补上 /v1。"""
+    if not url:
+        return url
+    s = url.rstrip("/")
+    if s.endswith("/v1"):
+        s = s[:-3].rstrip("/")
+    return s + "/v1"
+
+
+def collect_endpoints(settings: dict) -> list[dict]:
+    eps: list[dict] = []
+    base = settings.get("api_base_url") or ""
+    if base:
+        eps.append({
+            "name": "默认", "endpoint": normalize_v1(base), "description": "默认线路"
+        })
+    for c in settings.get("custom_endpoints") or []:
+        eps.append({
+            "name": c.get("name", "?"),
+            "endpoint": normalize_v1(c.get("endpoint", "")),
+            "description": c.get("description", ""),
+        })
+    if not eps:
+        # 中转 /settings/public 没给 url 时, 退到域名本身 (e.g. https://relay.example.com/v1)
+        host = getattr(c2a, "SITE", "") or ""
+        if host:
+            eps.append({
+                "name": "默认",
+                "endpoint": normalize_v1(f"https://{host}"),
+                "description": "域名 fallback",
+            })
+    return eps
+
+
+def auto_pick_key(keys: list[dict]) -> dict | None:
+    """直接取第一个；无 key 时返回 None（调用方负责自动创建）。"""
+    return keys[0] if keys else None
+
+
+def auto_pick_endpoint(eps: list[dict]) -> dict | None:
+    """探所有端点，选延迟最低的 OK 那个；都失败则返第一个；无端点返回 None。"""
+    if not eps:
+        return None
+    if len(eps) == 1:
+        return eps[0]
+    best = None
+    best_lat = float("inf")
+    for ep in eps:
+        r = probe_endpoint(ep.get("endpoint", ""))
+        if r["ok"] and r["latency_ms"] < best_lat:
+            best_lat = r["latency_ms"]
+            best = ep
+    return best or eps[0]
+
+
+def ensure_defaults(cfg: dict, token: str, *, verbose: bool = False) -> tuple[dict, dict | None, dict | None]:
+    """读 keys/endpoints；若 cfg 里的默认值缺失/失效，自动填一个并 save。
+    keys 为空时自动建一个名为 sub2cli 的 key。
+    返回 (cfg, default_key dict | None, default_ep dict | None)。"""
+    keys = fetch_keys(token)
+    if not keys:
+        if verbose:
+            print(color("  · 该中转尚未创建任何 key，自动建一个 sub2cli …", C_DIM))
+        new_key = create_key(token, name="sub2cli")
+        if new_key:
+            if verbose:
+                print(color(f"    ✓ 已创建 key: {new_key.get('name')} (id={new_key.get('id')})", C_GREEN))
+            keys = fetch_keys(token)
+        else:
+            if verbose:
+                print(color("    ✗ 自动创建 key 失败 (POST /keys 没成功)", C_YELLOW))
+
+    settings = fetch_settings(token) or {}
+    eps = collect_endpoints(settings)
+
+    dk_name = cfg.get("default_key_name", "")
+    default_key = find_key_by_name(keys, dk_name) if dk_name else None
+    if not default_key:
+        default_key = auto_pick_key(keys)
+        if default_key:
+            cfg["default_key_id"] = default_key.get("id")
+            cfg["default_key_name"] = default_key.get("name")
+            if verbose:
+                print(color(f"  · 自动选默认 key: {default_key.get('name')}", C_DIM))
+
+    de_name = cfg.get("default_endpoint_name", "")
+    default_ep = find_endpoint(eps, de_name) if de_name else None
+    if not default_ep:
+        default_ep = auto_pick_endpoint(eps)
+        if default_ep:
+            cfg["default_endpoint_name"] = default_ep.get("name")
+            cfg["default_endpoint_url"] = default_ep.get("endpoint")
+            if verbose:
+                print(color(
+                    f"  · 自动选默认线路: {default_ep.get('name')} "
+                    f"({default_ep.get('endpoint')})", C_DIM))
+
+    save_config(cfg)
+    return cfg, default_key, default_ep
+
+
+def parse_codes(text: str) -> list[str]:
+    found = re.findall(r"\b[a-fA-F0-9]{16,}\b", text)
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in found:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def read_input(prompt: str) -> str | None:
+    """读一行，再 200ms 内 drain 任何粘进来的后续行。EOF 返回 None。"""
+    try:
+        first = input(prompt)
+    except EOFError:
+        return None
+    chunks = [first]
+    deadline = time.time() + 0.2
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        r, _, _ = select.select([sys.stdin], [], [], remaining)
+        if not r:
+            break
+        line = sys.stdin.readline()
+        if not line:
+            break
+        chunks.append(line.rstrip("\n"))
+        deadline = time.time() + 0.1
+    return "\n".join(chunks)
+
+
+def ask_choice(prompt: str, n: int, default: int | None = None) -> int | None:
+    """让用户从 1..n 里选一个；回车=default；空回车且无 default 返回 None。"""
+    hint = f" [{default}]" if default else ""
+    while True:
+        try:
+            raw = input(f"{prompt}{hint}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not raw:
+            return default
+        try:
+            v = int(raw)
+            if 1 <= v <= n:
+                return v
+        except ValueError:
+            pass
+        print(color(f"  请输入 1..{n} 之间的整数", C_YELLOW))
+
+
+# ==================== TUI 菜单（基于 termios，参考 codex-provider-macos）====================
+
+def clear_screen() -> None:
+    if not sys.stdout.isatty():
+        return
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+def read_key() -> str:
+    """阻塞读一个键。返回: up / down / enter / quit / back / 或单字符串。"""
+    if not sys.stdin.isatty():
+        return "quit"
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = os.read(fd, 1)
+        if ch == b"\x1b":
+            key = ch
+            while select.select([sys.stdin], [], [], 0.02)[0]:
+                key += os.read(fd, 1)
+            if key in (b"\x1b[A", b"\x1b[D"):
+                return "up"
+            if key in (b"\x1b[B", b"\x1b[C"):
+                return "down"
+            return "back"
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch in (b"q", b"Q", b"\x03"):
+            return "quit"
+        if ch in (b"b", b"B", b"\x7f"):
+            return "back"
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return ""
+
+
+def pause(msg: str = "按任意键返回") -> None:
+    print(color(f"\n  {msg}…", C_DIM), end="", flush=True)
+    read_key()
+    print()
+
+
+def select_menu(
+    options: list[tuple[str, str]],
+    *,
+    banner_fn=None,
+    title: str | None = None,
+    subtitle: str | None = None,
+    initial: int = 0,
+) -> str:
+    """箭头上下选菜单。options=[(label, value)]，返回 value 或 'quit'。"""
+    if not options:
+        return "quit"
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        # 非交互场景退化为数字输入
+        if banner_fn:
+            banner_fn()
+        if title:
+            print(title)
+        for idx, (label, _) in enumerate(options, 1):
+            print(f"  {idx}. {label}")
+        try:
+            raw = input("> ").strip()
+            return options[int(raw) - 1][1]
+        except (EOFError, ValueError, IndexError, KeyboardInterrupt):
+            return "quit"
+
+    selected = max(0, min(initial, len(options) - 1))
+    while True:
+        clear_screen()
+        if banner_fn:
+            banner_fn()
+        if title:
+            print(color(title, C_BOLD))
+        if subtitle:
+            print(color(subtitle, C_DIM))
+        if title or subtitle:
+            print()
+        for idx, (label, _) in enumerate(options):
+            marker = color("▶", C_CYAN) if idx == selected else " "
+            line_color = C_BOLD + C_CYAN if idx == selected else C_RESET
+            print(f"  {marker} {color(f'{idx + 1}. {label}', line_color)}")
+        key = read_key()
+        if key == "up":
+            selected = (selected - 1) % len(options)
+        elif key == "down":
+            selected = (selected + 1) % len(options)
+        elif key == "enter":
+            return options[selected][1]
+        elif key == "quit":
+            return "quit"
+
+
+# ==================== 显示 ====================
+
+def print_banner(cfg: dict, user: dict, default_key: dict | None, default_ep: dict | None) -> None:
+    host = urlparse(cfg["domain"]).hostname or "?"
+    print(color("sub2cli", C_BOLD + C_CYAN) + color(f" — {host} 控制台", C_DIM))
+    print(color("  域名:    ", C_DIM) + cfg["domain"])
+    email = user.get("email", "?")
+    status = user.get("status", "?")
+    print(color("  账号:    ", C_DIM) + f"{email}  ·  状态: {color(status, C_GREEN if status=='active' else C_YELLOW)}")
+    bal = user.get("balance")
+    bal_s = f"${bal:.4f}" if isinstance(bal, (int, float)) else "?"
+    conc = user.get("concurrency", "?")
+    print(
+        color("  余额:    ", C_DIM) + color(bal_s, C_GREEN)
+        + color("   并发: ", C_DIM) + color(str(conc), C_GREEN)
+    )
+    if default_key:
+        g = default_key.get("group") or {}
+        gname = g.get("name", "?")
+        rate = g.get("rate_multiplier")
+        rate_s = f"{rate}x" if rate is not None else "?"
+        print(
+            color("  名称:    ", C_DIM) + color(default_key.get("name", "?"), C_CYAN)
+            + color(f"  ·  分组 {gname} ({rate_s})", C_DIM)
+        )
+        print(color("  apikey:  ", C_DIM) + default_key.get("key", ""))
+        if default_ep:
+            ep_name = default_ep.get("name", "?")
+            ep_suffix = f"  ({ep_name})" if ep_name and ep_name != "默认" else ""
+            print(
+                color("  url:     ", C_DIM)
+                + default_ep.get("endpoint", "?")
+                + color(ep_suffix, C_DIM)
+            )
+    else:
+        print(color("  默认:    ", C_DIM) + color("(未配置，运行 setup)", C_YELLOW))
+    print()
+
+
+def cmd_help() -> None:
+    print(color("命令", C_BOLD))
+    rows = [
+        ("(粘 hex 兑换码)", "兑换（1 顺序 / 2+ AIMD 并行）"),
+        ("ep / endpoints / ping", "端点连通性测试 + 可选设默认"),
+        ("g / groups", "分组列表 + 可用性测试"),
+        ("key [name]", "切换默认 key（不带参数则菜单选）"),
+        ("export", "导出当前默认的 shell env 片段（自动 pbcopy）"),
+        ("b / balance", "刷新余额、并发"),
+        ("h / hist / history", "最近兑换历史"),
+        ("reveal", "完整显示默认 apikey（默认掩码）"),
+        ("setup", "重跑首次配置向导"),
+        ("? / help", "本帮助"),
+        ("q / quit / exit", "退出（Ctrl-D 同效）"),
+    ]
+    for cmd, desc in rows:
+        print(f"  {color(cmd, C_CYAN):<28} {desc}")
+    print()
+
+
+def print_history(rows: list[dict]) -> None:
+    if not rows:
+        print(color("  （无）", C_DIM))
+        return
+    for r in rows:
+        ts = (r.get("used_at") or "")[:19].replace("T", " ")
+        t = r.get("type") or "?"
+        v = r.get("value")
+        code = (r.get("code") or "")[:10] + "…"
+        if t == "balance":
+            v_s = f"+${v:.2f}" if isinstance(v, (int, float)) else "?"
+        elif t == "concurrency":
+            v_s = f"+{v} 请求" if v is not None else "?"
+        elif t == "subscription":
+            v_s = f"订阅 {r.get('validity_days')}天"
+        else:
+            v_s = str(v)
+        print(f"  {color(ts, C_DIM)}  {color(t, C_BLUE):<14}  {v_s:<14}  {color(code, C_DIM)}")
+
+
+def print_record(rec: dict) -> None:
+    short = rec["code"][:10] + "…"
+    if rec["status"] == 200:
+        bits = []
+        t, v = rec.get("type"), rec.get("value")
+        if t == "balance" and v is not None:
+            bits.append(color(f"+${v:.2f}", C_GREEN))
+        elif t == "concurrency" and v is not None:
+            bits.append(color(f"+{v} 请求", C_GREEN))
+        elif t == "subscription":
+            bits.append(color(f"订阅 {rec.get('validity_days')}天", C_GREEN))
+        if (nb := rec.get("new_balance")) is not None:
+            bits.append(color(f"余额=${nb:.2f}", C_DIM))
+        if (nc := rec.get("new_concurrency")) is not None:
+            bits.append(color(f"并发={nc}", C_DIM))
+        bits.append(color(f"{rec['latency_ms']}ms", C_DIM))
+        print(f"  {color('OK ', C_GREEN)} [{short}]  " + "  ".join(bits))
+    else:
+        det = rec.get("detail") or "(无详情)"
+        print(
+            f"  {color('ERR', C_RED)} [{short}] HTTP {rec['status']}: "
+            f"{det[:80]}  {color(str(rec['latency_ms'])+'ms', C_DIM)}"
+        )
+
+
+# ==================== 命令 ====================
+
+def cmd_endpoints(token: str, cfg: dict) -> dict:
+    settings = fetch_settings(token)
+    if not settings:
+        print(color("  （无法读 settings/public）", C_RED))
+        return cfg
+    eps = collect_endpoints(settings)
+    if not eps:
+        print(color("  （无端点配置）", C_YELLOW))
+        return cfg
+    keys = fetch_keys(token)
+    sample_key = next((k.get("key") for k in keys if k.get("status") == "active"), None)
+    cur_name = cfg.get("default_endpoint_name")
+
+    print(color(f"可用端点 (n={len(eps)}):", C_BOLD))
+    results: list[dict] = []
+    for i, ep in enumerate(eps, 1):
+        name = ep.get("name", "?")
+        url = ep.get("endpoint", "")
+        desc = ep.get("description", "")
+        cur = color(" ★当前", C_GREEN) if name == cur_name else ""
+        r = probe_endpoint(url)
+        r2 = probe_endpoint(url, api_key=sample_key) if sample_key else None
+        results.append({"ep": ep, "noauth": r, "auth": r2})
+        tag = color("OK ", C_GREEN) if r["ok"] else color("ERR", C_RED)
+        line = (f"  [{i}] {tag} {color(name, C_CYAN):<14} {color(url, C_DIM)}"
+                f"  {r['latency_ms']}ms{cur}")
+        print(line)
+        if desc:
+            print(color(f"        {desc}", C_DIM))
+        if r2:
+            tag2 = color("OK ", C_GREEN) if r2["ok"] else color("ERR", C_RED)
+            print(f"        {tag2} 带 auth  {r2['latency_ms']}ms  {color(r2['summary'], C_DIM)}")
+
+    auto_idx = len(eps) + 1
+    print(f"  [{auto_idx}] {color('自动选择 (最快的可用端点)', C_CYAN)}")
+
+    pick = ask_choice("\n选择并测试（回车跳过）", auto_idx, default=None)
+    if pick is None:
+        return cfg
+
+    if pick == auto_idx:
+        ok_results = [r for r in results if r["noauth"]["ok"]]
+        if not ok_results:
+            print(color("  没有可达的端点", C_RED))
+            return cfg
+        best = min(ok_results, key=lambda r: r["noauth"]["latency_ms"])
+        chosen = best["ep"]
+        print(color(
+            f"  自动选: {chosen.get('name')} "
+            f"({best['noauth']['latency_ms']}ms)", C_GREEN))
+    else:
+        chosen = eps[pick - 1]
+
+    cfg["default_endpoint_name"] = chosen.get("name")
+    cfg["default_endpoint_url"] = chosen.get("endpoint")
+    save_config(cfg)
+    print(color(f"  ✓ 默认端点 → {chosen.get('name')}  ({chosen.get('endpoint')})", C_GREEN))
+    print()
+    return cfg
+
+
+def _fmt_test_cell(r: dict | None, width: int = 14) -> str:
+    """格式化单个测试结果为表格单元。"""
+    if r is None:
+        return color(f"{'—':<{width}}", C_DIM)
+    if r.get("running"):
+        return color(f"{'⏳ 测试中…':<{width-2}}", C_YELLOW)
+    if r.get("ok"):
+        s = f"✓ {r['latency_ms']}ms"
+        return color(f"{s:<{width}}", C_GREEN)
+    s = f"✗ {r.get('status','?')}"
+    return color(f"{s:<{width}}", C_RED)
+
+
+def cmd_groups(token: str, cfg: dict) -> dict:
+    """列分组 → 选 (含「自动选择」) → 切默认 key 到该分组 → 跑 gpt-5.5 + gpt-image-2，
+    表格行动态刷新。自动模式按倍率低到高跑，找到两个都通的就停。"""
+    groups = fetch_groups(token)
+    if not groups:
+        print(color("  （无可用分组）", C_YELLOW))
+        return cfg
+    keys = fetch_keys(token)
+    keys_by_group: dict[int, list[dict]] = {}
+    for k in keys:
+        gid = k.get("group_id")
+        if gid is not None:
+            keys_by_group.setdefault(gid, []).append(k)
+
+    ep_url = cfg.get("default_endpoint_url") or f"https://{c2a.SITE}/v1"
+    default_key_name = cfg.get("default_key_name", "")
+    default_key = find_key_by_name(keys, default_key_name)
+    if not default_key:
+        print(color("  未设置默认 key — 无法测试。先去『名称』设一个。", C_YELLOW))
+        return cfg
+
+    # 倍率从低到高（None 视为最大）
+    sorted_groups = sorted(
+        groups, key=lambda x: x.get("rate_multiplier") or 99999
+    )
+    results: dict[int, dict] = {}  # gid → {chat, image}
+    in_progress_gid: int | None = None
+
+    def render() -> None:
+        clear_screen()
+        # 简化版 banner（多次 render 时不想太占空间）
+        print(color("分组测试", C_BOLD + C_CYAN))
+        print(color(f"  端点: {ep_url}  ·  默认 key: {default_key_name}", C_DIM))
+        print()
+        print(color(
+            "   #  倍率   分组                              gpt-5.5         image",
+            C_DIM,
+        ))
+        for i, g in enumerate(sorted_groups, 1):
+            gid = g.get("id")
+            name = (g.get("name") or "?")[:30]
+            rate = g.get("rate_multiplier")
+            rate_s = f"{rate}x" if rate is not None else "?"
+            r = results.get(gid)
+            chat_cell = _fmt_test_cell(r.get("chat") if r else None)
+            img_cell = _fmt_test_cell(r.get("image") if r else None)
+            star = ""
+            for k in keys_by_group.get(gid, []):
+                if k.get("name") == default_key_name:
+                    star = color(" ★", C_GREEN)
+                    break
+            arrow = color(" ◀ 测试中", C_YELLOW) if gid == in_progress_gid else ""
+            print(
+                f"  [{i:>2}] {rate_s:>5}  {name:<30}{star}  "
+                f"{chat_cell}  {img_cell}{arrow}"
+            )
+        auto_idx = len(sorted_groups) + 1
+        print(f"  [{auto_idx:>2}] {color('自动选择 (倍率低→高，两个都通就停)', C_CYAN)}")
+        print(color("\n  ★ = 默认 key 当前所在分组", C_DIM))
+
+    render()
+    auto_idx = len(sorted_groups) + 1
+    pick = ask_choice("\n选择并测试（回车跳过）", auto_idx, default=None)
+    if pick is None:
+        return cfg
+
+    auto_mode = (pick == auto_idx)
+    targets = sorted_groups if auto_mode else [sorted_groups[pick - 1]]
+
+    final_chosen = None
+    for g in targets:
+        gid = g.get("id")
+        gname = g.get("name", "?")
+        # 切分组（如果 default_key 不在 target）
+        cur_gid = default_key.get("group_id")
+        if cur_gid != gid:
+            in_progress_gid = gid
+            results[gid] = {"chat": {"running": True}, "image": {"running": True}}
+            render()
+            ok, err = update_key_group(token, default_key["id"], gid)
+            if not ok:
+                results[gid] = {
+                    "chat": {"ok": False, "status": "切换失败", "summary": err},
+                    "image": {"ok": False, "status": "切换失败", "summary": err},
+                }
+                render()
+                if not auto_mode:
+                    break
+                continue
+            # 刷新 key
+            keys = fetch_keys(token)
+            default_key = find_key_by_name(keys, default_key_name)
+            # 同步 keys_by_group
+            keys_by_group = {}
+            for k in keys:
+                kgid = k.get("group_id")
+                if kgid is not None:
+                    keys_by_group.setdefault(kgid, []).append(k)
+        in_progress_gid = gid
+        api_key = default_key.get("key", "")
+
+        # chat
+        results.setdefault(gid, {})
+        results[gid]["chat"] = {"running": True}
+        results[gid]["image"] = {"running": True}
+        render()
+        r_chat = test_chat(ep_url, api_key, model="gpt-5.5")
+        results[gid]["chat"] = r_chat
+        render()
+        # image
+        r_img = test_image(ep_url, api_key, model="gpt-image-2")
+        results[gid]["image"] = r_img
+        in_progress_gid = None
+        render()
+
+        if auto_mode and r_chat.get("ok") and r_img.get("ok"):
+            final_chosen = g
+            break
+
+    if auto_mode:
+        if final_chosen:
+            print(color(
+                f"\n  ✓ 自动选定: 「{final_chosen.get('name')}」 ({final_chosen.get('rate_multiplier')}x)"
+                f"  — 默认 key 现已在此分组",
+                C_GREEN,
+            ))
+        else:
+            print(color("\n  ✗ 没有一个分组两项测试都通过", C_RED))
+    else:
+        g = targets[0]
+        print(color(f"\n  默认 key 现在分组「{g.get('name')}」", C_DIM))
+    return cfg
+
+
+def cmd_key(token: str, cfg: dict, arg: str | None) -> dict:
+    """测试 + 选择分组（按 key 维度，因为 key↔分组 1:1）。"""
+    keys = fetch_keys(token)
+    if not keys:
+        print(color("  没有可用 key", C_YELLOW))
+        return cfg
+    if arg:
+        match = find_key_by_name(keys, arg)
+        if not match:
+            print(color(f"  未找到 key: {arg}", C_RED))
+            return cfg
+        cfg["default_key_name"] = match.get("name")
+        cfg["default_key_id"] = match.get("id")
+        save_config(cfg)
+        print(color(f"  ✓ 默认 key → {match['name']}", C_GREEN))
+        return cfg
+
+    ep_url = cfg.get("default_endpoint_url") or f"https://{c2a.SITE}/v1"
+    print(color(f"测试每把 key (GET {ep_url}/models):", C_BOLD))
+    cur_idx = 1
+    results: list[tuple[dict, dict]] = []
+    for i, k in enumerate(keys, 1):
+        g = k.get("group") or {}
+        gname = g.get("name", "?")
+        rate = g.get("rate_multiplier")
+        rate_s = f"{rate}x" if rate is not None else "?"
+        is_cur = k.get("name") == cfg.get("default_key_name")
+        if is_cur:
+            cur_idx = i
+        status = k.get("status", "?")
+        st_col = C_GREEN if status == "active" else C_YELLOW
+        # 探测
+        if status == "active":
+            r = probe_endpoint(ep_url, api_key=k.get("key"))
+            results.append((k, r))
+            if r["ok"] and r["status"] == 200:
+                probe_s = color(f"✓ {r['latency_ms']}ms · {r['summary']}", C_GREEN)
+            else:
+                probe_s = color(f"✗ HTTP {r['status']}", C_RED)
+        else:
+            results.append((k, {"ok": False}))
+            probe_s = color("(已停用)", C_DIM)
+        cur_mark = color(" ★当前", C_GREEN) if is_cur else ""
+        print(
+            f"  [{i}] {color(k.get('name','?'), C_CYAN):<14} "
+            f"{mask_key(k.get('key',''))}  "
+            f"分组: {gname} ({rate_s}){cur_mark}"
+        )
+        print(f"      {probe_s}")
+    pick = ask_choice("选择新默认", len(keys), default=cur_idx)
+    if pick is None:
+        print()
+        return cfg
+    k = keys[pick - 1]
+    cfg["default_key_name"] = k.get("name")
+    cfg["default_key_id"] = k.get("id")
+    save_config(cfg)
+    print(color(f"  ✓ 默认 → {k['name']}（分组 {(k.get('group') or {}).get('name','?')}）", C_GREEN))
+    print()
+    return cfg
+
+
+def cmd_export(token: str, cfg: dict) -> None:
+    keys = fetch_keys(token)
+    k = find_key_by_name(keys, cfg.get("default_key_name", "")) if cfg.get("default_key_name") else None
+    if not k:
+        print(color("  未设置默认 key，运行 'key' 命令选一个", C_YELLOW))
+        return
+    url = cfg.get("default_endpoint_url") or ""
+    api_key = k.get("key", "")
+    g = k.get("group") or {}
+    snippet = (
+        f"export OPENAI_API_KEY=\"{api_key}\"\n"
+        f"export OPENAI_BASE_URL=\"{url}\"\n"
+        f"# 来源: sub2cli · key={k.get('name')} · 分组 {g.get('name','?')} "
+        f"({g.get('rate_multiplier')}x) · 线路 {cfg.get('default_endpoint_name','?')}\n"
+    )
+    print(color("shell 片段:", C_BOLD))
+    for ln in snippet.splitlines():
+        print(f"  {ln}")
+    # pbcopy
+    try:
+        subprocess.run(["pbcopy"], input=snippet, text=True, check=True, timeout=3)
+        print(color("  ✓ 已复制到剪贴板", C_GREEN))
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        print(color("  (剪贴板复制失败，自己粘上方文本)", C_DIM))
+    print()
+
+
+def _resolve_inject_bin() -> str | None:
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "sub2cli-inject"),
+        os.path.expanduser("~/.local/bin/sub2cli-inject"),
+        os.path.expanduser("~/.local/bin/codex-provider"),  # 兼容已装 codex-provider 的用户
+        shutil.which("sub2cli-inject"),
+        shutil.which("codex-provider"),
+    ]
+    return next((p for p in candidates if p and os.path.isfile(p) and os.access(p, os.X_OK)), None)
+
+
+def _run_inject(inject_bin: str, url: str, api_key: str, source_label: str) -> None:
+    print(color("注入 codex:", C_BOLD))
+    print(f"  url:     {url}")
+    print(f"  apikey:  {api_key}")
+    print(f"  来源:    {source_label}")
+    print(color(f"  调用:    {inject_bin} add-api <url> <key>", C_DIM))
+    print()
+    try:
+        rc = subprocess.call([sys.executable, inject_bin, "add-api", url, api_key])
+    except OSError as exc:
+        print(color(f"  调用注入器失败: {exc}", C_RED))
+        return
+    if rc == 0:
+        print(color("  ✓ 注入完成", C_GREEN))
+    else:
+        print(color(f"  ✗ 注入器返回非零 (rc={rc})", C_RED))
+
+
+def cmd_inject_codex(token: str, cfg: dict) -> None:
+    """注入到 Codex CLI / Codex App: 用当前配置 或 临时输入新的 url+apikey."""
+    inject_bin = _resolve_inject_bin()
+    if not inject_bin:
+        here = os.path.dirname(os.path.abspath(__file__))
+        print(color("  缺少注入器脚本 sub2cli-inject (应跟 sub2cli 同目录):", C_RED))
+        print(color(f"    预期位置: {os.path.join(here, 'sub2cli-inject')}", C_DIM))
+        return
+
+    sub_options: list[tuple[str, str]] = [
+        ("使用当前配置", "current"),
+        ("使用新的 url + apikey", "new"),
+    ]
+
+    # 提前抓一次 keys, 把当前默认 key 的完整 apikey 拿出来显在 banner; 不在 banner_fn
+    # 里调 fetch_keys 是因为 select_menu 每次按键都会重渲染 banner.
+    cur_apikey = "(空)"
+    if cfg.get("default_key_name"):
+        _keys = fetch_keys(token)
+        _k = find_key_by_name(_keys, cfg["default_key_name"])
+        if _k and _k.get("key"):
+            cur_apikey = _k["key"]
+
+    def sub_banner() -> None:
+        print(color("注入 codex — 选择来源", C_BOLD + C_CYAN))
+        cur_url = cfg.get("default_endpoint_url") or "(空)"
+        print(color(f"  当前 url:    {cur_url}", C_DIM))
+        print(color(f"  当前 apikey: {cur_apikey}", C_DIM))
+        print()
+
+    pick = select_menu(sub_options, banner_fn=sub_banner, initial=0)
+    clear_screen()
+    if pick == "quit":
+        print(color("  已取消", C_DIM))
+        return
+
+    if pick == "current":
+        keys = fetch_keys(token)
+        k = find_key_by_name(keys, cfg.get("default_key_name", "")) if cfg.get("default_key_name") else None
+        if not k:
+            print(color("  未设置默认 key，先去 [名称] 选一个，或选 '使用新的 url + apikey'", C_YELLOW))
+            return
+        url = cfg.get("default_endpoint_url") or ""
+        api_key = k.get("key", "")
+        if not url or not api_key:
+            print(color("  缺少 url 或 api key", C_RED))
+            return
+        g = k.get("group") or {}
+        label = (
+            f"key={k.get('name')} · 分组 {g.get('name','?')} "
+            f"({g.get('rate_multiplier')}x) · 线路 {cfg.get('default_endpoint_name','?')}"
+        )
+        _run_inject(inject_bin, url, api_key, label)
+        return
+
+    # pick == "new"
+    print(color("输入新的 url 和 apikey (空回车取消):", C_BOLD))
+    try:
+        new_url = (read_input("  url   > ") or "").strip()
+    except KeyboardInterrupt:
+        print()
+        return
+    if not new_url:
+        print(color("  已取消", C_DIM))
+        return
+    if not re.match(r"^https?://", new_url):
+        new_url = "https://" + new_url
+    new_url = new_url.rstrip("/")
+    try:
+        new_key = (read_input("  apikey> ") or "").strip()
+    except KeyboardInterrupt:
+        print()
+        return
+    if not new_key:
+        print(color("  已取消", C_DIM))
+        return
+    _run_inject(inject_bin, new_url, new_key, "手动输入")
+
+
+def cmd_select_relay(state: dict) -> dict:
+    """列已保存中转 + 新建。切完自动 apply_domain、重新拿 token、补默认。"""
+    cfg = state["cfg"]
+    relays = cfg.setdefault("relays", {})
+    domain_list = list(relays.keys())
+    current = cfg.get("domain", "")
+
+    print(color("已保存的中转:", C_BOLD))
+    for i, d in enumerate(domain_list, 1):
+        r = relays.get(d, {})
+        mark = color(" ★当前", C_GREEN) if d == current else ""
+        print(
+            f"  [{i}] {color(d, C_CYAN)}  "
+            f"key={r.get('default_key_name','?')}  "
+            f"线路={r.get('default_endpoint_name','?')}{mark}"
+        )
+    add_idx = len(domain_list) + 1
+    print(f"  [{add_idx}] {color('+ 新建中转', C_GREEN)}")
+
+    default_pick = (domain_list.index(current) + 1) if current in domain_list else add_idx
+    pick = ask_choice("选择", add_idx, default=default_pick)
+    if pick is None:
+        return state
+
+    if pick == add_idx:
+        # 新建：仅问域名 + 验证 + 拿 token + 自动补默认
+        try:
+            raw = input("  新中转域名 (https://...): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return state
+        if not raw:
+            print(color("  已取消", C_DIM))
+            return state
+        if not re.match(r"^https?://", raw):
+            raw = "https://" + raw
+        raw = raw.rstrip("/")
+        # 临时切换 c2a SITE 来验证
+        old_site = c2a.SITE
+        apply_domain(raw)
+        try:
+            r = requests.get(f"{API_BASE}/settings/public", timeout=8)
+            if r.status_code != 200 or "data" not in r.json():
+                print(color(f"  ✗ {raw} 不像 Sub2API 实例 (HTTP {r.status_code})", C_RED))
+                apply_domain(f"https://{old_site}")
+                return state
+        except requests.RequestException as exc:
+            print(color(f"  ✗ 不可达: {exc}", C_RED))
+            apply_domain(f"https://{old_site}")
+            return state
+        print(color(f"  ✓ {raw} 正常", C_GREEN))
+        target_domain = raw
+        relays[target_domain] = {f: None for f in RELAY_FIELDS}
+    else:
+        target_domain = domain_list[pick - 1]
+        apply_domain(target_domain)
+
+    # 切换 cfg 到目标 relay
+    cfg["domain"] = target_domain
+    relay = relays.get(target_domain, {})
+    for f in RELAY_FIELDS:
+        cfg[f] = relay.get(f)
+
+    # 拿 token（可能需要在浏览器先登录新域名）
+    token = None
+    while not token:
+        try:
+            token = c2a.get_token()
+        except SystemExit as exc:
+            print(color(f"  ✗ {exc}", C_YELLOW))
+            print(color(
+                f"  请在 Edge 打开 {target_domain} 并登录，按回车重试 (Ctrl-C 取消)",
+                C_YELLOW))
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                # 回滚
+                apply_domain(state["cfg"]["domain"])
+                return state
+    state["token"] = token
+
+    user = fetch_user(token)
+    if not user:
+        print(color("  ✗ /auth/me 失败，token 可能无效", C_RED))
+        apply_domain(state["cfg"]["domain"])
+        return state
+    state["user"] = user
+
+    cfg, dk, de = ensure_defaults(cfg, token, verbose=True)
+    state["cfg"] = cfg
+    state["default_key"] = dk
+    state["default_ep"] = de
+    print(color(f"  ✓ 切到 {target_domain}", C_GREEN))
+    return state
+
+
+def cmd_reveal(token: str, cfg: dict) -> None:
+    keys = fetch_keys(token)
+    k = find_key_by_name(keys, cfg.get("default_key_name", "")) if cfg.get("default_key_name") else None
+    if not k:
+        print(color("  未设置默认 key", C_YELLOW))
+        return
+    print(f"  {color(k.get('name','?'), C_CYAN)}: {k.get('key','')}")
+
+
+def redeem_codes(token: str, codes: list[str], user: dict | None) -> dict | None:
+    done = c2a.load_done(c2a.DEFAULT_STATE)
+    pending = [c for c in codes if c not in done]
+    skipped = len(codes) - len(pending)
+    if skipped:
+        print(color(f"[去重] 已跳过 {skipped} 个之前已处理的码", C_YELLOW))
+    if not pending:
+        print(color("  没有可处理的码", C_DIM))
+        return user
+
+    import random as _r
+    _r.shuffle(pending)
+    n = len(pending)
+    print(color(f"[计划] {n} 个码  模式=随机顺序 1/s (不看返回)", C_DIM))
+
+    # 1 并发 / 1 秒 1 个 / 随机顺序 / 不看返回 / 不 requeue / 不 abort, 走一遍就完
+    for i, code in enumerate(pending):
+        rec = c2a.call_once(token, code)
+        rec["run_id"] = c2a._run_id
+        c2a.append_state(c2a.DEFAULT_STATE, rec)
+        print_record(rec)
+        if i < n - 1:
+            time.sleep(1.0)
+
+    fresh = fetch_user(token)
+    if fresh:
+        bal = fresh.get("balance")
+        conc = fresh.get("concurrency")
+        if bal is not None and conc is not None:
+            print(color(f"  → 余额: ${bal:.4f}   并发: {conc}", C_GREEN))
+    return fresh or user
+
+
+# ==================== Setup 向导 ====================
+
+def run_wizard() -> dict:
+    print(color("sub2cli — 首次启动配置", C_BOLD + C_CYAN))
+    print()
+
+    # 1. 域名
+    print(color("[1/5] 中转站域名", C_BOLD))
+    default_domain = "https://www.codex2api.com"
+    while True:
+        try:
+            raw = input(f"  输入域名 (默认 {default_domain}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+        raw = raw or default_domain
+        if not re.match(r"^https?://", raw):
+            raw = "https://" + raw
+        raw = raw.rstrip("/")
+        apply_domain(raw)
+        print(color(f"  正在验证 {API_BASE}/settings/public ...", C_DIM))
+        try:
+            r = requests.get(f"{API_BASE}/settings/public", timeout=8)
+            if r.status_code == 200 and "data" in r.json():
+                print(color(f"  ✓ {API_BASE} 正常", C_GREEN))
+                domain = raw
+                break
+            print(color(f"  ✗ HTTP {r.status_code}", C_RED))
+        except requests.RequestException as exc:
+            print(color(f"  ✗ 不可达: {exc}", C_RED))
+
+    # 2. 浏览器拿 token
+    print()
+    print(color("[2/5] 读取浏览器登录信息", C_BOLD))
+    print(color(f"  正在从 Edge CDP 读取 {urlparse(domain).hostname} 的 auth_token ...", C_DIM))
+    token = None
+    while not token:
+        try:
+            token = c2a.get_token()
+        except SystemExit as exc:
+            print(color(f"  ✗ {exc}", C_YELLOW))
+            print(color(
+                f"  请在 Edge 中打开 {domain} 并登录，然后按回车重试 (Ctrl-C 退出)", C_YELLOW))
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(0)
+    print(color(f"  ✓ 拿到 token ({len(token)} 字符)", C_GREEN))
+
+    # 3. 账号
+    print()
+    print(color("[3/5] 账号信息", C_BOLD))
+    user = fetch_user(token)
+    if not user:
+        print(color("  ✗ /auth/me 失败", C_RED))
+        sys.exit(1)
+    bal = user.get("balance", 0)
+    conc = user.get("concurrency", 0)
+    print(f"  邮箱: {color(user.get('email','?'), C_CYAN)}   "
+          f"余额: {color(f'${bal:.4f}', C_GREEN)}   并发: {color(str(conc), C_GREEN)}")
+
+    # 4. 选 key
+    print()
+    print(color("[4/5] 选择默认 API Key", C_BOLD))
+    keys = fetch_keys(token)
+    if not keys:
+        print(color("  该账号还没有任何 API key，自动创建 sub2cli …", C_DIM))
+        new_key = create_key(token, name="sub2cli")
+        if not new_key:
+            print(color("  ✗ POST /keys 失败，请在网页 UI 手动建一个再重跑", C_RED))
+            sys.exit(1)
+        print(color(f"  ✓ 已创建: {new_key.get('name')} (id={new_key.get('id')})", C_GREEN))
+        keys = fetch_keys(token)
+        if not keys:
+            print(color("  ✗ 创建后仍未读到 keys，请检查网页 UI", C_RED))
+            sys.exit(1)
+    for i, k in enumerate(keys, 1):
+        g = k.get("group") or {}
+        rate = g.get("rate_multiplier")
+        rate_s = f"{rate}x" if rate is not None else "?"
+        print(
+            f"  [{i}] {color(k.get('name','?'), C_CYAN):<14} "
+            f"{mask_key(k.get('key',''))}  "
+            f"分组: {g.get('name','?')} ({rate_s})"
+        )
+    pick = ask_choice("  选择默认", len(keys), default=1)
+    if pick is None:
+        sys.exit(0)
+    default_key = keys[pick - 1]
+
+    # 5. 选端点
+    print()
+    print(color("[5/5] 选择默认端点", C_BOLD))
+    settings = fetch_settings(token) or {}
+    eps = collect_endpoints(settings)
+    if not eps:
+        print(color("  ✗ 无端点配置", C_RED))
+        sys.exit(1)
+    for i, ep in enumerate(eps, 1):
+        print(
+            f"  [{i}] {color(ep.get('name','?'), C_CYAN):<14} "
+            f"{ep.get('endpoint','?')}  "
+            f"{color(ep.get('description',''), C_DIM)}"
+        )
+    pick = ask_choice("  选择默认", len(eps), default=1)
+    if pick is None:
+        sys.exit(0)
+    default_ep = eps[pick - 1]
+
+    cfg = {
+        "domain": domain,
+        "default_key_id": default_key.get("id"),
+        "default_key_name": default_key.get("name"),
+        "default_endpoint_name": default_ep.get("name"),
+        "default_endpoint_url": default_ep.get("endpoint"),
+    }
+    save_config(cfg)
+    print()
+    print(color(f"✓ 已保存到 {CONFIG_PATH}", C_GREEN))
+    print()
+    return cfg
+
+
+# ==================== 主循环 ====================
+
+def main() -> int:
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__.strip())
+        return 0
+
+    cfg = load_config()
+    if not cfg:
+        cfg = run_wizard()
+
+    apply_domain(cfg["domain"])
+
+    try:
+        token = c2a.get_token()
+    except SystemExit as exc:
+        print(color(str(exc), C_RED))
+        return 1
+
+    user = fetch_user(token)
+    if not user:
+        print(color("拉取账号信息失败，token 可能失效。请重新登录后再试。", C_RED))
+        return 1
+
+    cfg, default_key, default_ep = ensure_defaults(cfg, token, verbose=False)
+
+    # ==== TUI 菜单主循环 ====
+    state = {
+        "cfg": cfg, "token": token, "user": user,
+        "default_key": default_key, "default_ep": default_ep,
+    }
+
+    def banner_fn():
+        print_banner(state["cfg"], state["user"], state["default_key"], state["default_ep"])
+
+    def refresh_default_key():
+        ks = fetch_keys(state["token"])
+        state["default_key"] = find_key_by_name(ks, state["cfg"].get("default_key_name", ""))
+
+    def refresh_default_ep():
+        s = fetch_settings(state["token"]) or {}
+        eps = collect_endpoints(s)
+        state["default_ep"] = find_endpoint(eps, state["cfg"].get("default_endpoint_name", ""))
+
+    options: list[tuple[str, str]] = [
+        ("刷新", "refresh"),
+        ("中转", "relay"),
+        ("url", "ep"),
+        ("分组", "groups"),
+        ("名称", "key"),
+        ("兑换历史", "history"),
+        ("注入 codex", "inject"),
+        ("粘 hex 兑换码 兑换", "redeem"),
+        ("退出", "quit"),
+    ]
+    last_idx = 0
+
+    while True:
+        choice = select_menu(options, banner_fn=banner_fn, initial=last_idx)
+        if choice == "quit":
+            clear_screen()
+            print(color("bye", C_DIM))
+            return 0
+
+        last_idx = next((i for i, (_, v) in enumerate(options) if v == choice), 0)
+        clear_screen()
+        banner_fn()
+        print()
+
+        if choice == "refresh":
+            new_user = fetch_user(state["token"])
+            if new_user:
+                state["user"] = new_user
+            state["cfg"], state["default_key"], state["default_ep"] = ensure_defaults(
+                state["cfg"], state["token"], verbose=False
+            )
+            print(color("  ✓ 已刷新", C_GREEN))
+            pause()
+            continue
+
+        if choice == "relay":
+            state = cmd_select_relay(state)
+            pause()
+            continue
+
+        if choice == "redeem":
+            print(color("粘入 hex 兑换码（每行一个或一行多个，回车结束；空回车取消）:", C_BOLD))
+            try:
+                raw = read_input("> ")
+            except KeyboardInterrupt:
+                print()
+                continue
+            if not raw or not raw.strip():
+                print(color("  已取消", C_DIM))
+                pause()
+                continue
+            codes = parse_codes(raw)
+            if not codes:
+                print(color("  （未识别到 hex 兑换码）", C_YELLOW))
+                pause()
+                continue
+            new_user = redeem_codes(state["token"], codes, state["user"])
+            if new_user:
+                state["user"] = new_user
+            pause()
+
+        elif choice == "ep":
+            state["cfg"] = cmd_endpoints(state["token"], state["cfg"])
+            refresh_default_ep()
+            pause()
+
+        elif choice == "groups":
+            state["cfg"] = cmd_groups(state["token"], state["cfg"])
+            refresh_default_key()  # 切 group 后默认 key 的 group_id 变了
+            pause()
+
+        elif choice == "key":
+            state["cfg"] = cmd_key(state["token"], state["cfg"], None)
+            refresh_default_key()
+            pause()
+
+        elif choice == "history":
+            print(color("最近兑换历史:", C_BOLD))
+            print_history(fetch_history(state["token"], 10))
+            pause()
+
+        elif choice == "inject":
+            cmd_inject_codex(state["token"], state["cfg"])
+            pause()
+
+        elif choice == "reveal":
+            cmd_reveal(state["token"], state["cfg"])
+            pause()
+
+        elif choice == "setup":
+            state["cfg"] = run_wizard()
+            apply_domain(state["cfg"]["domain"])
+            state["token"] = c2a.get_token()
+            state["user"] = fetch_user(state["token"])
+            refresh_default_key()
+            refresh_default_ep()
+            pause("配置已更新")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

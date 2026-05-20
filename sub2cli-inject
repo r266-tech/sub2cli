@@ -1,0 +1,1361 @@
+#!/usr/bin/env python3
+"""sub2cli-inject — Codex 渠道切换器 (vendored from r266-tech/codex-provider-macos).
+
+sub2cli 用 add-api 子命令注入 url + apikey 到本机 Codex CLI / Codex App.
+单文件 Python, 无第三方依赖, MIT 许可.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import getpass
+import json
+import os
+import re
+import select
+import sqlite3
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+try:
+    import readline  # noqa: F401  启用 input() 的行编辑 (退格/CJK 宽度/Ctrl-U/方向键)
+except ImportError:
+    pass
+
+from pathlib import Path
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
+
+HOME = Path(os.environ.get("CODEX_PROVIDER_HOME", str(Path.home()))).expanduser()
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(HOME / ".codex"))).expanduser()
+APP_SUPPORT = HOME / "Library" / "Application Support"
+APP_PROFILE = APP_SUPPORT / "Codex"
+AUTH_JSON = CODEX_HOME / "auth.json"
+CONFIG_TOML = CODEX_HOME / "config.toml"
+STATE_DB = CODEX_HOME / "state_5.sqlite"
+SESSION_DIRS = [CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"]
+SLOTS_FILE = CODEX_HOME / "provider-slots.json"
+BACKUP_ROOT = CODEX_HOME / "provider-switch-backups"
+
+OAUTH_PROVIDER = "openai"
+RELAY_PROVIDER = "OpenAI"
+THREAD_PROVIDERS = (OAUTH_PROVIDER, RELAY_PROVIDER)
+DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
+APP_VERSION = "0.1.0"
+APP_URL = os.environ.get("CODEX_PROVIDER_URL", "https://github.com/r266-tech/codex-provider-macos")
+APP_BANNER = r"""
+  ____          _           ____                 _     _
+ / ___|___   __| | _____  _|  _ \ _ __ _____   _(_) __| | ___ _ __
+| |   / _ \ / _` |/ _ \ \/ / |_) | '__/ _ \ \ / / |/ _` |/ _ \ '__|
+| |__| (_) | (_| |  __/>  <|  __/| | | (_) \ V /| | (_| |  __/ |
+ \____\___/ \__,_|\___/_/\_\_|   |_|  \___/ \_/ |_|\__,_|\___|_|
+""".strip("\n")
+
+
+class ChineseHelpFormatter(argparse.HelpFormatter):
+    def start_section(self, heading: str | None) -> None:
+        translations = {
+            "positional arguments": "命令",
+            "optional arguments": "选项",
+            "options": "选项",
+        }
+        super().start_section(translations.get(heading, heading))
+
+
+def fail(message: str, code: int = 2) -> None:
+    print(f"错误：{message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def atomic_write_json(path: Path, data: dict, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        os.chmod(tmp, mode)
+        tmp.replace(path)
+    except Exception:
+        if tmp.exists() or tmp.is_symlink():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_text(text)
+        os.chmod(tmp, mode)
+        tmp.replace(path)
+    except Exception:
+        if tmp.exists() or tmp.is_symlink():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def atomic_symlink(link_path: Path, target: Path) -> None:
+    if link_path.exists() and not link_path.is_symlink():
+        fail(f"{link_path} is a real file/dir, not a symlink. Run init first or move it aside manually.")
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = link_path.with_name(f"{link_path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    tmp.symlink_to(target)
+    os.replace(tmp, link_path)
+
+
+def symlink_points_to(link_path: Path, target: Path) -> bool:
+    if not link_path.is_symlink():
+        return False
+    try:
+        return Path(os.readlink(link_path)).expanduser().resolve(strict=False) == target.resolve(strict=False)
+    except OSError:
+        return False
+
+
+def toml_quote(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def normalize_base_url(value: str) -> str:
+    base_url = value.strip().rstrip("/")
+    if base_url.lower().endswith("/v1"):
+        base_url = base_url[:-3].rstrip("/")
+    if not base_url.startswith(("http://", "https://")):
+        fail(f"base_url must start with http:// or https://: {value!r}")
+    return base_url
+
+
+def slot_from_url(base_url: str) -> str:
+    host = urlparse.urlparse(base_url).hostname or ""
+    host = host.removeprefix("www.").removeprefix("api.")
+    slot = host.split(".")[0] if host else ""
+    if not slot:
+        fail(f"could not derive a slot name from {base_url!r}; pass --slot")
+    return validate_slot(slot)
+
+
+def validate_slot(slot: str) -> str:
+    slot = slot.strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,30}", slot):
+        fail(f"invalid slot {slot!r}; use lowercase a-z, 0-9, _ or -, max 31 chars")
+    return slot
+
+
+def load_slots(required: bool = True) -> dict:
+    if not SLOTS_FILE.exists():
+        if required:
+            fail(f"{SLOTS_FILE} not found. Run: codex-provider init")
+        return {"version": 1, "current": None, "app_history_slot": None, "slots": {}}
+    try:
+        data = json.loads(SLOTS_FILE.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"{SLOTS_FILE} is invalid JSON: {exc}")
+    data.setdefault("version", 1)
+    data.setdefault("slots", {})
+    return data
+
+
+def save_slots(data: dict) -> None:
+    atomic_write_json(SLOTS_FILE, data)
+
+
+def codex_running() -> bool:
+    return subprocess.run(["pgrep", "-x", "Codex"], capture_output=True).returncode == 0
+
+
+def quit_codex(timeout: float = 8.0) -> bool:
+    if not codex_running():
+        return False
+    try:
+        subprocess.run(
+            ["osascript", "-e", 'tell application id "com.openai.codex" to quit'],
+            check=False,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not codex_running():
+            return True
+        time.sleep(0.25)
+    fail("Codex.app 退出超时。请手动退出 Codex App 后重试。")
+    return True
+
+
+def launch_codex() -> None:
+    subprocess.Popen(["open", "-a", "Codex"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def decode_auth_email(auth_file: Path) -> str | None:
+    try:
+        data = json.loads(auth_file.read_text())
+        token = data.get("tokens", {}).get("id_token", "")
+        if token.count(".") < 2:
+            return None
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("email")
+    except Exception:
+        return None
+
+
+def cmd_init(slot: str = "local", display: str | None = None, *, quiet: bool = False) -> int:
+    slot = validate_slot(slot)
+    data = load_slots(required=False)
+    if data.get("current") and data.get("slots") and AUTH_JSON.is_symlink() and APP_PROFILE.is_symlink():
+        if not quiet:
+            print(f"already initialized: current={data['current']}")
+            print(f"slots file: {SLOTS_FILE}")
+        return 0
+
+    quit_codex()
+    CODEX_HOME.mkdir(parents=True, exist_ok=True)
+    APP_SUPPORT.mkdir(parents=True, exist_ok=True)
+
+    auth_slot = CODEX_HOME / f"auth.{slot}.json"
+    profile_slot = APP_SUPPORT / f"Codex.{slot}"
+
+    if AUTH_JSON.is_symlink():
+        auth_slot = Path(os.readlink(AUTH_JSON)).expanduser()
+    elif AUTH_JSON.exists():
+        if auth_slot.exists():
+            fail(f"{auth_slot} already exists; refusing to overwrite it")
+        AUTH_JSON.rename(auth_slot)
+
+    if APP_PROFILE.is_symlink():
+        profile_slot = Path(os.readlink(APP_PROFILE)).expanduser()
+    elif APP_PROFILE.exists():
+        if profile_slot.exists():
+            fail(f"{profile_slot} already exists; refusing to overwrite it")
+        APP_PROFILE.rename(profile_slot)
+    else:
+        profile_slot.mkdir(parents=True, exist_ok=True)
+
+    atomic_symlink(APP_PROFILE, profile_slot)
+    if auth_slot.exists() or AUTH_JSON.is_symlink():
+        atomic_symlink(AUTH_JSON, auth_slot)
+
+    email = decode_auth_email(auth_slot) if auth_slot.exists() else None
+    display_name = display or (f"Codex - {email}" if email else f"Codex - {slot}")
+    data["slots"][slot] = {
+        "display_name": display_name,
+        "mode": "oauth",
+        "auth_file": str(auth_slot),
+        "app_profile_dir": str(profile_slot),
+    }
+    data["current"] = slot
+    data["app_history_slot"] = slot
+    save_slots(data)
+
+    if not quiet:
+        print(f"initialized: {slot}")
+        print(f"  auth:    {auth_slot}")
+        print(f"  profile: {profile_slot}")
+        print(f"  slots:   {SLOTS_FILE}")
+    return 0
+
+
+def ensure_initialized() -> None:
+    if not SLOTS_FILE.exists():
+        cmd_init(quiet=True)
+
+
+def probe_relay(base_url: str, api_key: str, timeout: float = 12.0) -> tuple[bool, str]:
+    req = urlrequest.Request(
+        base_url.rstrip("/") + "/v1/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "User-Agent": "codex-provider-macos/1.0",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(8192)
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
+            return True, f"/v1/models 可访问（{len(parsed['data'])} 个模型）"
+        return False, "中转有响应，但返回格式不像 OpenAI 兼容接口"
+    except urlerror.HTTPError as exc:
+        if exc.code == 401:
+            return False, "401 Unauthorized - API key 不正确"
+        if exc.code == 403:
+            return False, "403 Forbidden - key 权限不足，或中转拒绝当前网络"
+        if exc.code == 404:
+            return False, "404 Not Found - base URL 可能不对，通常不要带 /v1"
+        return False, f"HTTP {exc.code} {exc.reason}"
+    except urlerror.URLError as exc:
+        return False, f"无法访问中转：{exc.reason}"
+    except TimeoutError:
+        return False, f"{timeout:.0f}s 后超时"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def write_apikey_auth(path: Path, api_key: str) -> bool:
+    desired = {"OPENAI_API_KEY": api_key, "auth_mode": "apikey"}
+    if path.exists():
+        try:
+            if json.loads(path.read_text()) == desired:
+                return False
+        except (OSError, json.JSONDecodeError):
+            pass
+    atomic_write_json(path, desired)
+    return True
+
+
+def split_toml_head(text: str) -> tuple[str, str]:
+    match = re.search(r"(?m)^\s*\[", text)
+    if not match:
+        return text, ""
+    return text[: match.start()], text[match.start() :]
+
+
+def set_top_level_config(text: str, updates: dict[str, str]) -> str:
+    head, tail = split_toml_head(text)
+    keys = "|".join(re.escape(key) for key in updates)
+    if keys:
+        head = re.sub(rf'(?m)^\s*({keys})\s*=.*(?:\n)?', "", head)
+    block = "".join(f'{key} = "{toml_quote(value)}"\n' for key, value in updates.items())
+    return block + head.lstrip("\n") + tail
+
+
+def strip_relay_provider_block(text: str) -> str:
+    return re.sub(
+        rf"(?ms)^\s*\[model_providers\.{re.escape(RELAY_PROVIDER)}\]\s*\n.*?(?=^\s*\[|\Z)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).rstrip() + "\n"
+
+
+def patch_config(*, mode: str, model: str, relay_base_url: str | None = None) -> bool:
+    text = CONFIG_TOML.read_text() if CONFIG_TOML.exists() else ""
+    provider = RELAY_PROVIDER if mode == "relay" else OAUTH_PROVIDER
+    new_text = set_top_level_config(
+        text,
+        {
+            "model": model,
+            "model_provider": provider,
+            "api_base_url": DEFAULT_API_BASE_URL,
+        },
+    )
+    new_text = strip_relay_provider_block(new_text)
+    if mode == "relay":
+        if not relay_base_url:
+            fail("relay_base_url is required for relay mode")
+        block = (
+            f"\n[model_providers.{RELAY_PROVIDER}]\n"
+            f'name = "{RELAY_PROVIDER}"\n'
+            f'base_url = "{toml_quote(relay_base_url.rstrip("/"))}"\n'
+            'wire_api = "responses"\n'
+            "requires_openai_auth = true\n"
+        )
+        new_text = new_text.rstrip() + "\n" + block
+    if new_text == text:
+        return False
+    atomic_write_text(CONFIG_TOML, new_text)
+    return True
+
+
+def top_level_value(text: str, key: str) -> str | None:
+    head, _ = split_toml_head(text)
+    match = re.search(rf'(?m)^\s*{re.escape(key)}\s*=\s*"([^"]*)"', head)
+    return match.group(1) if match else None
+
+
+def relay_block_base_url(text: str) -> str | None:
+    match = re.search(
+        rf"(?ms)^\s*\[model_providers\.{re.escape(RELAY_PROVIDER)}\]\s*\n(.*?)(?=^\s*\[|\Z)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    body = match.group(1)
+    url_match = re.search(r'(?m)^\s*base_url\s*=\s*"([^"]*)"', body)
+    return url_match.group(1).rstrip("/") if url_match else None
+
+
+def config_clean_for_slot(cfg: dict) -> bool:
+    try:
+        text = CONFIG_TOML.read_text()
+    except OSError:
+        return False
+    mode = cfg.get("mode", "oauth")
+    expected_provider = RELAY_PROVIDER if mode == "relay" else OAUTH_PROVIDER
+    expected_model = cfg.get("model", DEFAULT_MODEL)
+    if top_level_value(text, "model_provider") != expected_provider:
+        return False
+    if top_level_value(text, "model") != expected_model:
+        return False
+    if top_level_value(text, "api_base_url") != DEFAULT_API_BASE_URL:
+        return False
+    relay_url = relay_block_base_url(text)
+    if mode == "relay":
+        return relay_url == str(cfg.get("base_url", "")).rstrip("/")
+    return relay_url is None
+
+
+def new_backup_dir(label: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", label)
+    path = BACKUP_ROOT / f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}-{safe}"
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def backup_state_db(backup_dir: Path) -> Path | None:
+    if not STATE_DB.exists():
+        return None
+    target = backup_dir / STATE_DB.name
+    with sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=30) as src:
+        src.execute("PRAGMA busy_timeout=30000")
+        with sqlite3.connect(target) as dst:
+            src.backup(dst)
+    os.chmod(target, 0o600)
+    return target
+
+
+def thread_provider_counts() -> dict[str, int]:
+    if not STATE_DB.exists():
+        return {}
+    try:
+        with sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=10) as conn:
+            conn.execute("PRAGMA busy_timeout=10000")
+            rows = conn.execute("SELECT model_provider, COUNT(*) FROM threads GROUP BY model_provider").fetchall()
+    except sqlite3.Error:
+        return {}
+    return {str(provider): int(count) for provider, count in rows}
+
+
+def normalize_state_db(target_provider: str, *, backup_dir: Path | None, dry_run: bool) -> dict:
+    stats = {"exists": STATE_DB.exists(), "changed": 0, "backup": None, "error": None}
+    if not STATE_DB.exists():
+        return stats
+    try:
+        with sqlite3.connect(STATE_DB, timeout=30) as conn:
+            conn.execute("PRAGMA busy_timeout=30000")
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE model_provider IN (?, ?) AND model_provider != ?",
+                (*THREAD_PROVIDERS, target_provider),
+            ).fetchone()[0]
+            stats["changed"] = int(pending)
+            if dry_run or pending == 0:
+                return stats
+            if backup_dir is not None:
+                stats["backup"] = str(backup_state_db(backup_dir))
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE threads SET model_provider = ? WHERE model_provider IN (?, ?) AND model_provider != ?",
+                (target_provider, *THREAD_PROVIDERS, target_provider),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        stats["error"] = f"{type(exc).__name__}: {exc}"
+    return stats
+
+
+def extract_rollout_thread_id(line: bytes) -> str | None:
+    match = re.search(rb'"id":"([^"]+)"', line)
+    if not match:
+        return None
+    try:
+        return match.group(1).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def rollout_provider_records(path: Path, target_provider: str, *, dry_run: bool) -> list[dict]:
+    tokens = [(provider, f'"model_provider":"{provider}"'.encode()) for provider in THREAD_PROVIDERS]
+    records: list[dict] = []
+    try:
+        offset = 0
+        with path.open("rb") as handle:
+            for line_no, line in enumerate(handle, start=1):
+                if b'"type":"session_meta"' not in line or b'"model_provider":"' not in line:
+                    offset += len(line)
+                    continue
+                matches = [(line.find(token), provider, token) for provider, token in tokens]
+                matches = [(pos, provider, token) for pos, provider, token in matches if pos >= 0]
+                if not matches:
+                    offset += len(line)
+                    continue
+                pos, provider, _ = min(matches, key=lambda item: item[0])
+                if provider != target_provider:
+                    records.append(
+                        {
+                            "path": str(path),
+                            "line": line_no,
+                            "offset": offset + pos + len(b'"model_provider":"'),
+                            "thread_id": extract_rollout_thread_id(line[:4096]),
+                            "from": provider,
+                            "to": target_provider,
+                        }
+                    )
+                offset += len(line)
+    except OSError as exc:
+        return [{"path": str(path), "error": f"{type(exc).__name__}: {exc}"}]
+
+    if dry_run or not records:
+        return records
+
+    try:
+        before = path.stat()
+        with path.open("r+b") as handle:
+            for record in records:
+                provider = str(record["from"])
+                handle.seek(int(record["offset"]))
+                current = handle.read(len(provider))
+                if current != provider.encode():
+                    record["error"] = "provider bytes changed before write"
+                    continue
+                handle.seek(int(record["offset"]))
+                handle.write(target_provider.encode())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    except OSError as exc:
+        for record in records:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+    return records
+
+
+def normalize_rollouts(target_provider: str, *, backup_dir: Path | None, dry_run: bool) -> dict:
+    stats = {"scanned": 0, "changed": 0, "errors": 0, "audit": None}
+    audit_handle = None
+    try:
+        if backup_dir is not None and not dry_run:
+            audit_path = backup_dir / "rollout-provider-changes.jsonl"
+            audit_handle = audit_path.open("w", encoding="utf-8")
+            stats["audit"] = str(audit_path)
+        for root in SESSION_DIRS:
+            if not root.exists():
+                continue
+            for path in root.rglob("rollout-*.jsonl"):
+                stats["scanned"] += 1
+                for record in rollout_provider_records(path, target_provider, dry_run=dry_run):
+                    if record.get("error"):
+                        stats["errors"] += 1
+                    else:
+                        stats["changed"] += 1
+                    if audit_handle is not None:
+                        audit_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    finally:
+        if audit_handle is not None:
+            audit_handle.close()
+    return stats
+
+
+def normalize_sessions(target_provider: str, *, dry_run: bool = False) -> dict:
+    if target_provider not in THREAD_PROVIDERS:
+        fail(f"unsupported target provider {target_provider!r}; expected openai or OpenAI")
+    preview = {
+        "target_provider": target_provider,
+        "dry_run": dry_run,
+        "backup_dir": None,
+        "state_db": None,
+        "rollouts": None,
+    }
+    backup_dir = None if dry_run else new_backup_dir(f"thread-provider-{target_provider}")
+    preview["backup_dir"] = str(backup_dir) if backup_dir is not None else None
+    preview["state_db"] = normalize_state_db(target_provider, backup_dir=backup_dir, dry_run=dry_run)
+    preview["rollouts"] = normalize_rollouts(target_provider, backup_dir=backup_dir, dry_run=dry_run)
+    if backup_dir is not None:
+        atomic_write_json(backup_dir / "manifest.json", preview)
+    return preview
+
+
+def normalize_sessions_if_needed(target_provider: str) -> dict:
+    preview = normalize_sessions(target_provider, dry_run=True)
+    db_changed = int(preview["state_db"].get("changed", 0))
+    db_error = preview["state_db"].get("error")
+    rollouts = preview["rollouts"]
+    rollout_changed = int(rollouts.get("changed", 0))
+    rollout_errors = int(rollouts.get("errors", 0))
+    if db_changed == 0 and not db_error and rollout_changed == 0 and rollout_errors == 0:
+        preview["dry_run"] = False
+        preview["backup_dir"] = None
+        preview["skipped"] = True
+        return preview
+    return normalize_sessions(target_provider, dry_run=False)
+
+
+def sessions_need_normalize(target_provider: str) -> bool:
+    preview = normalize_sessions(target_provider, dry_run=True)
+    return bool(
+        preview["state_db"].get("error")
+        or int(preview["state_db"].get("changed", 0))
+        or int(preview["rollouts"].get("changed", 0))
+        or int(preview["rollouts"].get("errors", 0))
+    )
+
+
+def print_session_summary(stats: dict) -> None:
+    action = "将聚合" if stats.get("dry_run") else "已聚合"
+    db_stats = stats.get("state_db") or {}
+    rollout_stats = stats.get("rollouts") or {}
+    print(
+        f"  历史 session {action}: provider={stats.get('target_provider')} "
+        f"(DB 行: {db_stats.get('changed', 0)}, rollout 头: {rollout_stats.get('changed', 0)})"
+    )
+    if db_stats.get("error"):
+        print(f"  state DB 错误: {db_stats['error']}")
+    if rollout_stats.get("errors"):
+        print(f"  rollout 错误: {rollout_stats['errors']}")
+    if stats.get("backup_dir"):
+        print(f"  备份: {stats['backup_dir']}")
+
+
+def resolve_slot(name: str, slots: dict) -> str:
+    query = name.strip().lower()
+    if query in slots:
+        return query
+    matches = [key for key, cfg in slots.items() if query in key or query in cfg.get("display_name", "").lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        fail(f"no slot matches {name!r}. Available: {', '.join(sorted(slots)) or '(none)'}")
+    fail(f"{name!r} is ambiguous: {', '.join(matches)}")
+    return query
+
+
+def history_profile_target(data: dict, target_slot: str) -> Path:
+    slots = data.get("slots", {})
+    history_slot = data.get("app_history_slot")
+    if history_slot in slots:
+        return Path(slots[history_slot]["app_profile_dir"]).expanduser()
+    return Path(slots[target_slot]["app_profile_dir"]).expanduser()
+
+
+def slot_thread_provider(cfg: dict) -> str:
+    return RELAY_PROVIDER if cfg.get("mode") == "relay" else OAUTH_PROVIDER
+
+
+def slot_is_clean(data: dict, target_slot: str) -> bool:
+    cfg = data["slots"][target_slot]
+    auth_target = Path(cfg["auth_file"]).expanduser()
+    profile_target = history_profile_target(data, target_slot)
+    if data.get("current") != target_slot:
+        return False
+    if not symlink_points_to(AUTH_JSON, auth_target):
+        return False
+    if not symlink_points_to(APP_PROFILE, profile_target):
+        return False
+    if cfg.get("mode") == "relay":
+        api_key = str(cfg.get("api_key") or "")
+        try:
+            if json.loads(auth_target.read_text()) != {"OPENAI_API_KEY": api_key, "auth_mode": "apikey"}:
+                return False
+        except (OSError, json.JSONDecodeError):
+            return False
+    elif not auth_target.exists() or auth_target.stat().st_size < 10:
+        return False
+    return config_clean_for_slot(cfg) and not sessions_need_normalize(slot_thread_provider(cfg))
+
+
+def cmd_switch(name: str, *, no_restart: bool = False) -> int:
+    ensure_initialized()
+    data = load_slots()
+    slots = data.get("slots", {})
+    target_slot = resolve_slot(name, slots)
+    cfg = slots[target_slot]
+    mode = cfg.get("mode", "oauth")
+    if mode not in ("oauth", "relay"):
+        fail(f"slot {target_slot!r} has invalid mode {mode!r}")
+
+    if slot_is_clean(data, target_slot):
+        print(f"当前已是：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
+        print("  无需修改；Codex App 未重启")
+        return 0
+
+    if not no_restart:
+        quit_codex()
+
+    auth_target = Path(cfg["auth_file"]).expanduser()
+    profile_target = history_profile_target(data, target_slot)
+    auth_target.parent.mkdir(parents=True, exist_ok=True)
+    profile_target.mkdir(parents=True, exist_ok=True)
+
+    if mode == "relay":
+        api_key = str(cfg.get("api_key") or "").strip()
+        base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
+        if not api_key or not base_url:
+            fail(f"relay slot {target_slot!r} is missing api_key/base_url")
+        write_apikey_auth(auth_target, api_key)
+        patch_config(mode="relay", model=cfg.get("model", DEFAULT_MODEL), relay_base_url=base_url)
+    else:
+        patch_config(mode="oauth", model=cfg.get("model", DEFAULT_MODEL))
+
+    atomic_symlink(AUTH_JSON, auth_target)
+    atomic_symlink(APP_PROFILE, profile_target)
+    session_stats = normalize_sessions_if_needed(slot_thread_provider(cfg))
+
+    previous = data.get("current")
+    data["current"] = target_slot
+    data.setdefault("app_history_slot", target_slot)
+    save_slots(data)
+
+    verb = "已修复当前渠道" if previous == target_slot else "已切换到"
+    print(f"{verb}：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
+    print(f"  auth.json   -> {auth_target}")
+    print(f"  App profile -> {profile_target}（历史保留）")
+    if mode == "relay":
+        print(f"  base_url    -> {cfg.get('base_url')}")
+        print(f"  model       -> {cfg.get('model', DEFAULT_MODEL)}")
+    elif not auth_target.exists() or auth_target.stat().st_size < 10:
+        print(f"  尚未登录：请运行 `codex login` 写入 {auth_target}")
+    print_session_summary(session_stats)
+    if not no_restart:
+        launch_codex()
+        print("  Codex App 已重新打开")
+    else:
+        print("  --no-restart：Codex App 未重新打开")
+    return 0
+
+
+def cmd_relay(
+    base_url: str,
+    api_key: str,
+    *,
+    slot: str | None = None,
+    model: str = DEFAULT_MODEL,
+    display: str | None = None,
+    skip_probe: bool = False,
+    no_switch: bool = False,
+    no_restart: bool = False,
+) -> int:
+    ensure_initialized()
+    base_url = normalize_base_url(base_url)
+    api_key = api_key.strip()
+    if not api_key:
+        fail("API key 不能为空")
+    slot = validate_slot(slot) if slot else slot_from_url(base_url)
+
+    if not skip_probe:
+        ok, message = probe_relay(base_url, api_key)
+        if not ok:
+            print(f"中转检查失败：{message}", file=sys.stderr)
+            print("渠道未保存。请换正确的 URL/key 后重试，或加 --skip-check 跳过检查。", file=sys.stderr)
+            return 3
+        print(f"检查通过：{message}")
+
+    data = load_slots()
+    slots = data.setdefault("slots", {})
+    existing = slots.get(slot)
+    if existing and existing.get("mode") != "relay":
+        fail(f"渠道 {slot!r} 已存在，但不是 API 渠道")
+
+    slots[slot] = {
+        "display_name": display or (existing or {}).get("display_name") or f"Codex - {slot} relay",
+        "mode": "relay",
+        "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
+        "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+        "base_url": base_url,
+        "model": model,
+        "api_key": api_key,
+    }
+    save_slots(data)
+    print(f"{'已更新' if existing else '已添加'} API 渠道：{slot}")
+    print(f"  base_url: {base_url}")
+    print(f"  model:    {model}")
+
+    if no_switch:
+        print(f"  稍后切换：codex-provider use {slot}")
+        return 0
+    return cmd_switch(slot, no_restart=no_restart)
+
+
+def cmd_oauth(
+    slot: str,
+    *,
+    display: str | None = None,
+    no_switch: bool = False,
+    no_restart: bool = False,
+) -> int:
+    ensure_initialized()
+    slot = validate_slot(slot)
+    data = load_slots()
+    slots = data.setdefault("slots", {})
+    existing = slots.get(slot)
+    if existing and existing.get("mode") != "oauth":
+        fail(f"渠道 {slot!r} 已存在，但不是账号渠道")
+
+    slots[slot] = {
+        "display_name": display or (existing or {}).get("display_name") or f"Codex - {slot}",
+        "mode": "oauth",
+        "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
+        "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+    }
+    save_slots(data)
+    print(f"{'已更新' if existing else '已添加'}账号渠道：{slot}")
+    if no_switch:
+        print(f"  稍后切换：codex-provider use {slot}")
+        print("  切过去后运行：codex login")
+        return 0
+    rc = cmd_switch(slot, no_restart=no_restart)
+    auth_target = Path(slots[slot]["auth_file"]).expanduser()
+    if not auth_target.exists() or auth_target.stat().st_size < 10:
+        print("  下一步：运行 `codex login`，登录这个账号")
+    return rc
+
+
+def cmd_list() -> int:
+    data = load_slots(required=False)
+    current = data.get("current")
+    slots = data.get("slots", {})
+    if not slots:
+        print("还没有渠道")
+        print("  添加 API：  codex-provider add-api https://relay.example.com sk-...")
+        print("  添加账号： codex-provider add-account work")
+        return 0
+    for key, cfg in slots.items():
+        marker = "*" if key == current else " "
+        mode = cfg.get("mode", "oauth")
+        label = cfg.get("display_name", key)
+        extra = cfg.get("base_url", "") if mode == "relay" else "(账号登录)"
+        print(f"{marker} {key:<16} [{mode:<5}] {label:<32} {extra}")
+    return 0
+
+
+def cmd_status() -> int:
+    data = load_slots(required=False)
+    current = data.get("current")
+    slots = data.get("slots", {})
+    if not current or current not in slots:
+        print("当前没有渠道")
+        print("  运行：codex-provider")
+        return 0
+    cfg = slots[current]
+    provider = slot_thread_provider(cfg)
+    print(f"当前渠道：{cfg.get('display_name', current)} ({current}) [{cfg.get('mode', 'oauth')}]")
+    print(f"  渠道文件:    {SLOTS_FILE}")
+    print(f"  auth.json:   {'-> ' + os.readlink(AUTH_JSON) if AUTH_JSON.is_symlink() else str(AUTH_JSON)}")
+    print(f"  App profile: {'-> ' + os.readlink(APP_PROFILE) if APP_PROFILE.is_symlink() else str(APP_PROFILE)}")
+    print(f"  App 运行中:  {'是' if codex_running() else '否'}")
+    counts = thread_provider_counts()
+    if counts:
+        summary = ", ".join(f"{key}:{value}" for key, value in sorted(counts.items()))
+        print(f"  sessions:    {summary}")
+    preview = normalize_sessions(provider, dry_run=True)
+    print_session_summary(preview)
+    if not slot_is_clean(data, current):
+        print(f"  状态不一致：运行 `codex-provider use {current}` 修复")
+    return 0
+
+
+def cmd_remove(slot: str, *, hard: bool = False) -> int:
+    data = load_slots()
+    slot = resolve_slot(slot, data.get("slots", {}))
+    if slot == data.get("current"):
+        fail(f"{slot!r} is current; switch away before removing it")
+    cfg = data["slots"].pop(slot)
+    save_slots(data)
+    print(f"removed slot: {slot}")
+    if hard:
+        auth_path = Path(cfg.get("auth_file", "")).expanduser()
+        profile_path = Path(cfg.get("app_profile_dir", "")).expanduser()
+        if auth_path.is_file() or auth_path.is_symlink():
+            if CODEX_HOME.resolve(strict=False) in auth_path.resolve(strict=False).parents:
+                auth_path.unlink()
+                print(f"  removed {auth_path}")
+        if profile_path.exists() and not profile_path.is_symlink():
+            if APP_SUPPORT.resolve(strict=False) in profile_path.resolve(strict=False).parents:
+                import shutil
+
+                shutil.rmtree(profile_path)
+                print(f"  removed {profile_path}")
+    return 0
+
+
+def cmd_normalize_sessions(target: str | None, *, dry_run: bool) -> int:
+    if target in (None, "", "current"):
+        data = load_slots()
+        current = data.get("current")
+        if not current:
+            fail("当前没有渠道")
+        target_provider = slot_thread_provider(data["slots"][current])
+    elif target in THREAD_PROVIDERS:
+        target_provider = target
+    else:
+        data = load_slots()
+        slot = resolve_slot(target, data.get("slots", {}))
+        target_provider = slot_thread_provider(data["slots"][slot])
+    stats = normalize_sessions(target_provider, dry_run=dry_run)
+    print_session_summary(stats)
+    return 1 if stats.get("rollouts", {}).get("errors") else 0
+
+
+def clear_screen() -> None:
+    if sys.stdout.isatty():
+        print("\033[2J\033[H", end="")
+
+
+def pause() -> None:
+    if sys.stdin.isatty():
+        input("\n按 Enter 继续...")
+
+
+def read_key() -> str:
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = os.read(fd, 1)
+        if ch == b"\x1b":
+            key = ch
+            while select.select([sys.stdin], [], [], 0.02)[0]:
+                key += os.read(fd, 1)
+            if key in (b"\x1b[A", b"\x1b[D"):
+                return "up"
+            if key in (b"\x1b[B", b"\x1b[C"):
+                return "down"
+            return "back"
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch in (b"q", b"Q", b"\x03"):
+            return "quit"
+        if ch in (b"b", b"B", b"\x7f"):
+            return "back"
+        if ch in (b"v", b"V"):
+            return "version"
+        if ch in (b"m", b"M"):
+            return "more"
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return ""
+
+
+def select_menu(
+    title: str,
+    options: list[tuple[str, str]],
+    *,
+    subtitle: str | None = None,
+    branded: bool = False,
+) -> str:
+    if not options:
+        return "back"
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(title)
+        if subtitle:
+            print(subtitle)
+        for idx, (label, _) in enumerate(options, start=1):
+            print(f"{idx}. {label}")
+        choice = input("> ").strip()
+        if not choice:
+            return "back"
+        try:
+            return options[int(choice) - 1][1]
+        except (ValueError, IndexError):
+            return "back"
+
+    selected = 0
+    while True:
+        clear_screen()
+        if branded:
+            print(APP_BANNER)
+            print(f"  {APP_URL}")
+            print(f"  {title}")
+            if subtitle:
+                print(f"  {subtitle}")
+            print("")
+        else:
+            print(title)
+            if subtitle:
+                print(subtitle)
+            print("")
+        for idx, (label, _) in enumerate(options):
+            marker = "➤" if idx == selected else " "
+            print(f"{marker} {idx + 1}. {label}")
+        if branded:
+            print("\n↑↓  |  Enter 确认  |  Q 退出")
+        else:
+            print("\n↑↓  |  Enter 确认  |  B 返回  |  Q 退出")
+        key = read_key()
+        if key == "up":
+            selected = (selected - 1) % len(options)
+        elif key == "down":
+            selected = (selected + 1) % len(options)
+        elif key == "enter":
+            return options[selected][1]
+        elif key in ("back", "quit"):
+            return key
+
+
+def prompt_line(label: str, *, default: str | None = None, required: bool = False) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        value = input(f"{label}{suffix}: ").strip()
+        if value:
+            return value
+        if default is not None:
+            return default
+        if not required:
+            return ""
+        print("必填。")
+
+
+def yes_no(label: str, *, default: bool = True) -> bool:
+    marker = "Y/n" if default else "y/N"
+    value = input(f"{label} [{marker}]: ").strip().lower()
+    if not value:
+        return default
+    return value in ("y", "yes")
+
+
+def menu_status() -> None:
+    clear_screen()
+    cmd_status()
+    pause()
+
+
+def menu_init() -> None:
+    clear_screen()
+    print("初始化当前 Codex 配置\n")
+    slot = prompt_line("渠道名", default="local", required=True)
+    display = prompt_line("显示名称", default="")
+    clear_screen()
+    cmd_init(slot=slot, display=display or None)
+    pause()
+
+
+def menu_add_relay() -> None:
+    clear_screen()
+    print("新增 API 渠道\n")
+    base_url = prompt_line("中转 base URL，不要带 /v1", required=True)
+    api_key = getpass.getpass("API key（隐藏输入）: ").strip()
+    slot = prompt_line("渠道名（空着则自动从域名取）", default="")
+    switch_now = yes_no("现在切到这个渠道", default=True)
+    clear_screen()
+    cmd_relay(
+        base_url,
+        api_key,
+        slot=slot or None,
+        no_switch=not switch_now,
+    )
+    pause()
+
+
+def menu_add_oauth() -> None:
+    clear_screen()
+    print("新增账号渠道\n")
+    slot = prompt_line("渠道名，例如 personal 或 work", required=True)
+    switch_now = yes_no("现在切到这个账号", default=True)
+    clear_screen()
+    cmd_oauth(slot, no_switch=not switch_now)
+    pause()
+
+
+def menu_switch() -> None:
+    data = load_slots(required=False)
+    slots = data.get("slots", {})
+    current = data.get("current")
+    if not slots:
+        clear_screen()
+        print("还没有渠道。请先新增账号或 API。")
+        pause()
+        return
+    options = []
+    for key, cfg in slots.items():
+        marker = "*" if key == current else " "
+        mode = cfg.get("mode", "oauth")
+        label = cfg.get("display_name", key)
+        extra = cfg.get("base_url", "账号登录") if mode == "relay" else "账号登录"
+        options.append((f"{marker} {key:<16} [{mode}] {label}  {extra}", key))
+    options.append(("← 返回", "back"))
+    choice = select_menu("切换渠道", options)
+    if choice in ("back", "quit"):
+        return
+    clear_screen()
+    cmd_switch(choice)
+    pause()
+
+
+def menu_remove() -> None:
+    data = load_slots(required=False)
+    slots = data.get("slots", {})
+    current = data.get("current")
+    removable = [(key, cfg) for key, cfg in slots.items() if key != current]
+    if not removable:
+        clear_screen()
+        print("没有可删除的渠道。当前渠道不能删除。")
+        pause()
+        return
+    options = [
+        (f"{key:<16} [{cfg.get('mode', 'oauth')}] {cfg.get('display_name', key)}", key)
+        for key, cfg in removable
+    ]
+    options.append(("← 返回", "back"))
+    choice = select_menu("删除渠道", options)
+    if choice in ("back", "quit"):
+        return
+    if not yes_no(f"从列表中删除渠道 {choice!r}", default=False):
+        return
+    clear_screen()
+    cmd_remove(choice)
+    pause()
+
+
+def menu_normalize() -> None:
+    clear_screen()
+    print("Session normalize dry-run\n")
+    cmd_normalize_sessions("current", dry_run=True)
+    pause()
+
+
+def cmd_version() -> int:
+    print(f"codex-provider {APP_VERSION}")
+    print(APP_URL)
+    return 0
+
+
+def cmd_more() -> int:
+    data = load_slots(required=False)
+    print("Codex Provider 路径")
+    print(f"  渠道文件:    {SLOTS_FILE}")
+    print(f"  Codex 目录:  {CODEX_HOME}")
+    print(f"  配置:        {CONFIG_TOML}")
+    print(f"  认证:        {AUTH_JSON}")
+    print(f"  App profile: {APP_PROFILE}")
+    print(f"  备份:        {BACKUP_ROOT}")
+    if data.get("slots"):
+        print("\n渠道")
+        for key, cfg in data["slots"].items():
+            marker = "*" if key == data.get("current") else " "
+            print(f" {marker} {key:<16} {cfg.get('mode', 'oauth'):<5} {cfg.get('display_name', key)}")
+    return 0
+
+
+def menu_version() -> None:
+    clear_screen()
+    cmd_version()
+    pause()
+
+
+def menu_more() -> None:
+    clear_screen()
+    cmd_more()
+    pause()
+
+
+def cmd_menu() -> int:
+    while True:
+        data = load_slots(required=False)
+        current = data.get("current")
+        slots = data.get("slots", {})
+        if current in slots:
+            cfg = slots[current]
+            current_label = f"{cfg.get('display_name', current)} ({current}) [{cfg.get('mode', 'oauth')}]"
+        else:
+            current_label = "未初始化"
+        choice = select_menu(
+            "Codex 渠道切换",
+            [
+                ("切换渠道      选择已保存的渠道", "switch"),
+                ("新增 API      添加第三方 API key", "add-relay"),
+                ("新增账号      添加 Codex 登录账号", "add-oauth"),
+                ("当前状态      查看正在使用的渠道", "status"),
+                ("退出          关闭工具", "quit"),
+            ],
+            subtitle=f"当前：{current_label}",
+            branded=True,
+        )
+        if choice in ("quit", "back"):
+            clear_screen()
+            return 0
+        if choice == "status":
+            menu_status()
+        elif choice == "add-relay":
+            menu_add_relay()
+        elif choice == "add-oauth":
+            menu_add_oauth()
+        elif choice == "switch":
+            menu_switch()
+
+
+def run_internal_command(command: str, argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog=f"codex-provider {command}")
+
+    if command == "menu":
+        parser.parse_args(argv)
+        return cmd_menu()
+
+    if command == "version":
+        parser.parse_args(argv)
+        return cmd_version()
+
+    if command == "init":
+        parser.add_argument("--slot", default="local")
+        parser.add_argument("--display")
+        args = parser.parse_args(argv)
+        return cmd_init(slot=args.slot, display=args.display)
+
+    if command == "more":
+        parser.parse_args(argv)
+        return cmd_more()
+
+    if command == "status":
+        parser.parse_args(argv)
+        return cmd_status()
+
+    if command == "ls":
+        parser.parse_args(argv)
+        return cmd_list()
+
+    if command == "relay":
+        parser.add_argument("base_url")
+        parser.add_argument("api_key")
+        parser.add_argument("--slot")
+        parser.add_argument("--model", default=DEFAULT_MODEL)
+        parser.add_argument("--display")
+        parser.add_argument("--skip-probe", action="store_true")
+        parser.add_argument("--no-switch", action="store_true")
+        parser.add_argument("--no-restart", action="store_true")
+        args = parser.parse_args(argv)
+        return cmd_relay(
+            args.base_url,
+            args.api_key,
+            slot=args.slot,
+            model=args.model,
+            display=args.display,
+            skip_probe=args.skip_probe,
+            no_switch=args.no_switch,
+            no_restart=args.no_restart,
+        )
+
+    if command == "oauth":
+        parser.add_argument("slot")
+        parser.add_argument("--display")
+        parser.add_argument("--no-switch", action="store_true")
+        parser.add_argument("--no-restart", action="store_true")
+        args = parser.parse_args(argv)
+        return cmd_oauth(
+            args.slot,
+            display=args.display,
+            no_switch=args.no_switch,
+            no_restart=args.no_restart,
+        )
+
+    if command == "switch":
+        parser.add_argument("slot")
+        parser.add_argument("--no-restart", action="store_true")
+        args = parser.parse_args(argv)
+        return cmd_switch(args.slot, no_restart=args.no_restart)
+
+    if command == "remove":
+        parser.add_argument("slot")
+        parser.add_argument("--hard", action="store_true")
+        args = parser.parse_args(argv)
+        return cmd_remove(args.slot, hard=args.hard)
+
+    if command == "normalize-sessions":
+        parser.add_argument("target", nargs="?", default="current")
+        parser.add_argument("--dry-run", action="store_true")
+        args = parser.parse_args(argv)
+        return cmd_normalize_sessions(args.target, dry_run=args.dry_run)
+
+    fail(f"unknown internal command: {command}")
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    internal_commands = {
+        "menu",
+        "version",
+        "init",
+        "more",
+        "status",
+        "ls",
+        "relay",
+        "oauth",
+        "switch",
+        "remove",
+        "normalize-sessions",
+    }
+    if argv and argv[0] in internal_commands:
+        return run_internal_command(argv[0], argv[1:])
+
+    parser = argparse.ArgumentParser(
+        prog="codex-provider",
+        description="在已保存的 Codex 账号和 API 渠道之间切换。",
+        formatter_class=ChineseHelpFormatter,
+        add_help=False,
+    )
+    parser.add_argument("-h", "--help", action="help", help="显示帮助并退出")
+    sub = parser.add_subparsers(dest="command", metavar="command")
+
+    p_add_api = sub.add_parser("add-api", help="添加 API key 渠道，并切过去")
+    p_add_api.add_argument("base_url")
+    p_add_api.add_argument("api_key")
+    p_add_api.add_argument("--name", "--slot", dest="slot")
+    p_add_api.add_argument("--model", default=DEFAULT_MODEL)
+    p_add_api.add_argument("--display")
+    p_add_api.add_argument("--skip-check", "--skip-probe", dest="skip_probe", action="store_true")
+    p_add_api.add_argument("--no-switch", action="store_true")
+    p_add_api.add_argument("--no-restart", action="store_true")
+
+    p_add_account = sub.add_parser("add-account", help="添加 Codex 登录账号，并切过去")
+    p_add_account.add_argument("name")
+    p_add_account.add_argument("--display")
+    p_add_account.add_argument("--no-switch", action="store_true")
+    p_add_account.add_argument("--no-restart", action="store_true")
+
+    p_use = sub.add_parser("use", help="切换到已保存的渠道")
+    p_use.add_argument("name")
+    p_use.add_argument("--no-restart", action="store_true")
+
+    sub.add_parser("list", help="列出已保存渠道")
+    sub.add_parser("current", help="查看当前渠道")
+
+    args = parser.parse_args(argv)
+    if args.command is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return cmd_menu()
+        return cmd_status()
+    if args.command == "current":
+        return cmd_status()
+    if args.command == "list":
+        return cmd_list()
+    if args.command == "add-api":
+        return cmd_relay(
+            args.base_url,
+            args.api_key,
+            slot=args.slot,
+            model=args.model,
+            display=args.display,
+            skip_probe=args.skip_probe,
+            no_switch=args.no_switch,
+            no_restart=args.no_restart,
+        )
+    if args.command == "add-account":
+        return cmd_oauth(
+            args.name,
+            display=args.display,
+            no_switch=args.no_switch,
+            no_restart=args.no_restart,
+        )
+    if args.command == "use":
+        return cmd_switch(args.name, no_restart=args.no_restart)
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
