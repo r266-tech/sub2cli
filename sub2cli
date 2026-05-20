@@ -9,16 +9,13 @@
     sub2cli --help
 
 REPL 菜单:
-    刷新 / 中转 / url / 分组 / 名称 / 兑换历史 / 注入 codex /
-    粘 hex 兑换码 兑换 / 退出
+    刷新 / 中转 / url / 分组 / 名称 / 兑换历史 / 注入 codex / 退出
 
 鉴权: 从 Edge CDP (127.0.0.1:9222) 实时读 localStorage.auth_token；
       也支持 SUB2CLI_TOKEN 环境变量覆盖。
 """
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 import re
@@ -38,14 +35,7 @@ except ImportError:
     pass
 
 import requests
-
-# ---- 加载 sub2cli-redeem 作为 lib ----
-_BIN_DIR = os.path.dirname(os.path.realpath(__file__))
-_lib_path = os.path.join(_BIN_DIR, "sub2cli-redeem")
-_loader = importlib.machinery.SourceFileLoader("sub2cli_lib", _lib_path)
-_spec = importlib.util.spec_from_loader("sub2cli_lib", _loader)
-c2a = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
-_loader.exec_module(c2a)
+import websocket  # type: ignore[import-not-found]
 
 # ---- 路径 ----
 CONFIG_DIR = os.path.join(
@@ -54,9 +44,59 @@ CONFIG_DIR = os.path.join(
 )
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
+# ---- Token 读取 (Edge CDP) ----
+CDP_HOST = os.environ.get("EDGE_CDP_HOST", "127.0.0.1")
+CDP_PORT = int(os.environ.get("EDGE_CDP_PORT", "9222"))
+
 # ---- 全局变量（被 apply_domain 改写）----
-DOMAIN = f"https://{c2a.SITE}"
-API_BASE = f"https://{c2a.SITE}/api/v1"
+SITE = "www.codex2api.com"
+DOMAIN = f"https://{SITE}"
+API_BASE = f"https://{SITE}/api/v1"
+
+
+def get_token() -> str:
+    """从 Edge/Chromium 的 CDP (默认 127.0.0.1:9222) 拿当前 SITE 标签页的
+    localStorage.auth_token。环境变量 SUB2CLI_TOKEN 可整体覆盖。"""
+    if t := os.environ.get("SUB2CLI_TOKEN"):
+        return t
+    try:
+        tabs = json.load(
+            urllib.request.urlopen(f"http://{CDP_HOST}:{CDP_PORT}/json", timeout=3)
+        )
+    except Exception as exc:
+        sys.exit(f"[token] Edge CDP unreachable at {CDP_HOST}:{CDP_PORT} ({exc})")
+    target = next(
+        (t for t in tabs if t.get("type") == "page" and SITE in t.get("url", "")),
+        None,
+    )
+    if not target:
+        sys.exit(
+            f"[token] no {SITE} tab open in Edge — log in there first "
+            f"(or set SUB2CLI_TOKEN env)"
+        )
+    try:
+        ws = websocket.create_connection(
+            target["webSocketDebuggerUrl"], timeout=5, suppress_origin=True
+        )
+        ws.send(
+            json.dumps(
+                {
+                    "id": 1,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": "localStorage.getItem('auth_token')",
+                        "returnByValue": True,
+                    },
+                }
+            )
+        )
+        val = json.loads(ws.recv())["result"]["result"]["value"]
+        ws.close()
+    except Exception as exc:
+        sys.exit(f"[token] CDP evaluate failed: {exc}")
+    if not val:
+        sys.exit("[token] auth_token missing from localStorage (logged out?)")
+    return val
 
 # ---- ANSI 颜色 ----
 C_RESET = "\033[0m"
@@ -113,13 +153,12 @@ def save_config(cfg: dict) -> None:
 
 
 def apply_domain(domain: str) -> None:
-    """根据 domain 更新全局 + c2a lib 的 SITE/API。"""
-    global DOMAIN, API_BASE
+    """根据 domain 更新全局 SITE / DOMAIN / API_BASE。"""
+    global SITE, DOMAIN, API_BASE
     host = urlparse(domain).hostname or domain.replace("https://", "").replace("http://", "").rstrip("/")
+    SITE = host
     DOMAIN = f"https://{host}"
     API_BASE = f"https://{host}/api/v1"
-    c2a.SITE = host
-    c2a.API = f"https://{host}/api/v1/redeem"
 
 
 # ==================== API 调用 ====================
@@ -364,7 +403,7 @@ def collect_endpoints(settings: dict) -> list[dict]:
         })
     if not eps:
         # 中转 /settings/public 没给 url 时, 退到域名本身 (e.g. https://relay.example.com/v1)
-        host = getattr(c2a, "SITE", "") or ""
+        host = SITE or ""
         if host:
             eps.append({
                 "name": "默认",
@@ -439,17 +478,6 @@ def ensure_defaults(cfg: dict, token: str, *, verbose: bool = False) -> tuple[di
 
     save_config(cfg)
     return cfg, default_key, default_ep
-
-
-def parse_codes(text: str) -> list[str]:
-    found = re.findall(r"\b[a-fA-F0-9]{16,}\b", text)
-    seen: set[str] = set()
-    out: list[str] = []
-    for c in found:
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
-    return out
 
 
 def read_input(prompt: str) -> str | None:
@@ -631,7 +659,6 @@ def print_banner(cfg: dict, user: dict, default_key: dict | None, default_ep: di
 def cmd_help() -> None:
     print(color("命令", C_BOLD))
     rows = [
-        ("(粘 hex 兑换码)", "兑换（1 顺序 / 2+ AIMD 并行）"),
         ("ep / endpoints / ping", "端点连通性测试 + 可选设默认"),
         ("g / groups", "分组列表 + 可用性测试"),
         ("key [name]", "切换默认 key（不带参数则菜单选）"),
@@ -666,31 +693,6 @@ def print_history(rows: list[dict]) -> None:
         else:
             v_s = str(v)
         print(f"  {color(ts, C_DIM)}  {color(t, C_BLUE):<14}  {v_s:<14}  {color(code, C_DIM)}")
-
-
-def print_record(rec: dict) -> None:
-    short = rec["code"][:10] + "…"
-    if rec["status"] == 200:
-        bits = []
-        t, v = rec.get("type"), rec.get("value")
-        if t == "balance" and v is not None:
-            bits.append(color(f"+${v:.2f}", C_GREEN))
-        elif t == "concurrency" and v is not None:
-            bits.append(color(f"+{v} 请求", C_GREEN))
-        elif t == "subscription":
-            bits.append(color(f"订阅 {rec.get('validity_days')}天", C_GREEN))
-        if (nb := rec.get("new_balance")) is not None:
-            bits.append(color(f"余额=${nb:.2f}", C_DIM))
-        if (nc := rec.get("new_concurrency")) is not None:
-            bits.append(color(f"并发={nc}", C_DIM))
-        bits.append(color(f"{rec['latency_ms']}ms", C_DIM))
-        print(f"  {color('OK ', C_GREEN)} [{short}]  " + "  ".join(bits))
-    else:
-        det = rec.get("detail") or "(无详情)"
-        print(
-            f"  {color('ERR', C_RED)} [{short}] HTTP {rec['status']}: "
-            f"{det[:80]}  {color(str(rec['latency_ms'])+'ms', C_DIM)}"
-        )
 
 
 # ==================== 命令 ====================
@@ -783,7 +785,7 @@ def cmd_groups(token: str, cfg: dict) -> dict:
         if gid is not None:
             keys_by_group.setdefault(gid, []).append(k)
 
-    ep_url = cfg.get("default_endpoint_url") or f"https://{c2a.SITE}/v1"
+    ep_url = cfg.get("default_endpoint_url") or f"https://{SITE}/v1"
     default_key_name = cfg.get("default_key_name", "")
     default_key = find_key_by_name(keys, default_key_name)
     if not default_key:
@@ -920,7 +922,7 @@ def cmd_key(token: str, cfg: dict, arg: str | None) -> dict:
         print(color(f"  ✓ 默认 key → {match['name']}", C_GREEN))
         return cfg
 
-    ep_url = cfg.get("default_endpoint_url") or f"https://{c2a.SITE}/v1"
+    ep_url = cfg.get("default_endpoint_url") or f"https://{SITE}/v1"
     print(color(f"测试每把 key (GET {ep_url}/models):", C_BOLD))
     cur_idx = 1
     results: list[tuple[dict, dict]] = []
@@ -1139,7 +1141,7 @@ def cmd_select_relay(state: dict) -> dict:
             raw = "https://" + raw
         raw = raw.rstrip("/")
         # 临时切换 c2a SITE 来验证
-        old_site = c2a.SITE
+        old_site = SITE
         apply_domain(raw)
         try:
             r = requests.get(f"{API_BASE}/settings/public", timeout=8)
@@ -1168,7 +1170,7 @@ def cmd_select_relay(state: dict) -> dict:
     token = None
     while not token:
         try:
-            token = c2a.get_token()
+            token = get_token()
         except SystemExit as exc:
             print(color(f"  ✗ {exc}", C_YELLOW))
             print(color(
@@ -1205,39 +1207,6 @@ def cmd_reveal(token: str, cfg: dict) -> None:
         print(color("  未设置默认 key", C_YELLOW))
         return
     print(f"  {color(k.get('name','?'), C_CYAN)}: {k.get('key','')}")
-
-
-def redeem_codes(token: str, codes: list[str], user: dict | None) -> dict | None:
-    done = c2a.load_done(c2a.DEFAULT_STATE)
-    pending = [c for c in codes if c not in done]
-    skipped = len(codes) - len(pending)
-    if skipped:
-        print(color(f"[去重] 已跳过 {skipped} 个之前已处理的码", C_YELLOW))
-    if not pending:
-        print(color("  没有可处理的码", C_DIM))
-        return user
-
-    import random as _r
-    _r.shuffle(pending)
-    n = len(pending)
-    print(color(f"[计划] {n} 个码  模式=随机顺序 1/s (不看返回)", C_DIM))
-
-    # 1 并发 / 1 秒 1 个 / 随机顺序 / 不看返回 / 不 requeue / 不 abort, 走一遍就完
-    for i, code in enumerate(pending):
-        rec = c2a.call_once(token, code)
-        rec["run_id"] = c2a._run_id
-        c2a.append_state(c2a.DEFAULT_STATE, rec)
-        print_record(rec)
-        if i < n - 1:
-            time.sleep(1.0)
-
-    fresh = fetch_user(token)
-    if fresh:
-        bal = fresh.get("balance")
-        conc = fresh.get("concurrency")
-        if bal is not None and conc is not None:
-            print(color(f"  → 余额: ${bal:.4f}   并发: {conc}", C_GREEN))
-    return fresh or user
 
 
 # ==================== Setup 向导 ====================
@@ -1278,7 +1247,7 @@ def run_wizard() -> dict:
     token = None
     while not token:
         try:
-            token = c2a.get_token()
+            token = get_token()
         except SystemExit as exc:
             print(color(f"  ✗ {exc}", C_YELLOW))
             print(color(
@@ -1378,7 +1347,7 @@ def main() -> int:
     apply_domain(cfg["domain"])
 
     try:
-        token = c2a.get_token()
+        token = get_token()
     except SystemExit as exc:
         print(color(str(exc), C_RED))
         return 1
@@ -1416,7 +1385,6 @@ def main() -> int:
         ("名称", "key"),
         ("兑换历史", "history"),
         ("注入 codex", "inject"),
-        ("粘 hex 兑换码 兑换", "redeem"),
         ("退出", "quit"),
     ]
     last_idx = 0
@@ -1449,28 +1417,7 @@ def main() -> int:
             pause()
             continue
 
-        if choice == "redeem":
-            print(color("粘入 hex 兑换码（每行一个或一行多个，回车结束；空回车取消）:", C_BOLD))
-            try:
-                raw = read_input("> ")
-            except KeyboardInterrupt:
-                print()
-                continue
-            if not raw or not raw.strip():
-                print(color("  已取消", C_DIM))
-                pause()
-                continue
-            codes = parse_codes(raw)
-            if not codes:
-                print(color("  （未识别到 hex 兑换码）", C_YELLOW))
-                pause()
-                continue
-            new_user = redeem_codes(state["token"], codes, state["user"])
-            if new_user:
-                state["user"] = new_user
-            pause()
-
-        elif choice == "ep":
+        if choice == "ep":
             state["cfg"] = cmd_endpoints(state["token"], state["cfg"])
             refresh_default_ep()
             pause()
@@ -1501,7 +1448,7 @@ def main() -> int:
         elif choice == "setup":
             state["cfg"] = run_wizard()
             apply_domain(state["cfg"]["domain"])
-            state["token"] = c2a.get_token()
+            state["token"] = get_token()
             state["user"] = fetch_user(state["token"])
             refresh_default_key()
             refresh_default_ep()

@@ -11,7 +11,7 @@ set -eu
 REPO="r266-tech/sub2cli"
 BRANCH="main"
 DEST_DIR="${SUB2CLI_INSTALL_DIR:-${HOME}/.local/bin}"
-BINS="sub2cli sub2cli-redeem sub2cli-inject"
+BINS="sub2cli sub2cli-inject"
 
 mkdir -p "$DEST_DIR"
 
@@ -41,7 +41,7 @@ for b in $BINS; do
 done
 
 echo ""
-echo "Python 依赖 (sub2cli 主体 + sub2cli-redeem 需要):"
+echo "Python 依赖 (sub2cli 需要):"
 echo "  pip3 install --user requests websocket-client"
 echo "  (sub2cli-inject 无第三方依赖)"
 
