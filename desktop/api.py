@@ -259,6 +259,157 @@ class JsApi:
             self._default_key = chosen
         return {"ok": True, "default_key": self._serialize_key(chosen)}
 
+    def _resolve_inject_bin(self) -> str | None:
+        """Find sub2cli-inject binary; mirrors sub2cli._resolve_inject_bin."""
+        candidates = [
+            os.path.join(REPO_ROOT, "sub2cli-inject"),
+            os.path.expanduser("~/.local/bin/sub2cli-inject"),
+            shutil.which("sub2cli-inject"),
+            shutil.which("codex-provider"),
+        ]
+        for p in candidates:
+            if p and os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+        return None
+
+    def _current_default_inject_target(self) -> tuple[str, str, str] | None:
+        """Return (url, api_key, label) for the current default key+endpoint.
+
+        Returns None if not configured. label is human-readable summary.
+        """
+        with self._lock:
+            try:
+                ctx, cfg = self._ensure_ctx()
+            except RuntimeError:
+                return None
+            keys = ctx.fetch_keys()
+            default_name = (cfg or {}).get("default_key_name", "")
+            k = sub2cli_lib.find_key_by_name(keys, default_name)
+            url = (cfg or {}).get("default_endpoint_url") or ""
+            if not k or not url:
+                return None
+            api_key = k.get("key") or ""
+            g = k.get("group") or {}
+            label = (
+                f"key={k.get('name')} · 分组 {g.get('name','?')} "
+                f"({g.get('rate_multiplier')}x) · 线路 "
+                f"{(cfg or {}).get('default_endpoint_name','?')}"
+            )
+            return url, api_key, label
+
+    def inject_plan(self) -> dict:
+        """Dry-run: call sub2cli-inject add-api <url> <key> --dry-run.
+
+        Returns {ok, plan_text, label, slot_hint, command}. The plan_text is
+        the raw stdout of the inject binary so the modal can display it
+        verbatim — we don't try to re-parse the inject's plan format here.
+        """
+        target = self._current_default_inject_target()
+        if not target:
+            return {
+                "ok": False,
+                "error": "未设置默认 key 或端点; 先在主面板设默认。",
+            }
+        url, api_key, label = target
+        inject_bin = self._resolve_inject_bin()
+        if not inject_bin:
+            return {
+                "ok": False,
+                "error": "找不到 sub2cli-inject 二进制 (应在 repo 根 或 ~/.local/bin)",
+            }
+        try:
+            proc = subprocess.run(
+                [inject_bin, "add-api", url, api_key, "--skip-check", "--dry-run"],
+                capture_output=True, text=True, timeout=20,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"调用 inject 失败: {type(exc).__name__}: {exc}",
+            }
+        if proc.returncode != 0:
+            return {
+                "ok": False,
+                "error": f"inject --dry-run 返回 {proc.returncode}",
+                "stderr": proc.stderr,
+                "stdout": proc.stdout,
+            }
+        return {
+            "ok": True,
+            "plan_text": proc.stdout,
+            "label": label,
+            "command": f"sub2cli-inject add-api <url> <key> --skip-check (dry-run)",
+        }
+
+    def inject_apply(self) -> dict:
+        """Real inject: call sub2cli-inject add-api <url> <key> for current default.
+
+        Caller must show inject_plan() output first. Returns {ok, stdout, stderr}.
+        """
+        target = self._current_default_inject_target()
+        if not target:
+            return {"ok": False, "error": "未设置默认 key 或端点"}
+        url, api_key, _label = target
+        inject_bin = self._resolve_inject_bin()
+        if not inject_bin:
+            return {"ok": False, "error": "找不到 sub2cli-inject 二进制"}
+        try:
+            proc = subprocess.run(
+                [inject_bin, "add-api", url, api_key, "--skip-check"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "ok": proc.returncode == 0,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "returncode": proc.returncode,
+        }
+
+    def switch_relay(self, domain: str) -> dict:
+        """Change active relay. Rebuilds Sub2Context, re-runs bootstrap."""
+        cfg = sub2cli_lib.load_config()
+        if not cfg:
+            return {"ok": False, "error": "尚未配置"}
+        relays = cfg.get("relays") or {}
+        if domain not in relays:
+            return {"ok": False, "error": f"未保存的 relay: {domain}"}
+        # Reload cfg with target relay's default_* values
+        relay = relays[domain] or {}
+        cfg["domain"] = domain
+        for f in sub2cli_lib.RELAY_FIELDS:
+            cfg[f] = relay.get(f)
+        sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
+        with self._lock:
+            self._ctx = None  # force re-create on next ensure
+            self._cfg = None
+            self._user = None
+            self._default_key = None
+            self._default_ep = None
+        return self.bootstrap()
+
+    def list_relays_full(self) -> dict:
+        """Return all saved relays + which one is current."""
+        cfg = sub2cli_lib.load_config()
+        if not cfg:
+            return {"ok": False, "error": "尚未配置", "relays": [], "current": None}
+        relays = cfg.get("relays") or {}
+        current = cfg.get("domain", "")
+        items = []
+        for domain, r in relays.items():
+            r = r or {}
+            items.append({
+                "domain": domain,
+                "site": (sub2cli_lib._normalize_domain(domain)
+                         .replace("https://", "").replace("http://", "")
+                         .rstrip("/")),
+                "default_key_name": r.get("default_key_name"),
+                "default_endpoint_name": r.get("default_endpoint_name"),
+                "is_current": (domain == current),
+            })
+        return {"ok": True, "relays": items, "current": current}
+
     def check_health(self) -> dict:
         """5 environment + state checks for the 一键检测 panel.
 

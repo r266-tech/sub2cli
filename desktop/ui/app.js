@@ -140,6 +140,134 @@ function applyBootstrap(data) {
   renderDefaultKey(data);
   renderEndpoints(data.endpoints || [], data.default_endpoint);
   renderGroups(data.groups || [], data.keys || [], data.default_key);
+  refreshSidebar();  // sidebar is independent of bootstrap data
+}
+
+// ---- sidebar (multi-relay) ----
+
+async function refreshSidebar() {
+  const list = $('#sidebar-list');
+  try {
+    const r = await window.pywebview.api.list_relays_full();
+    if (!r.ok) {
+      list.replaceChildren(el('div', {
+        className: 'muted small',
+        text: r.error || '(空)',
+      }));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const relay of r.relays) {
+      const item = el('div', { className: 'sidebar-item' + (relay.is_current ? ' current' : '') });
+      item.appendChild(el('div', { className: 'sidebar-site', text: relay.site || relay.domain }));
+      const metaText = [
+        relay.default_key_name ? `key=${relay.default_key_name}` : null,
+        relay.default_endpoint_name ? `线路=${relay.default_endpoint_name}` : null,
+      ].filter(Boolean).join(' · ');
+      if (metaText) {
+        item.appendChild(el('div', { className: 'sidebar-meta', text: metaText }));
+      }
+      if (!relay.is_current) {
+        item.addEventListener('click', () => switchRelay(relay.domain));
+      }
+      frag.appendChild(item);
+    }
+    if (!r.relays.length) {
+      frag.appendChild(el('div', { className: 'muted small', text: '(尚无 relay; 跑 ./sub2cli 走 wizard)' }));
+    }
+    list.replaceChildren(frag);
+  } catch (err) {
+    list.replaceChildren(el('div', { className: 'muted small', text: '错: ' + String(err) }));
+  }
+}
+
+async function switchRelay(domain) {
+  setStatus(`切到 ${domain}…`, 'warn');
+  showScreen('loading');
+  try {
+    const data = await window.pywebview.api.switch_relay(domain);
+    if (!data.ok) {
+      showError(data.needs_login ? '需登录' : '切 relay 失败', data.error);
+      setStatus('未就绪', 'err');
+      return;
+    }
+    state.pingResults = {};
+    state.groupResults = {};
+    applyBootstrap(data);
+    showScreen('dashboard');
+    setStatus('✓ 已切 relay', 'ok');
+  } catch (err) {
+    showError('切 relay 失败', err && err.message ? err.message : String(err));
+    setStatus('错误', 'err');
+  }
+}
+
+// ---- inject modal (dry-run gate + apply) ----
+
+function openInjectModal() {
+  $('#inject-modal').classList.remove('hidden');
+  $('#btn-inject-confirm').disabled = true;
+  loadInjectPlan();
+}
+
+function closeInjectModal() {
+  $('#inject-modal').classList.add('hidden');
+}
+
+async function loadInjectPlan() {
+  const body = $('#inject-body');
+  body.replaceChildren(el('div', {
+    className: 'loader small',
+    children: [el('div', { className: 'spinner' })],
+  }));
+  try {
+    const r = await window.pywebview.api.inject_plan();
+    if (!r.ok) {
+      body.replaceChildren(
+        el('div', { className: 'plan-label plan-result err', text: '错误' }),
+        el('pre', { className: 'plan-preview', text: r.error + (r.stderr ? '\n\nstderr:\n' + r.stderr : '') }),
+      );
+      $('#btn-inject-confirm').disabled = true;
+      return;
+    }
+    body.replaceChildren(
+      el('div', { className: 'plan-label', text: r.label || '' }),
+      el('pre', { className: 'plan-preview', text: r.plan_text || '(空)' }),
+    );
+    $('#btn-inject-confirm').disabled = false;
+  } catch (err) {
+    body.replaceChildren(
+      el('div', { className: 'plan-label plan-result err', text: '调用 inject_plan 失败' }),
+      el('pre', { className: 'plan-preview', text: err && err.message ? err.message : String(err) }),
+    );
+    $('#btn-inject-confirm').disabled = true;
+  }
+}
+
+async function applyInject() {
+  const confirmBtn = $('#btn-inject-confirm');
+  confirmBtn.disabled = true;
+  confirmBtn.textContent = '执行中…';
+  setStatus('注入中…', 'warn');
+  try {
+    const r = await window.pywebview.api.inject_apply();
+    const body = $('#inject-body');
+    body.replaceChildren(
+      el('div', {
+        className: 'plan-label ' + (r.ok ? 'plan-result ok' : 'plan-result err'),
+        text: r.ok ? '✓ 注入完成 (rc=0)' : `✗ 注入失败 (rc=${r.returncode ?? '?'})`,
+      }),
+      el('pre', {
+        className: 'plan-preview',
+        text: (r.stdout || '') + (r.stderr ? '\n\nstderr:\n' + r.stderr : ''),
+      }),
+    );
+    confirmBtn.textContent = r.ok ? '✓ 完成' : '✗ 失败';
+    setStatus(r.ok ? '✓ 注入完成' : '✗ 注入失败', r.ok ? 'ok' : 'err');
+  } catch (err) {
+    setStatus('错误', 'err');
+    confirmBtn.textContent = '✗ 失败';
+  }
 }
 
 // ---- renderers ----
@@ -446,8 +574,18 @@ $('#health-modal').addEventListener('click', (e) => {
   if (e.target === $('#health-modal')) closeHealthModal();
 });
 
+$('#btn-inject').addEventListener('click', openInjectModal);
+$('#btn-inject-close').addEventListener('click', closeInjectModal);
+$('#btn-inject-cancel').addEventListener('click', closeInjectModal);
+$('#btn-inject-confirm').addEventListener('click', applyInject);
+
+$('#inject-modal').addEventListener('click', (e) => {
+  if (e.target === $('#inject-modal')) closeInjectModal();
+});
+
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !$('#health-modal').classList.contains('hidden')) {
-    closeHealthModal();
+  if (e.key === 'Escape') {
+    if (!$('#health-modal').classList.contains('hidden')) closeHealthModal();
+    if (!$('#inject-modal').classList.contains('hidden')) closeInjectModal();
   }
 });

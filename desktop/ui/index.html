@@ -35,6 +35,14 @@
     </div>
   </div>
 
+  <div class="app-shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-title">中转 (relays)</div>
+    <div class="sidebar-list" id="sidebar-list">
+      <div class="muted small">载入中…</div>
+    </div>
+  </aside>
+
   <main class="app-main" id="app-main">
     <section id="loading" class="screen">
       <div class="loader">
@@ -139,11 +147,28 @@
       </div>
 
       <div class="footer-cta">
-        <button class="primary big" id="btn-inject" disabled>注入到 Codex (P4 将启用)</button>
-        <span class="muted small">P4 会把这里串到 sub2cli-inject 的 dry-run gate</span>
+        <button class="primary big" id="btn-inject">注入到 Codex</button>
+        <span class="muted small">先 dry-run 看完计划再确认</span>
       </div>
     </section>
   </main>
+  </div>
+
+  <div class="modal-overlay hidden" id="inject-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">注入 Codex · 计划预览</span>
+        <button class="link" id="btn-inject-close">✕</button>
+      </div>
+      <div class="modal-body" id="inject-body">
+        <div class="loader small"><div class="spinner"></div></div>
+      </div>
+      <div class="modal-footer">
+        <button class="ghost" id="btn-inject-cancel">取消</button>
+        <button class="primary" id="btn-inject-confirm" disabled>确认执行</button>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>
