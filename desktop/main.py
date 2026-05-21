@@ -21,6 +21,8 @@ import traceback
 
 import webview
 
+from api import JsApi
+
 # ---- crash log ----
 
 CRASH_LOG_DIR = os.path.join(
@@ -98,30 +100,6 @@ def _load_sub2cli_lib():
 
 
 sub2cli_lib = _load_sub2cli_lib()
-
-
-class JsApi:
-    """Methods exposed to the frontend via window.pywebview.api.<name>().
-
-    Keep methods cheap + side-effect-free for P1; P2-P4 will add the real
-    Sub2Context-backed endpoints (fetch_user/keys/groups, dry-run inject, etc).
-    """
-
-    def hello(self) -> dict:
-        return {
-            "app": "sub2cli desktop",
-            "version": "0.1.0-p1",
-            "sub2cli_module_path": SUB2CLI_PATH,
-            "default_config_path": sub2cli_lib.default_config_path(),
-            "default_domain": sub2cli_lib.DEFAULT_DOMAIN,
-            "config_exists": os.path.exists(sub2cli_lib.default_config_path()),
-        }
-
-    def list_relays(self) -> list[str]:
-        cfg = sub2cli_lib.load_config()
-        if not cfg:
-            return []
-        return list((cfg.get("relays") or {}).keys())
 
 
 def main() -> int:
