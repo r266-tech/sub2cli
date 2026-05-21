@@ -344,6 +344,80 @@ async function revealKey() {
   }
 }
 
+// ---- health modal ----
+
+function openHealthModal() {
+  $('#health-modal').classList.remove('hidden');
+  runHealthCheck();
+}
+
+function closeHealthModal() {
+  $('#health-modal').classList.add('hidden');
+}
+
+function buildCheckRow(check) {
+  const row = el('div', { className: 'check-row' });
+
+  const iconClass = check.severity || (check.ok ? 'ok' : 'err');
+  const iconText = (
+    iconClass === 'ok' ? '✓' :
+    iconClass === 'warn' ? '!' :
+    iconClass === 'running' ? '⏳' : '✗'
+  );
+  row.appendChild(el('div', {
+    className: `check-icon ${iconClass}`,
+    text: iconText,
+  }));
+
+  const body = el('div', { className: 'check-body' });
+  body.appendChild(el('div', { className: 'check-name', text: check.name }));
+  body.appendChild(el('div', { className: 'check-msg', text: check.message || '' }));
+  if (check.fix_hint) {
+    body.appendChild(el('div', { className: 'check-hint', text: '修复: ' + check.fix_hint }));
+  }
+  row.appendChild(body);
+
+  return row;
+}
+
+async function runHealthCheck() {
+  const body = $('#health-body');
+  body.replaceChildren(el('div', {
+    className: 'loader small',
+    children: [el('div', { className: 'spinner' })],
+  }));
+  $('#health-summary').textContent = '检测中…';
+  try {
+    const r = await window.pywebview.api.check_health();
+    const frag = document.createDocumentFragment();
+    for (const c of r.checks || []) frag.appendChild(buildCheckRow(c));
+    body.replaceChildren(frag);
+    const total = (r.checks || []).length;
+    const okN = (r.checks || []).filter((c) => c.ok).length;
+    const warnN = (r.checks || []).filter((c) => c.severity === 'warn').length;
+    const errN = (r.checks || []).filter((c) => c.severity === 'err').length;
+    let summary = `${okN}/${total} 通过`;
+    if (warnN) summary += ` · ${warnN} 警告`;
+    if (errN) summary += ` · ${errN} 错误`;
+    $('#health-summary').textContent = summary;
+  } catch (err) {
+    body.replaceChildren(el('div', {
+      className: 'check-row',
+      children: [
+        el('div', { className: 'check-icon err', text: '✗' }),
+        el('div', {
+          className: 'check-body',
+          children: [
+            el('div', { className: 'check-name', text: '检测调用失败' }),
+            el('div', { className: 'check-msg', text: err && err.message ? err.message : String(err) }),
+          ],
+        }),
+      ],
+    }));
+    $('#health-summary').textContent = '失败';
+  }
+}
+
 // ---- wiring ----
 
 window.addEventListener('pywebviewready', () => {
@@ -363,3 +437,17 @@ $('#btn-retry').addEventListener('click', () => {
 $('#btn-reveal').addEventListener('click', revealKey);
 
 $('#btn-ping-all').addEventListener('click', pingAll);
+
+$('#btn-health').addEventListener('click', openHealthModal);
+$('#btn-health-close').addEventListener('click', closeHealthModal);
+$('#btn-health-rerun').addEventListener('click', runHealthCheck);
+
+$('#health-modal').addEventListener('click', (e) => {
+  if (e.target === $('#health-modal')) closeHealthModal();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('#health-modal').classList.contains('hidden')) {
+    closeHealthModal();
+  }
+});

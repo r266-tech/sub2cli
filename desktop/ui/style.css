@@ -304,3 +304,107 @@ button.link {
 button.link:hover:not(:disabled) { color: var(--fg); }
 
 button.sm { padding: 3px 8px; font-size: 11px; }
+
+/* ===== modal ===== */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 10, 14, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 30px;
+}
+
+.modal {
+  background: var(--bg-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  width: 100%;
+  max-width: 640px;
+  max-height: calc(100vh - 60px);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--accent);
+}
+
+.modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+}
+
+.loader.small { min-height: 120px; }
+
+/* health check rows */
+
+.check-row {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 10px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+  align-items: start;
+}
+.check-row:last-child { border-bottom: none; }
+
+.check-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  margin-top: 1px;
+}
+.check-icon.ok { background: rgba(107, 217, 127, 0.18); color: var(--success); }
+.check-icon.warn { background: rgba(232, 184, 90, 0.18); color: var(--warn); }
+.check-icon.err { background: rgba(240, 100, 100, 0.18); color: var(--error); }
+.check-icon.running { background: rgba(89, 211, 232, 0.18); color: var(--accent); }
+
+.check-body { min-width: 0; }
+.check-name {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 3px;
+}
+.check-msg {
+  font-size: 12px;
+  color: var(--fg);
+  word-break: break-all;
+  user-select: text;
+}
+.check-hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+  padding-left: 6px;
+  border-left: 2px solid var(--border-strong);
+  user-select: text;
+}

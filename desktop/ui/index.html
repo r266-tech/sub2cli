@@ -14,9 +14,26 @@
     </div>
     <div class="header-actions">
       <span class="status" id="status">·</span>
+      <button class="ghost" id="btn-health" title="一键检测环境">🩺 检测</button>
       <button class="ghost" id="btn-refresh" title="刷新所有">⟳</button>
     </div>
   </header>
+
+  <div class="modal-overlay hidden" id="health-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">一键检测 · 环境与状态</span>
+        <button class="link" id="btn-health-close">✕</button>
+      </div>
+      <div class="modal-body" id="health-body">
+        <div class="loader small"><div class="spinner"></div></div>
+      </div>
+      <div class="modal-footer">
+        <button class="ghost" id="btn-health-rerun">重新检测</button>
+        <span class="muted small" id="health-summary"></span>
+      </div>
+    </div>
+  </div>
 
   <main class="app-main" id="app-main">
     <section id="loading" class="screen">

@@ -9,8 +9,13 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import os
+import shutil
+import subprocess
 import threading
+import urllib.request
+from pathlib import Path
 from typing import Any
 
 
@@ -253,6 +258,237 @@ class JsApi:
             self._cfg = cfg
             self._default_key = chosen
         return {"ok": True, "default_key": self._serialize_key(chosen)}
+
+    def check_health(self) -> dict:
+        """5 environment + state checks for the 一键检测 panel.
+
+        Returns {ok: bool, checks: [{name, ok, severity, message, fix_hint}]}
+        severity: ok | warn | err
+        """
+        checks: list[dict] = []
+
+        # 1. Codex App installed?
+        app_path = Path("/Applications/Codex.app")
+        if app_path.is_dir():
+            version = "?"
+            try:
+                import plistlib
+                info_plist = app_path / "Contents" / "Info.plist"
+                with open(info_plist, "rb") as f:
+                    version = plistlib.load(f).get("CFBundleShortVersionString", "?")
+            except Exception:
+                pass
+            checks.append({
+                "name": "Codex App",
+                "ok": True,
+                "severity": "ok",
+                "message": f"已安装 ({version})",
+                "fix_hint": None,
+            })
+        else:
+            checks.append({
+                "name": "Codex App",
+                "ok": False,
+                "severity": "warn",
+                "message": "未在 /Applications/Codex.app 找到",
+                "fix_hint": "从 https://codex.io 下载安装; 若装在非默认位置可忽略",
+            })
+
+        # 2. codex CLI in PATH?
+        codex_path = shutil.which("codex")
+        if codex_path:
+            cli_version = "?"
+            try:
+                r = subprocess.run(
+                    [codex_path, "--version"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                cli_version = (r.stdout or r.stderr).strip().split("\n")[0] or "?"
+            except Exception:
+                pass
+            checks.append({
+                "name": "codex CLI",
+                "ok": True,
+                "severity": "ok",
+                "message": f"{codex_path} ({cli_version})",
+                "fix_hint": None,
+            })
+        else:
+            checks.append({
+                "name": "codex CLI",
+                "ok": False,
+                "severity": "err",
+                "message": "在 PATH 找不到 codex 命令",
+                "fix_hint": "npm i -g @openai/codex 或检查当前 shell 的 PATH",
+            })
+
+        # 3. Edge CDP 9222 + 当前 relay 的登录 tab
+        cdp_ok = False
+        cdp_sev = "err"
+        cdp_msg = ""
+        cdp_hint: str | None = (
+            "Edge 启动加 --remote-debugging-port=9222 (推荐 LaunchAgent 守护)"
+        )
+        site_for_check: str | None = None
+        try:
+            with self._lock:
+                if self._ctx is None:
+                    try:
+                        self._ensure_ctx()
+                    except RuntimeError:
+                        pass
+                if self._ctx is not None:
+                    site_for_check = self._ctx.site
+        except Exception:
+            pass
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=2) as resp:
+                tabs = json.load(resp)
+            if site_for_check:
+                tab = next(
+                    (t for t in tabs if t.get("type") == "page" and site_for_check in t.get("url", "")),
+                    None,
+                )
+                if tab:
+                    cdp_ok = True
+                    cdp_sev = "ok"
+                    cdp_msg = f"CDP 通, {site_for_check} tab 已登录"
+                    cdp_hint = None
+                else:
+                    cdp_ok = False
+                    cdp_sev = "warn"
+                    cdp_msg = f"CDP 通, 但找不到 {site_for_check} 的登录 tab"
+                    cdp_hint = f"在 Edge 打开 https://{site_for_check} 并登录"
+            else:
+                cdp_ok = True
+                cdp_sev = "ok"
+                cdp_msg = f"CDP 通 ({len(tabs)} 个 tab; 未配置 relay, 跳过 tab 匹配)"
+                cdp_hint = None
+        except Exception as exc:
+            cdp_msg = f"127.0.0.1:9222 不可达 ({type(exc).__name__})"
+        checks.append({
+            "name": "Edge CDP",
+            "ok": cdp_ok,
+            "severity": cdp_sev,
+            "message": cdp_msg,
+            "fix_hint": cdp_hint,
+        })
+
+        # 4. ~/.codex slot symlink 健康
+        codex_home = Path(os.path.expanduser("~/.codex"))
+        auth_json = codex_home / "auth.json"
+        slot_file = codex_home / "provider-slots.json"
+        app_support_codex = Path(os.path.expanduser("~/Library/Application Support/Codex"))
+
+        slot_issues: list[str] = []
+        if not codex_home.exists():
+            slot_issues.append("~/.codex 不存在")
+        if codex_home.exists() and not slot_file.exists():
+            slot_issues.append("provider-slots.json 不存在")
+        if auth_json.exists() and not auth_json.is_symlink():
+            slot_issues.append("~/.codex/auth.json 是真文件 (该是 symlink)")
+        if app_support_codex.exists() and not app_support_codex.is_symlink():
+            slot_issues.append("~/Library/Application Support/Codex 是真目录 (该是 symlink)")
+
+        if slot_issues:
+            checks.append({
+                "name": "~/.codex slot",
+                "ok": False,
+                "severity": "warn",
+                "message": "; ".join(slot_issues),
+                "fix_hint": "运行 sub2cli-inject init (会把现状包成第一个 slot + 建 symlink)",
+            })
+        elif slot_file.exists():
+            try:
+                with open(slot_file) as f:
+                    slots_data = json.load(f)
+                current = slots_data.get("current") or "(无)"
+                n = len(slots_data.get("slots", {}))
+                checks.append({
+                    "name": "~/.codex slot",
+                    "ok": True,
+                    "severity": "ok",
+                    "message": f"current={current}, {n} 个 slot, symlinks OK",
+                    "fix_hint": None,
+                })
+            except Exception as exc:
+                checks.append({
+                    "name": "~/.codex slot",
+                    "ok": False,
+                    "severity": "warn",
+                    "message": f"读 provider-slots.json 失败: {exc}",
+                    "fix_hint": None,
+                })
+        else:
+            checks.append({
+                "name": "~/.codex slot",
+                "ok": True,
+                "severity": "warn",
+                "message": "尚未初始化 (没用过 sub2cli-inject)",
+                "fix_hint": "sub2cli-inject init",
+            })
+
+        # 5. 默认 key + 端点 可达
+        try:
+            with self._lock:
+                try:
+                    ctx, cfg = self._ensure_ctx()
+                except RuntimeError as exc:
+                    checks.append({
+                        "name": "默认 key + 端点",
+                        "ok": False,
+                        "severity": "warn",
+                        "message": str(exc),
+                        "fix_hint": None,
+                    })
+                    ctx = None
+            if ctx is not None:
+                keys = ctx.fetch_keys()
+                default_name = (cfg or {}).get("default_key_name", "")
+                default_key = sub2cli_lib.find_key_by_name(keys, default_name)
+                default_ep_url = (cfg or {}).get("default_endpoint_url") or ""
+                if not default_key or not default_ep_url:
+                    checks.append({
+                        "name": "默认 key + 端点",
+                        "ok": False,
+                        "severity": "warn",
+                        "message": "未设置默认 key 或端点",
+                        "fix_hint": "在主面板的端点/分组 section 设默认",
+                    })
+                else:
+                    probe = sub2cli_lib.probe_endpoint(
+                        default_ep_url, api_key=default_key.get("key")
+                    )
+                    if probe.get("ok"):
+                        checks.append({
+                            "name": "默认 key + 端点",
+                            "ok": True,
+                            "severity": "ok",
+                            "message": (
+                                f"{default_ep_url}  "
+                                f"{probe.get('latency_ms')}ms · {probe.get('summary')}"
+                            ),
+                            "fix_hint": None,
+                        })
+                    else:
+                        checks.append({
+                            "name": "默认 key + 端点",
+                            "ok": False,
+                            "severity": "err",
+                            "message": f"探测失败 (status={probe.get('status')}): {probe.get('summary')}",
+                            "fix_hint": "切端点或换 key (主面板)",
+                        })
+        except Exception as exc:
+            checks.append({
+                "name": "默认 key + 端点",
+                "ok": False,
+                "severity": "err",
+                "message": f"检查抛错: {type(exc).__name__}: {exc}",
+                "fix_hint": None,
+            })
+
+        overall_ok = all(c["ok"] for c in checks)
+        return {"ok": overall_ok, "checks": checks}
 
     def test_group(self, group_id: int) -> dict:
         """Switch default key to group_id, run chat + image test, return both."""
