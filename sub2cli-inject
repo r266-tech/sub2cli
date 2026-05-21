@@ -17,9 +17,15 @@ import select
 import sqlite3
 import subprocess
 import sys
-import termios
 import time
-import tty
+
+if os.name == "nt":
+    import msvcrt
+    termios = None
+    tty = None
+else:
+    import termios
+    import tty
 
 try:
     import readline  # noqa: F401  启用 input() 的行编辑 (退格/CJK 宽度/Ctrl-U/方向键)
@@ -31,9 +37,14 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
+IS_WINDOWS = os.name == "nt"
 HOME = Path(os.environ.get("CODEX_PROVIDER_HOME", str(Path.home()))).expanduser()
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(HOME / ".codex"))).expanduser()
-APP_SUPPORT = HOME / "Library" / "Application Support"
+APP_SUPPORT = (
+    Path(os.environ.get("LOCALAPPDATA", str(HOME / "AppData" / "Local"))) / "Codex"
+    if IS_WINDOWS
+    else HOME / "Library" / "Application Support"
+)
 APP_PROFILE = APP_SUPPORT / "Codex"
 AUTH_JSON = CODEX_HOME / "auth.json"
 CONFIG_TOML = CODEX_HOME / "config.toml"
@@ -117,6 +128,86 @@ def atomic_symlink(link_path: Path, target: Path) -> None:
     os.replace(tmp, link_path)
 
 
+def copy_path_atomic(src: Path, dst: Path) -> bool:
+    if not src.exists():
+        return False
+    if dst.exists():
+        try:
+            if src.read_bytes() == dst.read_bytes():
+                return False
+        except OSError:
+            pass
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_bytes(src.read_bytes())
+        tmp.replace(dst)
+    except Exception:
+        if tmp.exists() or tmp.is_symlink():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+    return True
+
+
+def prepare_windows_auth_temp(auth_target: Path) -> tuple[Path, bool]:
+    tmp = AUTH_JSON.with_name(f"{AUTH_JSON.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    if auth_target.exists():
+        tmp.write_bytes(auth_target.read_bytes())
+        return tmp, False
+    return tmp, True
+
+
+def install_prepared_windows_auth(tmp: Path, remove_auth: bool) -> None:
+    try:
+        if remove_auth:
+            if AUTH_JSON.exists() or AUTH_JSON.is_symlink():
+                AUTH_JSON.unlink()
+            return
+        tmp.replace(AUTH_JSON)
+    finally:
+        if tmp.exists() or tmp.is_symlink():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def windows_auth_matches(auth_target: Path) -> bool:
+    if not auth_target.exists():
+        return not AUTH_JSON.exists()
+    try:
+        return AUTH_JSON.exists() and AUTH_JSON.read_bytes() == auth_target.read_bytes()
+    except OSError:
+        return False
+
+
+def recover_windows_current_slot(data: dict) -> None:
+    current = data.get("current")
+    slots = data.get("slots", {})
+    if current not in slots:
+        return
+    auth_path = Path(slots[current].get("auth_file", "")).expanduser()
+    if windows_auth_matches(auth_path):
+        return
+    tmp, remove_auth = prepare_windows_auth_temp(auth_path)
+    install_prepared_windows_auth(tmp, remove_auth)
+
+
+def save_current_windows_auth(data: dict) -> None:
+    current = data.get("current")
+    slots = data.get("slots", {})
+    if current not in slots or not AUTH_JSON.exists():
+        return
+    auth_path = Path(slots[current].get("auth_file", "")).expanduser()
+    if auth_path:
+        copy_path_atomic(AUTH_JSON, auth_path)
+
+
 def symlink_points_to(link_path: Path, target: Path) -> bool:
     if not link_path.is_symlink():
         return False
@@ -174,12 +265,28 @@ def save_slots(data: dict) -> None:
 
 
 def codex_running() -> bool:
+    if IS_WINDOWS:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Codex.exe", "/NH"],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and "Codex.exe" in result.stdout
     return subprocess.run(["pgrep", "-x", "Codex"], capture_output=True).returncode == 0
 
 
 def quit_codex(timeout: float = 8.0) -> bool:
     if not codex_running():
         return False
+    if IS_WINDOWS:
+        subprocess.run(["taskkill", "/IM", "Codex.exe"], check=False, capture_output=True)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not codex_running():
+                return True
+            time.sleep(0.25)
+        fail("Codex.exe 退出超时。请手动退出 Codex App 后重试。")
+        return True
     try:
         subprocess.run(
             ["osascript", "-e", 'tell application id "com.openai.codex" to quit'],
@@ -200,6 +307,9 @@ def quit_codex(timeout: float = 8.0) -> bool:
 
 
 def launch_codex() -> None:
+    if IS_WINDOWS:
+        print("  Windows: 请手动重新打开 Codex App。")
+        return
     subprocess.Popen(["open", "-a", "Codex"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -219,6 +329,34 @@ def decode_auth_email(auth_file: Path) -> str | None:
 def cmd_init(slot: str = "local", display: str | None = None, *, quiet: bool = False) -> int:
     slot = validate_slot(slot)
     data = load_slots(required=False)
+    if IS_WINDOWS:
+        if data.get("current") and data.get("slots"):
+            recover_windows_current_slot(data)
+            if not quiet:
+                print(f"already initialized: current={data['current']}")
+                print(f"slots file: {SLOTS_FILE}")
+            return 0
+        CODEX_HOME.mkdir(parents=True, exist_ok=True)
+        auth_slot = CODEX_HOME / f"auth.{slot}.json"
+        if AUTH_JSON.exists() and not auth_slot.exists():
+            copy_path_atomic(AUTH_JSON, auth_slot)
+        email = decode_auth_email(auth_slot) if auth_slot.exists() else None
+        display_name = display or (f"Codex - {email}" if email else f"Codex - {slot}")
+        data["slots"][slot] = {
+            "display_name": display_name,
+            "mode": "oauth",
+            "auth_file": str(auth_slot),
+            "app_profile_dir": "",
+        }
+        data["current"] = slot
+        data["app_history_slot"] = slot
+        save_slots(data)
+        if not quiet:
+            print(f"initialized: {slot}")
+            print(f"  auth:  {auth_slot}")
+            print(f"  slots: {SLOTS_FILE}")
+        return 0
+
     if data.get("current") and data.get("slots") and AUTH_JSON.is_symlink() and APP_PROFILE.is_symlink():
         if not quiet:
             print(f"already initialized: current={data['current']}")
@@ -654,10 +792,17 @@ def slot_is_clean(data: dict, target_slot: str) -> bool:
     profile_target = history_profile_target(data, target_slot)
     if data.get("current") != target_slot:
         return False
-    if not symlink_points_to(AUTH_JSON, auth_target):
-        return False
-    if not symlink_points_to(APP_PROFILE, profile_target):
-        return False
+    if IS_WINDOWS:
+        try:
+            if not AUTH_JSON.exists() or AUTH_JSON.read_bytes() != auth_target.read_bytes():
+                return False
+        except OSError:
+            return False
+    else:
+        if not symlink_points_to(AUTH_JSON, auth_target):
+            return False
+        if not symlink_points_to(APP_PROFILE, profile_target):
+            return False
     if cfg.get("mode") == "relay":
         api_key = str(cfg.get("api_key") or "")
         try:
@@ -673,6 +818,8 @@ def slot_is_clean(data: dict, target_slot: str) -> bool:
 def cmd_switch(name: str, *, no_restart: bool = False) -> int:
     ensure_initialized()
     data = load_slots()
+    if IS_WINDOWS:
+        recover_windows_current_slot(data)
     slots = data.get("slots", {})
     target_slot = resolve_slot(name, slots)
     cfg = slots[target_slot]
@@ -688,10 +835,14 @@ def cmd_switch(name: str, *, no_restart: bool = False) -> int:
     if not no_restart:
         quit_codex()
 
+    if IS_WINDOWS:
+        save_current_windows_auth(data)
+
     auth_target = Path(cfg["auth_file"]).expanduser()
     profile_target = history_profile_target(data, target_slot)
     auth_target.parent.mkdir(parents=True, exist_ok=True)
-    profile_target.mkdir(parents=True, exist_ok=True)
+    if not IS_WINDOWS:
+        profile_target.mkdir(parents=True, exist_ok=True)
 
     if mode == "relay":
         api_key = str(cfg.get("api_key") or "").strip()
@@ -703,19 +854,25 @@ def cmd_switch(name: str, *, no_restart: bool = False) -> int:
     else:
         patch_config(mode="oauth", model=cfg.get("model", DEFAULT_MODEL))
 
-    atomic_symlink(AUTH_JSON, auth_target)
-    atomic_symlink(APP_PROFILE, profile_target)
+    if IS_WINDOWS:
+        auth_tmp, remove_auth = prepare_windows_auth_temp(auth_target)
+    else:
+        atomic_symlink(AUTH_JSON, auth_target)
+        atomic_symlink(APP_PROFILE, profile_target)
     session_stats = normalize_sessions_if_needed(slot_thread_provider(cfg))
 
     previous = data.get("current")
     data["current"] = target_slot
     data.setdefault("app_history_slot", target_slot)
     save_slots(data)
+    if IS_WINDOWS:
+        install_prepared_windows_auth(auth_tmp, remove_auth)
 
     verb = "已修复当前渠道" if previous == target_slot else "已切换到"
     print(f"{verb}：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
-    print(f"  auth.json   -> {auth_target}")
-    print(f"  App profile -> {profile_target}（历史保留）")
+    print(f"  auth.json   {'<-' if IS_WINDOWS else '->'} {auth_target}")
+    if not IS_WINDOWS:
+        print(f"  App profile -> {profile_target}（历史保留）")
     if mode == "relay":
         print(f"  base_url    -> {cfg.get('base_url')}")
         print(f"  model       -> {cfg.get('model', DEFAULT_MODEL)}")
@@ -724,7 +881,8 @@ def cmd_switch(name: str, *, no_restart: bool = False) -> int:
     print_session_summary(session_stats)
     if not no_restart:
         launch_codex()
-        print("  Codex App 已重新打开")
+        if not IS_WINDOWS:
+            print("  Codex App 已重新打开")
     else:
         print("  --no-restart：Codex App 未重新打开")
     return 0
@@ -766,7 +924,7 @@ def cmd_relay(
         "display_name": display or (existing or {}).get("display_name") or f"Codex - {slot} relay",
         "mode": "relay",
         "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
-        "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+        "app_profile_dir": "" if IS_WINDOWS else str(APP_SUPPORT / f"Codex.{slot}"),
         "base_url": base_url,
         "model": model,
         "api_key": api_key,
@@ -801,7 +959,7 @@ def cmd_oauth(
         "display_name": display or (existing or {}).get("display_name") or f"Codex - {slot}",
         "mode": "oauth",
         "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
-        "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+        "app_profile_dir": "" if IS_WINDOWS else str(APP_SUPPORT / f"Codex.{slot}"),
     }
     save_slots(data)
     print(f"{'已更新' if existing else '已添加'}账号渠道：{slot}")
@@ -847,7 +1005,8 @@ def cmd_status() -> int:
     print(f"当前渠道：{cfg.get('display_name', current)} ({current}) [{cfg.get('mode', 'oauth')}]")
     print(f"  渠道文件:    {SLOTS_FILE}")
     print(f"  auth.json:   {'-> ' + os.readlink(AUTH_JSON) if AUTH_JSON.is_symlink() else str(AUTH_JSON)}")
-    print(f"  App profile: {'-> ' + os.readlink(APP_PROFILE) if APP_PROFILE.is_symlink() else str(APP_PROFILE)}")
+    if not IS_WINDOWS:
+        print(f"  App profile: {'-> ' + os.readlink(APP_PROFILE) if APP_PROFILE.is_symlink() else str(APP_PROFILE)}")
     print(f"  App 运行中:  {'是' if codex_running() else '否'}")
     counts = thread_provider_counts()
     if counts:
@@ -875,7 +1034,7 @@ def cmd_remove(slot: str, *, hard: bool = False) -> int:
             if CODEX_HOME.resolve(strict=False) in auth_path.resolve(strict=False).parents:
                 auth_path.unlink()
                 print(f"  removed {auth_path}")
-        if profile_path.exists() and not profile_path.is_symlink():
+        if (not IS_WINDOWS) and profile_path.exists() and not profile_path.is_symlink():
             if APP_SUPPORT.resolve(strict=False) in profile_path.resolve(strict=False).parents:
                 import shutil
 
@@ -913,6 +1072,26 @@ def pause() -> None:
 
 
 def read_key() -> str:
+    if os.name == "nt":
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            code = msvcrt.getwch()
+            if code in ("H", "K"):
+                return "up"
+            if code in ("P", "M"):
+                return "down"
+            return ""
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch in ("q", "Q", "\x03"):
+            return "quit"
+        if ch in ("b", "B", "\x08"):
+            return "back"
+        if ch in ("v", "V"):
+            return "version"
+        if ch in ("m", "M"):
+            return "more"
+        return ""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:

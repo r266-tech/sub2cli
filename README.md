@@ -76,15 +76,54 @@ pip3 install --user requests websocket-client
 
 2 个 binary 装到 `~/.local/bin/` (覆盖位置走 `SUB2CLI_INSTALL_DIR` env). `sub2cli-inject` 零依赖, `sub2cli` 需要 `requests` + `websocket-client`.
 
+**Windows PowerShell:**
+
+```powershell
+git clone https://github.com/r266-tech/sub2cli
+cd sub2cli
+.\install.ps1
+python -m pip install --user requests websocket-client
+```
+
+Windows 下会额外生成同名 `.cmd` 包装器。包装器会嵌入安装时解析到的 Python 路径；如果之后移动或更换 Python, 重新运行 `.\install.ps1`。
+如果 PowerShell 执行策略拦截脚本:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+如果系统默认 `python` 不是目标 Python:
+
+```powershell
+.\install.ps1 -Python "C:\Path\To\python.exe"
+```
+
+如果安装目录不在 PATH, 按安装脚本提示加入用户 PATH, 或当前 PowerShell 临时加入:
+
+```powershell
+$env:Path += ";$HOME\.local\bin"
+```
+
 启动:
 
 ```bash
 sub2cli
 ```
 
+Windows 直接注入 Codex CLI:
+
+```powershell
+sub2cli-inject add-api https://relay.example.com/v1 sk-...
+```
+
+Windows 下 `sub2cli-inject` 会写入 `%USERPROFILE%\.codex\auth.<slot>.json`,
+切换渠道时复制当前 slot 到 `%USERPROFILE%\.codex\auth.json`, 并更新
+`%USERPROFILE%\.codex\config.toml`. 不管理 Codex App profile symlink; 如果
+Codex App 正在运行, 切换后手动重新打开。
+
 ## 依赖
 
-- macOS (Codex App 路径依赖 `~/Library/Application Support/Codex`)
+- macOS 或 Windows
 - Python 3.10+
 - Edge / Chromium with `--remote-debugging-port=9222` (用于读浏览器里 Sub2API 网页的 auth_token)
 - pip 包: `requests`, `websocket-client` (sub2cli 主体)
@@ -128,7 +167,8 @@ sub2cli-inject     Codex 渠道写入器 (vendored from r266-tech/codex-provider
 
 `sub2cli` 启动时从 Edge CDP (`http://127.0.0.1:9222`) 读 Sub2API 网页的 `localStorage.auth_token`, 调网关 REST API (`/auth/me` / `/keys` / `/groups/available` / `/settings/public` / `/redeem/history` / `/chat/completions` / `/images/generations`).
 
-`sub2cli-inject` 写 `~/.codex/auth.<slot>.json` + 改 `~/.codex/config.toml` 的 `[model_providers.OpenAI]` + symlink + 重启 Codex App.
+`sub2cli-inject` 写 `~/.codex/auth.<slot>.json` + 改 `~/.codex/config.toml` 的 `[model_providers.OpenAI]`.
+macOS 下用 symlink 切换 `auth.json` / Codex App profile 并重启 Codex App；Windows 下复制当前 slot 的 `auth.json` 到 `~/.codex/auth.json`，保留同样的 Codex CLI 配置切换能力，Codex App 需要手动重新打开。
 
 ## Upstream / 致谢
 
