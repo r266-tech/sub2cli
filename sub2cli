@@ -37,68 +37,32 @@ except ImportError:
 import requests
 import websocket  # type: ignore[import-not-found]
 
-# ---- 路径 ----
-CONFIG_DIR = os.path.join(
-    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
-    "sub2cli",
-)
-CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
-# ---- Token 读取 (Edge CDP) ----
-CDP_HOST = os.environ.get("EDGE_CDP_HOST", "127.0.0.1")
-CDP_PORT = int(os.environ.get("EDGE_CDP_PORT", "9222"))
+# ==================== 默认值 ====================
 
-# ---- 全局变量（被 apply_domain 改写）----
-SITE = "www.codex2api.com"
-DOMAIN = f"https://{SITE}"
-API_BASE = f"https://{SITE}/api/v1"
-
-
-def get_token() -> str:
-    """从 Edge/Chromium 的 CDP (默认 127.0.0.1:9222) 拿当前 SITE 标签页的
-    localStorage.auth_token。环境变量 SUB2CLI_TOKEN 可整体覆盖。"""
-    if t := os.environ.get("SUB2CLI_TOKEN"):
-        return t
-    try:
-        tabs = json.load(
-            urllib.request.urlopen(f"http://{CDP_HOST}:{CDP_PORT}/json", timeout=3)
-        )
-    except Exception as exc:
-        sys.exit(f"[token] Edge CDP unreachable at {CDP_HOST}:{CDP_PORT} ({exc})")
-    target = next(
-        (t for t in tabs if t.get("type") == "page" and SITE in t.get("url", "")),
-        None,
+def default_config_path() -> str:
+    return os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "sub2cli",
+        "config.json",
     )
-    if not target:
-        sys.exit(
-            f"[token] no {SITE} tab open in Edge — log in there first "
-            f"(or set SUB2CLI_TOKEN env)"
-        )
-    try:
-        ws = websocket.create_connection(
-            target["webSocketDebuggerUrl"], timeout=5, suppress_origin=True
-        )
-        ws.send(
-            json.dumps(
-                {
-                    "id": 1,
-                    "method": "Runtime.evaluate",
-                    "params": {
-                        "expression": "localStorage.getItem('auth_token')",
-                        "returnByValue": True,
-                    },
-                }
-            )
-        )
-        val = json.loads(ws.recv())["result"]["result"]["value"]
-        ws.close()
-    except Exception as exc:
-        sys.exit(f"[token] CDP evaluate failed: {exc}")
-    if not val:
-        sys.exit("[token] auth_token missing from localStorage (logged out?)")
-    return val
 
-# ---- ANSI 颜色 ----
+
+DEFAULT_CDP_HOST = os.environ.get("EDGE_CDP_HOST", "127.0.0.1")
+DEFAULT_CDP_PORT = int(os.environ.get("EDGE_CDP_PORT", "9222"))
+DEFAULT_DOMAIN = "https://www.codex2api.com"
+
+# 持久化到 config["relays"][domain] 下的字段
+RELAY_FIELDS = (
+    "default_key_id",
+    "default_key_name",
+    "default_endpoint_name",
+    "default_endpoint_url",
+)
+
+
+# ==================== ANSI 颜色 ====================
+
 C_RESET = "\033[0m"
 C_DIM = "\033[2m"
 C_BOLD = "\033[1m"
@@ -116,152 +80,214 @@ def color(s: str, c: str) -> str:
     return f"{c}{s}{C_RESET}"
 
 
-# ==================== 配置 ====================
+# ==================== Sub2Context ====================
 
-RELAY_FIELDS = (
-    "default_key_id",
-    "default_key_name",
-    "default_endpoint_name",
-    "default_endpoint_url",
-)
+class TokenError(RuntimeError):
+    """CDP 不可达 / 没找到登录 tab / localStorage 空时抛."""
 
 
-def load_config() -> dict | None:
-    if not os.path.exists(CONFIG_PATH):
-        return None
-    try:
-        with open(CONFIG_PATH) as f:
-            cfg = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    # 迁移：旧版无 relays 字段 → 把当前 domain 的设置打包成第一个 relay
-    if "relays" not in cfg and cfg.get("domain"):
-        cfg["relays"] = {cfg["domain"]: {f: cfg.get(f) for f in RELAY_FIELDS}}
-    return cfg
+def _normalize_domain(value: str) -> str:
+    value = value.strip().rstrip("/")
+    if not value:
+        return value
+    if not re.match(r"^https?://", value):
+        value = "https://" + value
+    return value
 
 
-def save_config(cfg: dict) -> None:
-    # 自动把当前 top-level default_* 同步进 relays[domain]
-    domain = cfg.get("domain", "")
-    if domain:
-        relays = cfg.setdefault("relays", {})
-        relays[domain] = {f: cfg.get(f) for f in RELAY_FIELDS}
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-    os.chmod(CONFIG_PATH, 0o600)
+class Sub2Context:
+    """单个 relay 的运行时上下文 — domain / token / 路径 一对一封装。
 
+    取代旧版的 module-level SITE / DOMAIN / API_BASE 全局，让 GUI 和 JSON-RPC
+    模式能并发持有多个 relay 而不互相污染。
+    """
 
-def apply_domain(domain: str) -> None:
-    """根据 domain 更新全局 SITE / DOMAIN / API_BASE。"""
-    global SITE, DOMAIN, API_BASE
-    host = urlparse(domain).hostname or domain.replace("https://", "").replace("http://", "").rstrip("/")
-    SITE = host
-    DOMAIN = f"https://{host}"
-    API_BASE = f"https://{host}/api/v1"
+    def __init__(
+        self,
+        domain: str,
+        *,
+        token: str | None = None,
+        config_path: str | None = None,
+        cdp_host: str | None = None,
+        cdp_port: int | None = None,
+    ) -> None:
+        domain = _normalize_domain(domain)
+        host = urlparse(domain).hostname or domain.replace("https://", "").replace("http://", "")
+        self.domain = domain
+        self.site = host
+        self.api_base = f"https://{host}/api/v1"
+        self._token = token
+        self.config_path = config_path or default_config_path()
+        self.cdp_host = cdp_host or DEFAULT_CDP_HOST
+        self.cdp_port = cdp_port or DEFAULT_CDP_PORT
+        self._session = requests.Session()
 
+    # ---- token plumbing ----
 
-# ==================== API 调用 ====================
+    @property
+    def token(self) -> str:
+        if self._token is None:
+            self._token = self._fetch_token_from_cdp()
+        return self._token
 
-def _auth_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    def has_token(self) -> bool:
+        return self._token is not None
 
+    def set_token(self, token: str) -> None:
+        self._token = token
 
-def fetch_user(token: str) -> dict | None:
-    try:
-        r = requests.get(f"{API_BASE}/auth/me", headers=_auth_headers(token), timeout=8)
-        if r.status_code == 200:
-            return r.json().get("data", {})
-    except requests.RequestException:
-        pass
-    return None
+    def clear_token(self) -> None:
+        self._token = None
 
-
-def fetch_keys(token: str) -> list[dict]:
-    try:
-        r = requests.get(f"{API_BASE}/keys", headers=_auth_headers(token), timeout=8)
-        if r.status_code == 200:
-            return (r.json().get("data") or {}).get("items", []) or []
-    except requests.RequestException:
-        pass
-    return []
-
-
-def fetch_settings(token: str) -> dict | None:
-    try:
-        r = requests.get(
-            f"{API_BASE}/settings/public", headers=_auth_headers(token), timeout=8
-        )
-        if r.status_code == 200:
-            return r.json().get("data", {})
-    except requests.RequestException:
-        pass
-    return None
-
-
-def fetch_groups(token: str) -> list[dict]:
-    try:
-        r = requests.get(
-            f"{API_BASE}/groups/available", headers=_auth_headers(token), timeout=10
-        )
-        if r.status_code == 200:
-            return r.json().get("data", []) or []
-    except requests.RequestException:
-        pass
-    return []
-
-
-def fetch_history(token: str, limit: int = 10) -> list[dict]:
-    try:
-        r = requests.get(
-            f"{API_BASE}/redeem/history", headers=_auth_headers(token), timeout=8
-        )
-        if r.status_code == 200:
-            return (r.json().get("data") or [])[:limit]
-    except requests.RequestException:
-        pass
-    return []
-
-
-def create_key(token: str, name: str = "sub2cli") -> dict | None:
-    """POST /api/v1/keys with {name}. Server auto-fills group_id/quota defaults."""
-    try:
-        r = requests.post(
-            f"{API_BASE}/keys",
-            headers={**_auth_headers(token), "Content-Type": "application/json"},
-            json={"name": name},
-            timeout=10,
-        )
-        if r.status_code in (200, 201):
-            body = r.json() if r.content else {}
-            return body.get("data") if isinstance(body, dict) else None
-    except requests.RequestException:
-        pass
-    return None
-
-
-def update_key_group(token: str, key_id: int, group_id: int) -> tuple[bool, str]:
-    """PUT /api/v1/keys/{id} with {group_id}. Returns (ok, detail)."""
-    try:
-        r = requests.put(
-            f"{API_BASE}/keys/{key_id}",
-            headers={**_auth_headers(token), "Content-Type": "application/json"},
-            json={"group_id": group_id},
-            timeout=10,
-        )
+    def _fetch_token_from_cdp(self) -> str:
+        if t := os.environ.get("SUB2CLI_TOKEN"):
+            return t
         try:
-            body = r.json()
-        except ValueError:
-            body = {"raw": r.text[:200]}
-        if r.status_code == 200 and body.get("code") == 0:
-            return True, ""
-        return False, body.get("message") or body.get("detail") or f"HTTP {r.status_code}"
-    except requests.RequestException as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+            tabs = json.load(
+                urllib.request.urlopen(
+                    f"http://{self.cdp_host}:{self.cdp_port}/json", timeout=3
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise TokenError(
+                f"Edge CDP unreachable at {self.cdp_host}:{self.cdp_port} ({exc})"
+            ) from exc
+        target = next(
+            (t for t in tabs if t.get("type") == "page" and self.site in t.get("url", "")),
+            None,
+        )
+        if not target:
+            raise TokenError(
+                f"no {self.site} tab open in Edge — log in there first "
+                f"(or set SUB2CLI_TOKEN env)"
+            )
+        try:
+            ws = websocket.create_connection(
+                target["webSocketDebuggerUrl"], timeout=5, suppress_origin=True
+            )
+            ws.send(
+                json.dumps(
+                    {
+                        "id": 1,
+                        "method": "Runtime.evaluate",
+                        "params": {
+                            "expression": "localStorage.getItem('auth_token')",
+                            "returnByValue": True,
+                        },
+                    }
+                )
+            )
+            val = json.loads(ws.recv())["result"]["result"]["value"]
+            ws.close()
+        except Exception as exc:  # noqa: BLE001
+            raise TokenError(f"CDP evaluate failed: {exc}") from exc
+        if not val:
+            raise TokenError("auth_token missing from localStorage (logged out?)")
+        return val
 
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
+
+    # ---- API methods ----
+
+    def fetch_user(self) -> dict | None:
+        try:
+            r = self._session.get(f"{self.api_base}/auth/me", headers=self._headers(), timeout=8)
+            if r.status_code == 200:
+                return r.json().get("data", {})
+        except requests.RequestException:
+            pass
+        return None
+
+    def fetch_keys(self) -> list[dict]:
+        try:
+            r = self._session.get(f"{self.api_base}/keys", headers=self._headers(), timeout=8)
+            if r.status_code == 200:
+                return (r.json().get("data") or {}).get("items", []) or []
+        except requests.RequestException:
+            pass
+        return []
+
+    def fetch_settings(self) -> dict | None:
+        try:
+            r = self._session.get(
+                f"{self.api_base}/settings/public", headers=self._headers(), timeout=8
+            )
+            if r.status_code == 200:
+                return r.json().get("data", {})
+        except requests.RequestException:
+            pass
+        return None
+
+    def fetch_groups(self) -> list[dict]:
+        try:
+            r = self._session.get(
+                f"{self.api_base}/groups/available", headers=self._headers(), timeout=10
+            )
+            if r.status_code == 200:
+                return r.json().get("data", []) or []
+        except requests.RequestException:
+            pass
+        return []
+
+    def fetch_history(self, limit: int = 10) -> list[dict]:
+        try:
+            r = self._session.get(
+                f"{self.api_base}/redeem/history", headers=self._headers(), timeout=8
+            )
+            if r.status_code == 200:
+                return (r.json().get("data") or [])[:limit]
+        except requests.RequestException:
+            pass
+        return []
+
+    def create_key(self, name: str = "sub2cli") -> dict | None:
+        try:
+            r = self._session.post(
+                f"{self.api_base}/keys",
+                headers={**self._headers(), "Content-Type": "application/json"},
+                json={"name": name},
+                timeout=10,
+            )
+            if r.status_code in (200, 201):
+                body = r.json() if r.content else {}
+                return body.get("data") if isinstance(body, dict) else None
+        except requests.RequestException:
+            pass
+        return None
+
+    def update_key_group(self, key_id: int, group_id: int) -> tuple[bool, str]:
+        try:
+            r = self._session.put(
+                f"{self.api_base}/keys/{key_id}",
+                headers={**self._headers(), "Content-Type": "application/json"},
+                json={"group_id": group_id},
+                timeout=10,
+            )
+            try:
+                body = r.json()
+            except ValueError:
+                body = {"raw": r.text[:200]}
+            if r.status_code == 200 and body.get("code") == 0:
+                return True, ""
+            return False, body.get("message") or body.get("detail") or f"HTTP {r.status_code}"
+        except requests.RequestException as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def settings_reachable_anonymous(self) -> tuple[bool, str]:
+        """探测 domain 是否像 Sub2API 实例 (不带 token, settings/public 公开端点)."""
+        try:
+            r = requests.get(f"{self.api_base}/settings/public", timeout=8)
+            if r.status_code == 200 and "data" in r.json():
+                return True, ""
+            return False, f"HTTP {r.status_code}"
+        except (requests.RequestException, ValueError) as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+
+# ==================== 无状态的 OpenAI-兼容探测 ====================
 
 def test_chat(base_url: str, api_key: str, model: str = "gpt-5.5") -> dict:
-    """POST /v1/chat/completions, tiny. Returns probe-result dict."""
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -283,19 +309,18 @@ def test_chat(base_url: str, api_key: str, model: str = "gpt-5.5") -> dict:
         except ValueError:
             body = {"raw": r.text[:200]}
         if r.status_code == 200:
-            content = (
-                body.get("choices", [{}])[0].get("message", {}).get("content", "")
-            )
-            return {"ok": True, "status": 200, "latency_ms": dt, "summary": f"ok"}
+            return {"ok": True, "status": 200, "latency_ms": dt, "summary": "ok"}
         det = body.get("error", {}).get("message") or body.get("message") or body.get("detail") or r.text[:80]
         return {"ok": False, "status": r.status_code, "latency_ms": dt, "summary": str(det)[:100]}
     except requests.RequestException as exc:
-        return {"ok": False, "status": -1, "latency_ms": int((time.perf_counter()-t0)*1000),
-                "summary": f"{type(exc).__name__}: {exc}"}
+        return {
+            "ok": False, "status": -1,
+            "latency_ms": int((time.perf_counter() - t0) * 1000),
+            "summary": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def test_image(base_url: str, api_key: str, model: str = "gpt-image-2") -> dict:
-    """POST /v1/images/generations, tiny."""
     url = base_url.rstrip("/") + "/images/generations"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -316,8 +341,11 @@ def test_image(base_url: str, api_key: str, model: str = "gpt-image-2") -> dict:
         det = body.get("error", {}).get("message") or body.get("message") or body.get("detail") or r.text[:80]
         return {"ok": False, "status": r.status_code, "latency_ms": dt, "summary": str(det)[:120]}
     except requests.RequestException as exc:
-        return {"ok": False, "status": -1, "latency_ms": int((time.perf_counter()-t0)*1000),
-                "summary": f"{type(exc).__name__}: {exc}"}
+        return {
+            "ok": False, "status": -1,
+            "latency_ms": int((time.perf_counter() - t0) * 1000),
+            "summary": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def probe_endpoint(base_url: str, api_key: str | None = None) -> dict:
@@ -347,7 +375,37 @@ def probe_endpoint(base_url: str, api_key: str | None = None) -> dict:
         }
 
 
-# ==================== 工具 ====================
+# ==================== 配置 ====================
+
+def load_config(path: str | None = None) -> dict | None:
+    path = path or default_config_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    # 旧版无 relays → 把当前 domain 的设置打包成第一个 relay
+    if "relays" not in cfg and cfg.get("domain"):
+        cfg["relays"] = {cfg["domain"]: {f: cfg.get(f) for f in RELAY_FIELDS}}
+    return cfg
+
+
+def save_config(cfg: dict, path: str | None = None) -> None:
+    path = path or default_config_path()
+    # 自动把 top-level default_* 同步进 relays[domain]
+    domain = cfg.get("domain", "")
+    if domain:
+        relays = cfg.setdefault("relays", {})
+        relays[domain] = {f: cfg.get(f) for f in RELAY_FIELDS}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.chmod(path, 0o600)
+
+
+# ==================== 纯工具函数 ====================
 
 def mask_key(k: str) -> str:
     if not k:
@@ -388,7 +446,7 @@ def normalize_v1(url: str) -> str:
     return s + "/v1"
 
 
-def collect_endpoints(settings: dict) -> list[dict]:
+def collect_endpoints(settings: dict, fallback_site: str = "") -> list[dict]:
     eps: list[dict] = []
     base = settings.get("api_base_url") or ""
     if base:
@@ -401,20 +459,16 @@ def collect_endpoints(settings: dict) -> list[dict]:
             "endpoint": normalize_v1(c.get("endpoint", "")),
             "description": c.get("description", ""),
         })
-    if not eps:
-        # 中转 /settings/public 没给 url 时, 退到域名本身 (e.g. https://relay.example.com/v1)
-        host = SITE or ""
-        if host:
-            eps.append({
-                "name": "默认",
-                "endpoint": normalize_v1(f"https://{host}"),
-                "description": "域名 fallback",
-            })
+    if not eps and fallback_site:
+        eps.append({
+            "name": "默认",
+            "endpoint": normalize_v1(f"https://{fallback_site}"),
+            "description": "域名 fallback",
+        })
     return eps
 
 
 def auto_pick_key(keys: list[dict]) -> dict | None:
-    """直接取第一个；无 key 时返回 None（调用方负责自动创建）。"""
     return keys[0] if keys else None
 
 
@@ -434,25 +488,25 @@ def auto_pick_endpoint(eps: list[dict]) -> dict | None:
     return best or eps[0]
 
 
-def ensure_defaults(cfg: dict, token: str, *, verbose: bool = False) -> tuple[dict, dict | None, dict | None]:
-    """读 keys/endpoints；若 cfg 里的默认值缺失/失效，自动填一个并 save。
-    keys 为空时自动建一个名为 sub2cli 的 key。
-    返回 (cfg, default_key dict | None, default_ep dict | None)。"""
-    keys = fetch_keys(token)
+def ensure_defaults(
+    ctx: Sub2Context, cfg: dict, *, verbose: bool = False
+) -> tuple[dict, dict | None, dict | None]:
+    """读 keys/endpoints；若 cfg 里的默认值缺失/失效，自动填一个并 save。"""
+    keys = ctx.fetch_keys()
     if not keys:
         if verbose:
             print(color("  · 该中转尚未创建任何 key，自动建一个 sub2cli …", C_DIM))
-        new_key = create_key(token, name="sub2cli")
+        new_key = ctx.create_key(name="sub2cli")
         if new_key:
             if verbose:
                 print(color(f"    ✓ 已创建 key: {new_key.get('name')} (id={new_key.get('id')})", C_GREEN))
-            keys = fetch_keys(token)
+            keys = ctx.fetch_keys()
         else:
             if verbose:
                 print(color("    ✗ 自动创建 key 失败 (POST /keys 没成功)", C_YELLOW))
 
-    settings = fetch_settings(token) or {}
-    eps = collect_endpoints(settings)
+    settings = ctx.fetch_settings() or {}
+    eps = collect_endpoints(settings, fallback_site=ctx.site)
 
     dk_name = cfg.get("default_key_name", "")
     default_key = find_key_by_name(keys, dk_name) if dk_name else None
@@ -476,9 +530,11 @@ def ensure_defaults(cfg: dict, token: str, *, verbose: bool = False) -> tuple[di
                     f"  · 自动选默认线路: {default_ep.get('name')} "
                     f"({default_ep.get('endpoint')})", C_DIM))
 
-    save_config(cfg)
+    save_config(cfg, ctx.config_path)
     return cfg, default_key, default_ep
 
+
+# ==================== 输入辅助 ====================
 
 def read_input(prompt: str) -> str | None:
     """读一行，再 200ms 内 drain 任何粘进来的后续行。EOF 返回 None。"""
@@ -504,7 +560,6 @@ def read_input(prompt: str) -> str | None:
 
 
 def ask_choice(prompt: str, n: int, default: int | None = None) -> int | None:
-    """让用户从 1..n 里选一个；回车=default；空回车且无 default 返回 None。"""
     hint = f" [{default}]" if default else ""
     while True:
         try:
@@ -522,7 +577,7 @@ def ask_choice(prompt: str, n: int, default: int | None = None) -> int | None:
         print(color(f"  请输入 1..{n} 之间的整数", C_YELLOW))
 
 
-# ==================== TUI 菜单（基于 termios，参考 codex-provider-macos）====================
+# ==================== TUI 菜单 ====================
 
 def clear_screen() -> None:
     if not sys.stdout.isatty():
@@ -578,7 +633,6 @@ def select_menu(
     if not options:
         return "quit"
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        # 非交互场景退化为数字输入
         if banner_fn:
             banner_fn()
         if title:
@@ -619,10 +673,13 @@ def select_menu(
 
 # ==================== 显示 ====================
 
-def print_banner(cfg: dict, user: dict, default_key: dict | None, default_ep: dict | None) -> None:
-    host = urlparse(cfg["domain"]).hostname or "?"
+def print_banner(
+    ctx: Sub2Context, user: dict,
+    default_key: dict | None, default_ep: dict | None
+) -> None:
+    host = urlparse(ctx.domain).hostname or "?"
     print(color("sub2cli", C_BOLD + C_CYAN) + color(f" — {host} 控制台", C_DIM))
-    print(color("  域名:    ", C_DIM) + cfg["domain"])
+    print(color("  域名:    ", C_DIM) + ctx.domain)
     email = user.get("email", "?")
     status = user.get("status", "?")
     print(color("  账号:    ", C_DIM) + f"{email}  ·  状态: {color(status, C_GREEN if status=='active' else C_YELLOW)}")
@@ -697,16 +754,16 @@ def print_history(rows: list[dict]) -> None:
 
 # ==================== 命令 ====================
 
-def cmd_endpoints(token: str, cfg: dict) -> dict:
-    settings = fetch_settings(token)
+def cmd_endpoints(ctx: Sub2Context, cfg: dict) -> dict:
+    settings = ctx.fetch_settings()
     if not settings:
         print(color("  （无法读 settings/public）", C_RED))
         return cfg
-    eps = collect_endpoints(settings)
+    eps = collect_endpoints(settings, fallback_site=ctx.site)
     if not eps:
         print(color("  （无端点配置）", C_YELLOW))
         return cfg
-    keys = fetch_keys(token)
+    keys = ctx.fetch_keys()
     sample_key = next((k.get("key") for k in keys if k.get("status") == "active"), None)
     cur_name = cfg.get("default_endpoint_name")
 
@@ -752,14 +809,13 @@ def cmd_endpoints(token: str, cfg: dict) -> dict:
 
     cfg["default_endpoint_name"] = chosen.get("name")
     cfg["default_endpoint_url"] = chosen.get("endpoint")
-    save_config(cfg)
+    save_config(cfg, ctx.config_path)
     print(color(f"  ✓ 默认端点 → {chosen.get('name')}  ({chosen.get('endpoint')})", C_GREEN))
     print()
     return cfg
 
 
 def _fmt_test_cell(r: dict | None, width: int = 14) -> str:
-    """格式化单个测试结果为表格单元。"""
     if r is None:
         return color(f"{'—':<{width}}", C_DIM)
     if r.get("running"):
@@ -771,37 +827,35 @@ def _fmt_test_cell(r: dict | None, width: int = 14) -> str:
     return color(f"{s:<{width}}", C_RED)
 
 
-def cmd_groups(token: str, cfg: dict) -> dict:
+def cmd_groups(ctx: Sub2Context, cfg: dict) -> dict:
     """列分组 → 选 (含「自动选择」) → 切默认 key 到该分组 → 跑 gpt-5.5 + gpt-image-2，
     表格行动态刷新。自动模式按倍率低到高跑，找到两个都通的就停。"""
-    groups = fetch_groups(token)
+    groups = ctx.fetch_groups()
     if not groups:
         print(color("  （无可用分组）", C_YELLOW))
         return cfg
-    keys = fetch_keys(token)
+    keys = ctx.fetch_keys()
     keys_by_group: dict[int, list[dict]] = {}
     for k in keys:
         gid = k.get("group_id")
         if gid is not None:
             keys_by_group.setdefault(gid, []).append(k)
 
-    ep_url = cfg.get("default_endpoint_url") or f"https://{SITE}/v1"
+    ep_url = cfg.get("default_endpoint_url") or f"https://{ctx.site}/v1"
     default_key_name = cfg.get("default_key_name", "")
     default_key = find_key_by_name(keys, default_key_name)
     if not default_key:
         print(color("  未设置默认 key — 无法测试。先去『名称』设一个。", C_YELLOW))
         return cfg
 
-    # 倍率从低到高（None 视为最大）
     sorted_groups = sorted(
         groups, key=lambda x: x.get("rate_multiplier") or 99999
     )
-    results: dict[int, dict] = {}  # gid → {chat, image}
+    results: dict[int, dict] = {}
     in_progress_gid: int | None = None
 
     def render() -> None:
         clear_screen()
-        # 简化版 banner（多次 render 时不想太占空间）
         print(color("分组测试", C_BOLD + C_CYAN))
         print(color(f"  端点: {ep_url}  ·  默认 key: {default_key_name}", C_DIM))
         print()
@@ -843,14 +897,12 @@ def cmd_groups(token: str, cfg: dict) -> dict:
     final_chosen = None
     for g in targets:
         gid = g.get("id")
-        gname = g.get("name", "?")
-        # 切分组（如果 default_key 不在 target）
         cur_gid = default_key.get("group_id")
         if cur_gid != gid:
             in_progress_gid = gid
             results[gid] = {"chat": {"running": True}, "image": {"running": True}}
             render()
-            ok, err = update_key_group(token, default_key["id"], gid)
+            ok, err = ctx.update_key_group(default_key["id"], gid)
             if not ok:
                 results[gid] = {
                     "chat": {"ok": False, "status": "切换失败", "summary": err},
@@ -860,10 +912,8 @@ def cmd_groups(token: str, cfg: dict) -> dict:
                 if not auto_mode:
                     break
                 continue
-            # 刷新 key
-            keys = fetch_keys(token)
+            keys = ctx.fetch_keys()
             default_key = find_key_by_name(keys, default_key_name)
-            # 同步 keys_by_group
             keys_by_group = {}
             for k in keys:
                 kgid = k.get("group_id")
@@ -872,7 +922,6 @@ def cmd_groups(token: str, cfg: dict) -> dict:
         in_progress_gid = gid
         api_key = default_key.get("key", "")
 
-        # chat
         results.setdefault(gid, {})
         results[gid]["chat"] = {"running": True}
         results[gid]["image"] = {"running": True}
@@ -880,7 +929,6 @@ def cmd_groups(token: str, cfg: dict) -> dict:
         r_chat = test_chat(ep_url, api_key, model="gpt-5.5")
         results[gid]["chat"] = r_chat
         render()
-        # image
         r_img = test_image(ep_url, api_key, model="gpt-image-2")
         results[gid]["image"] = r_img
         in_progress_gid = None
@@ -905,9 +953,9 @@ def cmd_groups(token: str, cfg: dict) -> dict:
     return cfg
 
 
-def cmd_key(token: str, cfg: dict, arg: str | None) -> dict:
-    """测试 + 选择分组（按 key 维度，因为 key↔分组 1:1）。"""
-    keys = fetch_keys(token)
+def cmd_key(ctx: Sub2Context, cfg: dict, arg: str | None) -> dict:
+    """测试 + 选择 key (按 key 维度，因为 key↔分组 1:1)。"""
+    keys = ctx.fetch_keys()
     if not keys:
         print(color("  没有可用 key", C_YELLOW))
         return cfg
@@ -918,11 +966,11 @@ def cmd_key(token: str, cfg: dict, arg: str | None) -> dict:
             return cfg
         cfg["default_key_name"] = match.get("name")
         cfg["default_key_id"] = match.get("id")
-        save_config(cfg)
+        save_config(cfg, ctx.config_path)
         print(color(f"  ✓ 默认 key → {match['name']}", C_GREEN))
         return cfg
 
-    ep_url = cfg.get("default_endpoint_url") or f"https://{SITE}/v1"
+    ep_url = cfg.get("default_endpoint_url") or f"https://{ctx.site}/v1"
     print(color(f"测试每把 key (GET {ep_url}/models):", C_BOLD))
     cur_idx = 1
     results: list[tuple[dict, dict]] = []
@@ -935,8 +983,6 @@ def cmd_key(token: str, cfg: dict, arg: str | None) -> dict:
         if is_cur:
             cur_idx = i
         status = k.get("status", "?")
-        st_col = C_GREEN if status == "active" else C_YELLOW
-        # 探测
         if status == "active":
             r = probe_endpoint(ep_url, api_key=k.get("key"))
             results.append((k, r))
@@ -961,14 +1007,14 @@ def cmd_key(token: str, cfg: dict, arg: str | None) -> dict:
     k = keys[pick - 1]
     cfg["default_key_name"] = k.get("name")
     cfg["default_key_id"] = k.get("id")
-    save_config(cfg)
+    save_config(cfg, ctx.config_path)
     print(color(f"  ✓ 默认 → {k['name']}（分组 {(k.get('group') or {}).get('name','?')}）", C_GREEN))
     print()
     return cfg
 
 
-def cmd_export(token: str, cfg: dict) -> None:
-    keys = fetch_keys(token)
+def cmd_export(ctx: Sub2Context, cfg: dict) -> None:
+    keys = ctx.fetch_keys()
     k = find_key_by_name(keys, cfg.get("default_key_name", "")) if cfg.get("default_key_name") else None
     if not k:
         print(color("  未设置默认 key，运行 'key' 命令选一个", C_YELLOW))
@@ -985,7 +1031,6 @@ def cmd_export(token: str, cfg: dict) -> None:
     print(color("shell 片段:", C_BOLD))
     for ln in snippet.splitlines():
         print(f"  {ln}")
-    # pbcopy
     try:
         subprocess.run(["pbcopy"], input=snippet, text=True, check=True, timeout=3)
         print(color("  ✓ 已复制到剪贴板", C_GREEN))
@@ -1024,7 +1069,7 @@ def _run_inject(inject_bin: str, url: str, api_key: str, source_label: str) -> N
         print(color(f"  ✗ 注入器返回非零 (rc={rc})", C_RED))
 
 
-def cmd_inject_codex(token: str, cfg: dict) -> None:
+def cmd_inject_codex(ctx: Sub2Context, cfg: dict) -> None:
     """注入到 Codex CLI / Codex App: 用当前配置 或 临时输入新的 url+apikey."""
     inject_bin = _resolve_inject_bin()
     if not inject_bin:
@@ -1038,11 +1083,9 @@ def cmd_inject_codex(token: str, cfg: dict) -> None:
         ("使用新的 url + apikey", "new"),
     ]
 
-    # 提前抓一次 keys, 把当前默认 key 的完整 apikey 拿出来显在 banner; 不在 banner_fn
-    # 里调 fetch_keys 是因为 select_menu 每次按键都会重渲染 banner.
     cur_apikey = "(空)"
     if cfg.get("default_key_name"):
-        _keys = fetch_keys(token)
+        _keys = ctx.fetch_keys()
         _k = find_key_by_name(_keys, cfg["default_key_name"])
         if _k and _k.get("key"):
             cur_apikey = _k["key"]
@@ -1061,7 +1104,7 @@ def cmd_inject_codex(token: str, cfg: dict) -> None:
         return
 
     if pick == "current":
-        keys = fetch_keys(token)
+        keys = ctx.fetch_keys()
         k = find_key_by_name(keys, cfg.get("default_key_name", "")) if cfg.get("default_key_name") else None
         if not k:
             print(color("  未设置默认 key，先去 [名称] 选一个，或选 '使用新的 url + apikey'", C_YELLOW))
@@ -1079,7 +1122,6 @@ def cmd_inject_codex(token: str, cfg: dict) -> None:
         _run_inject(inject_bin, url, api_key, label)
         return
 
-    # pick == "new"
     print(color("输入新的 url 和 apikey (空回车取消):", C_BOLD))
     try:
         new_url = (read_input("  url   > ") or "").strip()
@@ -1104,8 +1146,9 @@ def cmd_inject_codex(token: str, cfg: dict) -> None:
 
 
 def cmd_select_relay(state: dict) -> dict:
-    """列已保存中转 + 新建。切完自动 apply_domain、重新拿 token、补默认。"""
+    """列已保存中转 + 新建。切完创建新的 Sub2Context, 重新拿 token, 补默认。"""
     cfg = state["cfg"]
+    cur_ctx: Sub2Context = state["ctx"]
     relays = cfg.setdefault("relays", {})
     domain_list = list(relays.keys())
     current = cfg.get("domain", "")
@@ -1128,7 +1171,6 @@ def cmd_select_relay(state: dict) -> dict:
         return state
 
     if pick == add_idx:
-        # 新建：仅问域名 + 验证 + 拿 token + 自动补默认
         try:
             raw = input("  新中转域名 (https://...): ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -1137,41 +1179,37 @@ def cmd_select_relay(state: dict) -> dict:
         if not raw:
             print(color("  已取消", C_DIM))
             return state
-        if not re.match(r"^https?://", raw):
-            raw = "https://" + raw
-        raw = raw.rstrip("/")
-        # 临时切换 c2a SITE 来验证
-        old_site = SITE
-        apply_domain(raw)
-        try:
-            r = requests.get(f"{API_BASE}/settings/public", timeout=8)
-            if r.status_code != 200 or "data" not in r.json():
-                print(color(f"  ✗ {raw} 不像 Sub2API 实例 (HTTP {r.status_code})", C_RED))
-                apply_domain(f"https://{old_site}")
-                return state
-        except requests.RequestException as exc:
-            print(color(f"  ✗ 不可达: {exc}", C_RED))
-            apply_domain(f"https://{old_site}")
+        raw = _normalize_domain(raw)
+        probe_ctx = Sub2Context(
+            raw, config_path=cur_ctx.config_path,
+            cdp_host=cur_ctx.cdp_host, cdp_port=cur_ctx.cdp_port,
+        )
+        ok, why = probe_ctx.settings_reachable_anonymous()
+        if not ok:
+            print(color(f"  ✗ {raw} 不像 Sub2API 实例 ({why})", C_RED))
             return state
         print(color(f"  ✓ {raw} 正常", C_GREEN))
         target_domain = raw
         relays[target_domain] = {f: None for f in RELAY_FIELDS}
     else:
         target_domain = domain_list[pick - 1]
-        apply_domain(target_domain)
 
-    # 切换 cfg 到目标 relay
+    # 给 target_domain 建新 ctx
+    new_ctx = Sub2Context(
+        target_domain, config_path=cur_ctx.config_path,
+        cdp_host=cur_ctx.cdp_host, cdp_port=cur_ctx.cdp_port,
+    )
+
     cfg["domain"] = target_domain
     relay = relays.get(target_domain, {})
     for f in RELAY_FIELDS:
         cfg[f] = relay.get(f)
 
-    # 拿 token（可能需要在浏览器先登录新域名）
-    token = None
-    while not token:
+    while True:
         try:
-            token = get_token()
-        except SystemExit as exc:
+            _ = new_ctx.token
+            break
+        except TokenError as exc:
             print(color(f"  ✗ {exc}", C_YELLOW))
             print(color(
                 f"  请在 Edge 打开 {target_domain} 并登录，按回车重试 (Ctrl-C 取消)",
@@ -1180,19 +1218,16 @@ def cmd_select_relay(state: dict) -> dict:
                 input()
             except (EOFError, KeyboardInterrupt):
                 print()
-                # 回滚
-                apply_domain(state["cfg"]["domain"])
                 return state
-    state["token"] = token
 
-    user = fetch_user(token)
+    user = new_ctx.fetch_user()
     if not user:
         print(color("  ✗ /auth/me 失败，token 可能无效", C_RED))
-        apply_domain(state["cfg"]["domain"])
         return state
-    state["user"] = user
 
-    cfg, dk, de = ensure_defaults(cfg, token, verbose=True)
+    state["ctx"] = new_ctx
+    state["user"] = user
+    cfg, dk, de = ensure_defaults(new_ctx, cfg, verbose=True)
     state["cfg"] = cfg
     state["default_key"] = dk
     state["default_ep"] = de
@@ -1200,8 +1235,8 @@ def cmd_select_relay(state: dict) -> dict:
     return state
 
 
-def cmd_reveal(token: str, cfg: dict) -> None:
-    keys = fetch_keys(token)
+def cmd_reveal(ctx: Sub2Context, cfg: dict) -> None:
+    keys = ctx.fetch_keys()
     k = find_key_by_name(keys, cfg.get("default_key_name", "")) if cfg.get("default_key_name") else None
     if not k:
         print(color("  未设置默认 key", C_YELLOW))
@@ -1211,58 +1246,57 @@ def cmd_reveal(token: str, cfg: dict) -> None:
 
 # ==================== Setup 向导 ====================
 
-def run_wizard() -> dict:
+def run_wizard(
+    config_path: str, cdp_host: str, cdp_port: int
+) -> tuple[Sub2Context, dict]:
     print(color("sub2cli — 首次启动配置", C_BOLD + C_CYAN))
     print()
 
     # 1. 域名
     print(color("[1/5] 中转站域名", C_BOLD))
-    default_domain = "https://www.codex2api.com"
     while True:
         try:
-            raw = input(f"  输入域名 (默认 {default_domain}): ").strip()
+            raw = input(f"  输入域名 (默认 {DEFAULT_DOMAIN}): ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             sys.exit(0)
-        raw = raw or default_domain
-        if not re.match(r"^https?://", raw):
-            raw = "https://" + raw
-        raw = raw.rstrip("/")
-        apply_domain(raw)
-        print(color(f"  正在验证 {API_BASE}/settings/public ...", C_DIM))
-        try:
-            r = requests.get(f"{API_BASE}/settings/public", timeout=8)
-            if r.status_code == 200 and "data" in r.json():
-                print(color(f"  ✓ {API_BASE} 正常", C_GREEN))
-                domain = raw
-                break
-            print(color(f"  ✗ HTTP {r.status_code}", C_RED))
-        except requests.RequestException as exc:
-            print(color(f"  ✗ 不可达: {exc}", C_RED))
+        raw = raw or DEFAULT_DOMAIN
+        raw = _normalize_domain(raw)
+        probe_ctx = Sub2Context(
+            raw, config_path=config_path, cdp_host=cdp_host, cdp_port=cdp_port
+        )
+        print(color(f"  正在验证 {probe_ctx.api_base}/settings/public ...", C_DIM))
+        ok, why = probe_ctx.settings_reachable_anonymous()
+        if ok:
+            print(color(f"  ✓ {probe_ctx.api_base} 正常", C_GREEN))
+            ctx = probe_ctx
+            break
+        print(color(f"  ✗ {why}", C_RED))
 
-    # 2. 浏览器拿 token
+    # 2. token
     print()
     print(color("[2/5] 读取浏览器登录信息", C_BOLD))
-    print(color(f"  正在从 Edge CDP 读取 {urlparse(domain).hostname} 的 auth_token ...", C_DIM))
-    token = None
-    while not token:
+    print(color(f"  正在从 Edge CDP 读取 {ctx.site} 的 auth_token ...", C_DIM))
+    while True:
         try:
-            token = get_token()
-        except SystemExit as exc:
+            _ = ctx.token
+            break
+        except TokenError as exc:
             print(color(f"  ✗ {exc}", C_YELLOW))
             print(color(
-                f"  请在 Edge 中打开 {domain} 并登录，然后按回车重试 (Ctrl-C 退出)", C_YELLOW))
+                f"  请在 Edge 中打开 {ctx.domain} 并登录，然后按回车重试 (Ctrl-C 退出)",
+                C_YELLOW))
             try:
                 input()
             except (EOFError, KeyboardInterrupt):
                 print()
                 sys.exit(0)
-    print(color(f"  ✓ 拿到 token ({len(token)} 字符)", C_GREEN))
+    print(color(f"  ✓ 拿到 token ({len(ctx.token)} 字符)", C_GREEN))
 
     # 3. 账号
     print()
     print(color("[3/5] 账号信息", C_BOLD))
-    user = fetch_user(token)
+    user = ctx.fetch_user()
     if not user:
         print(color("  ✗ /auth/me 失败", C_RED))
         sys.exit(1)
@@ -1274,15 +1308,15 @@ def run_wizard() -> dict:
     # 4. 选 key
     print()
     print(color("[4/5] 选择默认 API Key", C_BOLD))
-    keys = fetch_keys(token)
+    keys = ctx.fetch_keys()
     if not keys:
         print(color("  该账号还没有任何 API key，自动创建 sub2cli …", C_DIM))
-        new_key = create_key(token, name="sub2cli")
+        new_key = ctx.create_key(name="sub2cli")
         if not new_key:
             print(color("  ✗ POST /keys 失败，请在网页 UI 手动建一个再重跑", C_RED))
             sys.exit(1)
         print(color(f"  ✓ 已创建: {new_key.get('name')} (id={new_key.get('id')})", C_GREEN))
-        keys = fetch_keys(token)
+        keys = ctx.fetch_keys()
         if not keys:
             print(color("  ✗ 创建后仍未读到 keys，请检查网页 UI", C_RED))
             sys.exit(1)
@@ -1303,8 +1337,8 @@ def run_wizard() -> dict:
     # 5. 选端点
     print()
     print(color("[5/5] 选择默认端点", C_BOLD))
-    settings = fetch_settings(token) or {}
-    eps = collect_endpoints(settings)
+    settings = ctx.fetch_settings() or {}
+    eps = collect_endpoints(settings, fallback_site=ctx.site)
     if not eps:
         print(color("  ✗ 无端点配置", C_RED))
         sys.exit(1)
@@ -1320,17 +1354,17 @@ def run_wizard() -> dict:
     default_ep = eps[pick - 1]
 
     cfg = {
-        "domain": domain,
+        "domain": ctx.domain,
         "default_key_id": default_key.get("id"),
         "default_key_name": default_key.get("name"),
         "default_endpoint_name": default_ep.get("name"),
         "default_endpoint_url": default_ep.get("endpoint"),
     }
-    save_config(cfg)
+    save_config(cfg, ctx.config_path)
     print()
-    print(color(f"✓ 已保存到 {CONFIG_PATH}", C_GREEN))
+    print(color(f"✓ 已保存到 {ctx.config_path}", C_GREEN))
     print()
-    return cfg
+    return ctx, cfg
 
 
 # ==================== 主循环 ====================
@@ -1340,41 +1374,47 @@ def main() -> int:
         print(__doc__.strip())
         return 0
 
-    cfg = load_config()
-    if not cfg:
-        cfg = run_wizard()
+    config_path = default_config_path()
+    cdp_host = DEFAULT_CDP_HOST
+    cdp_port = DEFAULT_CDP_PORT
 
-    apply_domain(cfg["domain"])
+    cfg = load_config(config_path)
+    if not cfg:
+        ctx, cfg = run_wizard(config_path, cdp_host, cdp_port)
+    else:
+        ctx = Sub2Context(
+            cfg["domain"], config_path=config_path,
+            cdp_host=cdp_host, cdp_port=cdp_port,
+        )
 
     try:
-        token = get_token()
-    except SystemExit as exc:
+        _ = ctx.token
+    except TokenError as exc:
         print(color(str(exc), C_RED))
         return 1
 
-    user = fetch_user(token)
+    user = ctx.fetch_user()
     if not user:
         print(color("拉取账号信息失败，token 可能失效。请重新登录后再试。", C_RED))
         return 1
 
-    cfg, default_key, default_ep = ensure_defaults(cfg, token, verbose=False)
+    cfg, default_key, default_ep = ensure_defaults(ctx, cfg, verbose=False)
 
-    # ==== TUI 菜单主循环 ====
     state = {
-        "cfg": cfg, "token": token, "user": user,
+        "ctx": ctx, "cfg": cfg, "user": user,
         "default_key": default_key, "default_ep": default_ep,
     }
 
     def banner_fn():
-        print_banner(state["cfg"], state["user"], state["default_key"], state["default_ep"])
+        print_banner(state["ctx"], state["user"], state["default_key"], state["default_ep"])
 
     def refresh_default_key():
-        ks = fetch_keys(state["token"])
+        ks = state["ctx"].fetch_keys()
         state["default_key"] = find_key_by_name(ks, state["cfg"].get("default_key_name", ""))
 
     def refresh_default_ep():
-        s = fetch_settings(state["token"]) or {}
-        eps = collect_endpoints(s)
+        s = state["ctx"].fetch_settings() or {}
+        eps = collect_endpoints(s, fallback_site=state["ctx"].site)
         state["default_ep"] = find_endpoint(eps, state["cfg"].get("default_endpoint_name", ""))
 
     options: list[tuple[str, str]] = [
@@ -1402,11 +1442,11 @@ def main() -> int:
         print()
 
         if choice == "refresh":
-            new_user = fetch_user(state["token"])
+            new_user = state["ctx"].fetch_user()
             if new_user:
                 state["user"] = new_user
             state["cfg"], state["default_key"], state["default_ep"] = ensure_defaults(
-                state["cfg"], state["token"], verbose=False
+                state["ctx"], state["cfg"], verbose=False
             )
             print(color("  ✓ 已刷新", C_GREEN))
             pause()
@@ -1418,38 +1458,40 @@ def main() -> int:
             continue
 
         if choice == "ep":
-            state["cfg"] = cmd_endpoints(state["token"], state["cfg"])
+            state["cfg"] = cmd_endpoints(state["ctx"], state["cfg"])
             refresh_default_ep()
             pause()
 
         elif choice == "groups":
-            state["cfg"] = cmd_groups(state["token"], state["cfg"])
+            state["cfg"] = cmd_groups(state["ctx"], state["cfg"])
             refresh_default_key()  # 切 group 后默认 key 的 group_id 变了
             pause()
 
         elif choice == "key":
-            state["cfg"] = cmd_key(state["token"], state["cfg"], None)
+            state["cfg"] = cmd_key(state["ctx"], state["cfg"], None)
             refresh_default_key()
             pause()
 
         elif choice == "history":
             print(color("最近兑换历史:", C_BOLD))
-            print_history(fetch_history(state["token"], 10))
+            print_history(state["ctx"].fetch_history(10))
             pause()
 
         elif choice == "inject":
-            cmd_inject_codex(state["token"], state["cfg"])
+            cmd_inject_codex(state["ctx"], state["cfg"])
             pause()
 
         elif choice == "reveal":
-            cmd_reveal(state["token"], state["cfg"])
+            cmd_reveal(state["ctx"], state["cfg"])
             pause()
 
         elif choice == "setup":
-            state["cfg"] = run_wizard()
-            apply_domain(state["cfg"]["domain"])
-            state["token"] = get_token()
-            state["user"] = fetch_user(state["token"])
+            state["ctx"], state["cfg"] = run_wizard(
+                state["ctx"].config_path,
+                state["ctx"].cdp_host,
+                state["ctx"].cdp_port,
+            )
+            state["user"] = state["ctx"].fetch_user()
             refresh_default_key()
             refresh_default_ep()
             pause("配置已更新")

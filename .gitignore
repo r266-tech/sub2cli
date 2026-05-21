@@ -25,3 +25,6 @@ credentials/
 *.key
 *.pem
 *.pfx
+spike/
+desktop/build/
+desktop/dist/

@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
+import fcntl
 import getpass
 import json
 import os
 import re
 import select
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +44,8 @@ STATE_DB = CODEX_HOME / "state_5.sqlite"
 SESSION_DIRS = [CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"]
 SLOTS_FILE = CODEX_HOME / "provider-slots.json"
 BACKUP_ROOT = CODEX_HOME / "provider-switch-backups"
+LOCK_FILE = CODEX_HOME / ".sub2cli-inject.lock"
+SNAPSHOT_FILENAME = "pre-switch-snapshot.json"
 
 OAUTH_PROVIDER = "openai"
 RELAY_PROVIDER = "OpenAI"
@@ -71,6 +76,56 @@ class ChineseHelpFormatter(argparse.HelpFormatter):
 def fail(message: str, code: int = 2) -> None:
     print(f"错误：{message}", file=sys.stderr)
     raise SystemExit(code)
+
+
+# ==================== File lock ====================
+
+class LockBusy(RuntimeError):
+    """Another sub2cli-inject process is holding the lock."""
+
+
+class Sub2cliLock:
+    """Advisory exclusive file lock — prevents concurrent ~/.codex mutations.
+
+    Wrap any cmd_switch / cmd_relay / cmd_oauth / cmd_init / cmd_rollback in
+    `with Sub2cliLock(): ...`. Raises LockBusy if another process holds it.
+    """
+
+    def __init__(self, path: Path = LOCK_FILE, *, timeout: float = 0.0) -> None:
+        self.path = path
+        self.timeout = timeout
+        self._fd: int | None = None
+
+    def __enter__(self) -> "Sub2cliLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(str(self.path), os.O_CREAT | os.O_WRONLY, 0o600)
+        deadline = time.time() + self.timeout if self.timeout > 0 else None
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.ftruncate(self._fd, 0)
+                os.write(self._fd, f"pid={os.getpid()} t={int(time.time())}\n".encode())
+                return self
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                    os.close(self._fd)
+                    self._fd = None
+                    raise
+                if deadline is None or time.time() >= deadline:
+                    os.close(self._fd)
+                    self._fd = None
+                    raise LockBusy(
+                        f"another sub2cli-inject is running (lock: {self.path})"
+                    )
+                time.sleep(0.1)
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+                self._fd = None
 
 
 def atomic_write_json(path: Path, data: dict, *, mode: int = 0o600) -> None:
@@ -670,7 +725,182 @@ def slot_is_clean(data: dict, target_slot: str) -> bool:
     return config_clean_for_slot(cfg) and not sessions_need_normalize(slot_thread_provider(cfg))
 
 
-def cmd_switch(name: str, *, no_restart: bool = False) -> int:
+# ==================== Dry-run plan + snapshot/restore ====================
+
+def snapshot_pre_switch(backup_dir: Path) -> dict:
+    """Capture rollback-able state of ~/.codex into backup_dir.
+
+    Captures: full config.toml content, current AUTH_JSON symlink target,
+    current APP_PROFILE symlink target. state_5.sqlite + rollout JSONLs
+    are backed up separately by backup_state_db() / rollout audit.
+    """
+    snap: dict = {
+        "schema": 1,
+        "timestamp": int(time.time()),
+        "config_toml_backup": None,
+        "auth_json_target": None,
+        "app_profile_target": None,
+    }
+    if CONFIG_TOML.exists():
+        target = backup_dir / "config.toml"
+        target.write_text(CONFIG_TOML.read_text())
+        os.chmod(target, 0o600)
+        snap["config_toml_backup"] = str(target)
+    if AUTH_JSON.is_symlink():
+        snap["auth_json_target"] = os.readlink(AUTH_JSON)
+    if APP_PROFILE.is_symlink():
+        snap["app_profile_target"] = os.readlink(APP_PROFILE)
+    atomic_write_json(backup_dir / SNAPSHOT_FILENAME, snap)
+    return snap
+
+
+def compute_switch_plan(data: dict, target_slot: str) -> dict:
+    """Compute what cmd_switch would change — read-only, no mutations."""
+    cfg = data["slots"][target_slot]
+    mode = cfg.get("mode", "oauth")
+    auth_target = Path(cfg["auth_file"]).expanduser()
+    profile_target = history_profile_target(data, target_slot)
+    target_provider = slot_thread_provider(cfg)
+
+    plan: dict = {
+        "target_slot": target_slot,
+        "mode": mode,
+        "display_name": cfg.get("display_name", target_slot),
+        "is_clean": slot_is_clean(data, target_slot),
+        "actions": [],
+    }
+    if plan["is_clean"]:
+        plan["actions"].append({"type": "noop", "reason": "已是当前渠道, 状态一致"})
+        return plan
+
+    cur_auth = os.readlink(AUTH_JSON) if AUTH_JSON.is_symlink() else None
+    plan["actions"].append({
+        "type": "symlink",
+        "path": str(AUTH_JSON),
+        "from": cur_auth,
+        "to": str(auth_target),
+    })
+    cur_profile = os.readlink(APP_PROFILE) if APP_PROFILE.is_symlink() else None
+    plan["actions"].append({
+        "type": "symlink",
+        "path": str(APP_PROFILE),
+        "from": cur_profile,
+        "to": str(profile_target),
+    })
+
+    if mode == "relay":
+        plan["actions"].append({
+            "type": "write",
+            "path": str(auth_target),
+            "what": "API key auth.json (apikey mode)",
+        })
+        plan["actions"].append({
+            "type": "patch_toml",
+            "path": str(CONFIG_TOML),
+            "section": f"[model_providers.{RELAY_PROVIDER}]",
+            "base_url": cfg.get("base_url"),
+            "model": cfg.get("model", DEFAULT_MODEL),
+        })
+    else:
+        plan["actions"].append({
+            "type": "patch_toml",
+            "path": str(CONFIG_TOML),
+            "section": "(remove relay block; oauth mode)",
+            "model": cfg.get("model", DEFAULT_MODEL),
+        })
+
+    if sessions_need_normalize(target_provider):
+        norm_preview = normalize_sessions(target_provider, dry_run=True)
+        plan["actions"].append({
+            "type": "normalize_sessions",
+            "target_provider": target_provider,
+            "state_db_changes": int(norm_preview["state_db"].get("changed", 0)),
+            "rollout_changes": int(norm_preview["rollouts"].get("changed", 0)),
+        })
+
+    if codex_running():
+        plan["actions"].append({"type": "quit_codex"})
+        plan["actions"].append({"type": "launch_codex"})
+    else:
+        plan["actions"].append({"type": "launch_codex", "note": "not running"})
+
+    return plan
+
+
+def print_switch_plan(plan: dict) -> None:
+    print(f"DRY-RUN: 将切换到 {plan['display_name']} ({plan['target_slot']}) [{plan['mode']}]")
+    if plan["is_clean"]:
+        print("  当前状态一致, 无需修改")
+        return
+    print(f"  计划改动 ({len(plan['actions'])}):")
+    for i, a in enumerate(plan["actions"], 1):
+        t = a["type"]
+        if t == "symlink":
+            print(f"    {i}. symlink: {a['path']}")
+            print(f"       from: {a['from']}")
+            print(f"       to:   {a['to']}")
+        elif t == "write":
+            print(f"    {i}. write:  {a['path']}  ({a['what']})")
+        elif t == "patch_toml":
+            print(f"    {i}. patch:  {a['path']}  {a['section']}")
+            if a.get("base_url"):
+                print(f"       base_url = {a['base_url']}")
+            print(f"       model = {a['model']}")
+        elif t == "normalize_sessions":
+            print(
+                f"    {i}. normalize sessions → provider={a['target_provider']}"
+                f"  (DB rows: {a['state_db_changes']}, rollout headers: {a['rollout_changes']})"
+            )
+        elif t == "quit_codex":
+            print(f"    {i}. quit Codex App")
+        elif t == "launch_codex":
+            note = f" [{a['note']}]" if a.get("note") else ""
+            print(f"    {i}. launch Codex App{note}")
+        elif t == "noop":
+            print(f"    {i}. noop: {a['reason']}")
+    print()
+    print("  (no changes applied; rerun without --dry-run to execute)")
+
+
+def restore_from_backup(backup_dir: Path) -> int:
+    """Restore config.toml + symlinks + sqlite from a backup_dir snapshot."""
+    snap_path = backup_dir / SNAPSHOT_FILENAME
+    if not snap_path.exists():
+        fail(f"snapshot not found: {snap_path}")
+    snap = json.loads(snap_path.read_text())
+    quit_codex()
+    restored: list[str] = []
+    if snap.get("config_toml_backup"):
+        src = Path(snap["config_toml_backup"])
+        if src.exists():
+            atomic_write_text(CONFIG_TOML, src.read_text())
+            restored.append(f"config.toml ← {src.name}")
+    if snap.get("auth_json_target"):
+        target = Path(snap["auth_json_target"]).expanduser()
+        atomic_symlink(AUTH_JSON, target)
+        restored.append(f"auth.json → {target}")
+    if snap.get("app_profile_target"):
+        target = Path(snap["app_profile_target"]).expanduser()
+        atomic_symlink(APP_PROFILE, target)
+        restored.append(f"App profile → {target}")
+    state_db_backup = backup_dir / STATE_DB.name
+    if state_db_backup.exists():
+        if STATE_DB.exists():
+            STATE_DB.unlink()
+        shutil.copyfile(state_db_backup, STATE_DB)
+        os.chmod(STATE_DB, 0o600)
+        restored.append(f"state DB ← {state_db_backup.name}")
+    if not restored:
+        print("没有可恢复的项 (snapshot 为空)")
+        return 1
+    print("已恢复:")
+    for r in restored:
+        print(f"  · {r}")
+    print(f"  备份来源: {backup_dir}")
+    return 0
+
+
+def cmd_switch(name: str, *, no_restart: bool = False, dry_run: bool = False) -> int:
     ensure_initialized()
     data = load_slots()
     slots = data.get("slots", {})
@@ -680,54 +910,72 @@ def cmd_switch(name: str, *, no_restart: bool = False) -> int:
     if mode not in ("oauth", "relay"):
         fail(f"slot {target_slot!r} has invalid mode {mode!r}")
 
+    if dry_run:
+        plan = compute_switch_plan(data, target_slot)
+        print_switch_plan(plan)
+        return 0
+
     if slot_is_clean(data, target_slot):
         print(f"当前已是：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
         print("  无需修改；Codex App 未重启")
         return 0
 
-    if not no_restart:
-        quit_codex()
+    try:
+        lock_ctx = Sub2cliLock()
+        lock_ctx.__enter__()
+    except LockBusy as exc:
+        fail(str(exc), code=4)
+        return 4
+    try:
+        backup_dir = new_backup_dir(f"switch-to-{target_slot}")
+        snapshot_pre_switch(backup_dir)
 
-    auth_target = Path(cfg["auth_file"]).expanduser()
-    profile_target = history_profile_target(data, target_slot)
-    auth_target.parent.mkdir(parents=True, exist_ok=True)
-    profile_target.mkdir(parents=True, exist_ok=True)
+        if not no_restart:
+            quit_codex()
 
-    if mode == "relay":
-        api_key = str(cfg.get("api_key") or "").strip()
-        base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
-        if not api_key or not base_url:
-            fail(f"relay slot {target_slot!r} is missing api_key/base_url")
-        write_apikey_auth(auth_target, api_key)
-        patch_config(mode="relay", model=cfg.get("model", DEFAULT_MODEL), relay_base_url=base_url)
-    else:
-        patch_config(mode="oauth", model=cfg.get("model", DEFAULT_MODEL))
+        auth_target = Path(cfg["auth_file"]).expanduser()
+        profile_target = history_profile_target(data, target_slot)
+        auth_target.parent.mkdir(parents=True, exist_ok=True)
+        profile_target.mkdir(parents=True, exist_ok=True)
 
-    atomic_symlink(AUTH_JSON, auth_target)
-    atomic_symlink(APP_PROFILE, profile_target)
-    session_stats = normalize_sessions_if_needed(slot_thread_provider(cfg))
+        if mode == "relay":
+            api_key = str(cfg.get("api_key") or "").strip()
+            base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
+            if not api_key or not base_url:
+                fail(f"relay slot {target_slot!r} is missing api_key/base_url")
+            write_apikey_auth(auth_target, api_key)
+            patch_config(mode="relay", model=cfg.get("model", DEFAULT_MODEL), relay_base_url=base_url)
+        else:
+            patch_config(mode="oauth", model=cfg.get("model", DEFAULT_MODEL))
 
-    previous = data.get("current")
-    data["current"] = target_slot
-    data.setdefault("app_history_slot", target_slot)
-    save_slots(data)
+        atomic_symlink(AUTH_JSON, auth_target)
+        atomic_symlink(APP_PROFILE, profile_target)
+        session_stats = normalize_sessions_if_needed(slot_thread_provider(cfg))
 
-    verb = "已修复当前渠道" if previous == target_slot else "已切换到"
-    print(f"{verb}：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
-    print(f"  auth.json   -> {auth_target}")
-    print(f"  App profile -> {profile_target}（历史保留）")
-    if mode == "relay":
-        print(f"  base_url    -> {cfg.get('base_url')}")
-        print(f"  model       -> {cfg.get('model', DEFAULT_MODEL)}")
-    elif not auth_target.exists() or auth_target.stat().st_size < 10:
-        print(f"  尚未登录：请运行 `codex login` 写入 {auth_target}")
-    print_session_summary(session_stats)
-    if not no_restart:
-        launch_codex()
-        print("  Codex App 已重新打开")
-    else:
-        print("  --no-restart：Codex App 未重新打开")
-    return 0
+        previous = data.get("current")
+        data["current"] = target_slot
+        data.setdefault("app_history_slot", target_slot)
+        save_slots(data)
+
+        verb = "已修复当前渠道" if previous == target_slot else "已切换到"
+        print(f"{verb}：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
+        print(f"  auth.json   -> {auth_target}")
+        print(f"  App profile -> {profile_target}（历史保留）")
+        if mode == "relay":
+            print(f"  base_url    -> {cfg.get('base_url')}")
+            print(f"  model       -> {cfg.get('model', DEFAULT_MODEL)}")
+        elif not auth_target.exists() or auth_target.stat().st_size < 10:
+            print(f"  尚未登录：请运行 `codex login` 写入 {auth_target}")
+        print_session_summary(session_stats)
+        if not no_restart:
+            launch_codex()
+            print("  Codex App 已重新打开")
+        else:
+            print("  --no-restart：Codex App 未重新打开")
+        print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
+        return 0
+    finally:
+        lock_ctx.__exit__(None, None, None)
 
 
 def cmd_relay(
@@ -740,6 +988,7 @@ def cmd_relay(
     skip_probe: bool = False,
     no_switch: bool = False,
     no_restart: bool = False,
+    dry_run: bool = False,
 ) -> int:
     ensure_initialized()
     base_url = normalize_base_url(base_url)
@@ -755,6 +1004,34 @@ def cmd_relay(
             print("渠道未保存。请换正确的 URL/key 后重试，或加 --skip-check 跳过检查。", file=sys.stderr)
             return 3
         print(f"检查通过：{message}")
+
+    if dry_run:
+        existing_data = load_slots(required=False)
+        existing_slots = existing_data.get("slots", {}) or {}
+        verb = "update" if slot in existing_slots else "add"
+        print(f"DRY-RUN: 将 {verb} API 渠道")
+        print(f"  slot:     {slot}")
+        print(f"  base_url: {base_url}")
+        print(f"  model:    {model}")
+        if no_switch:
+            print("  --no-switch: 不会切换")
+            return 0
+        # Simulate post-add state for the switch plan.
+        simulated = dict(existing_data)
+        simulated_slots = dict(existing_slots)
+        simulated_slots[slot] = {
+            "display_name": display or (existing_slots.get(slot) or {}).get("display_name") or f"Codex - {slot} relay",
+            "mode": "relay",
+            "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
+            "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+            "base_url": base_url,
+            "model": model,
+            "api_key": api_key,
+        }
+        simulated["slots"] = simulated_slots
+        print()
+        print_switch_plan(compute_switch_plan(simulated, slot))
+        return 0
 
     data = load_slots()
     slots = data.setdefault("slots", {})
@@ -788,9 +1065,33 @@ def cmd_oauth(
     display: str | None = None,
     no_switch: bool = False,
     no_restart: bool = False,
+    dry_run: bool = False,
 ) -> int:
     ensure_initialized()
     slot = validate_slot(slot)
+
+    if dry_run:
+        existing_data = load_slots(required=False)
+        existing_slots = existing_data.get("slots", {}) or {}
+        verb = "update" if slot in existing_slots else "add"
+        print(f"DRY-RUN: 将 {verb} 账号渠道")
+        print(f"  slot: {slot}")
+        if no_switch:
+            print("  --no-switch: 不会切换")
+            return 0
+        simulated = dict(existing_data)
+        simulated_slots = dict(existing_slots)
+        simulated_slots[slot] = {
+            "display_name": display or (existing_slots.get(slot) or {}).get("display_name") or f"Codex - {slot}",
+            "mode": "oauth",
+            "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
+            "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+        }
+        simulated["slots"] = simulated_slots
+        print()
+        print_switch_plan(compute_switch_plan(simulated, slot))
+        return 0
+
     data = load_slots()
     slots = data.setdefault("slots", {})
     existing = slots.get(slot)
@@ -900,6 +1201,63 @@ def cmd_normalize_sessions(target: str | None, *, dry_run: bool) -> int:
     stats = normalize_sessions(target_provider, dry_run=dry_run)
     print_session_summary(stats)
     return 1 if stats.get("rollouts", {}).get("errors") else 0
+
+
+def cmd_rollback(target: str | None = None, *, list_only: bool = False) -> int:
+    """Restore the most recent (or named) backup. --list to show available ones."""
+    if not BACKUP_ROOT.exists():
+        if list_only:
+            print(f"(no backups: {BACKUP_ROOT} doesn't exist)")
+            return 0
+        fail(f"备份目录不存在: {BACKUP_ROOT}")
+    backups = sorted(
+        [p for p in BACKUP_ROOT.iterdir() if p.is_dir()],
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    if list_only:
+        if not backups:
+            print("(no backups)")
+            return 0
+        print(f"备份 ({len(backups)} 个, 最新在上):")
+        for p in backups[:20]:
+            snap = p / SNAPSHOT_FILENAME
+            tag = "snapshot" if snap.exists() else "no-snapshot"
+            print(f"  {p.name}  [{tag}]")
+        if len(backups) > 20:
+            print(f"  ... 还有 {len(backups) - 20} 个")
+        return 0
+    if not backups:
+        fail("没有任何备份可恢复")
+    if target in (None, "", "latest"):
+        chosen = backups[0]
+    else:
+        exact = [p for p in backups if p.name == target]
+        if exact:
+            chosen = exact[0]
+        else:
+            partial = [p for p in backups if target in p.name]
+            if len(partial) == 1:
+                chosen = partial[0]
+            elif not partial:
+                head = ", ".join(p.name for p in backups[:5])
+                fail(f"未找到匹配的备份: {target}\n  候选: {head}")
+                return 2
+            else:
+                head = ", ".join(p.name for p in partial)
+                fail(f"备份名歧义: {head}")
+                return 2
+    print(f"将从备份恢复: {chosen.name}")
+    try:
+        lock_ctx = Sub2cliLock()
+        lock_ctx.__enter__()
+    except LockBusy as exc:
+        fail(str(exc), code=4)
+        return 4
+    try:
+        return restore_from_backup(chosen)
+    finally:
+        lock_ctx.__exit__(None, None, None)
 
 
 def clear_screen() -> None:
@@ -1270,6 +1628,14 @@ def run_internal_command(command: str, argv: list[str]) -> int:
         args = parser.parse_args(argv)
         return cmd_normalize_sessions(args.target, dry_run=args.dry_run)
 
+    if command == "rollback":
+        parser.add_argument("target", nargs="?", default=None,
+                            help="备份名 (latest 或具体目录名), 不传=latest")
+        parser.add_argument("--list", dest="list_only", action="store_true",
+                            help="只列出可用备份")
+        args = parser.parse_args(argv)
+        return cmd_rollback(args.target, list_only=args.list_only)
+
     fail(f"unknown internal command: {command}")
     return 1
 
@@ -1288,6 +1654,7 @@ def main(argv: list[str] | None = None) -> int:
         "switch",
         "remove",
         "normalize-sessions",
+        "rollback",
     }
     if argv and argv[0] in internal_commands:
         return run_internal_command(argv[0], argv[1:])
@@ -1310,16 +1677,28 @@ def main(argv: list[str] | None = None) -> int:
     p_add_api.add_argument("--skip-check", "--skip-probe", dest="skip_probe", action="store_true")
     p_add_api.add_argument("--no-switch", action="store_true")
     p_add_api.add_argument("--no-restart", action="store_true")
+    p_add_api.add_argument("--dry-run", action="store_true",
+                           help="只打印计划改动, 不写入")
 
     p_add_account = sub.add_parser("add-account", help="添加 Codex 登录账号，并切过去")
     p_add_account.add_argument("name")
     p_add_account.add_argument("--display")
     p_add_account.add_argument("--no-switch", action="store_true")
     p_add_account.add_argument("--no-restart", action="store_true")
+    p_add_account.add_argument("--dry-run", action="store_true",
+                               help="只打印计划改动, 不写入")
 
     p_use = sub.add_parser("use", help="切换到已保存的渠道")
     p_use.add_argument("name")
     p_use.add_argument("--no-restart", action="store_true")
+    p_use.add_argument("--dry-run", action="store_true",
+                       help="只打印计划改动, 不写入")
+
+    p_rollback = sub.add_parser("rollback", help="从备份恢复 ~/.codex 状态")
+    p_rollback.add_argument("target", nargs="?", default=None,
+                            help="备份名 (latest 或具体目录名), 不传=latest")
+    p_rollback.add_argument("--list", dest="list_only", action="store_true",
+                            help="只列出可用备份")
 
     sub.add_parser("list", help="列出已保存渠道")
     sub.add_parser("current", help="查看当前渠道")
@@ -1343,6 +1722,7 @@ def main(argv: list[str] | None = None) -> int:
             skip_probe=args.skip_probe,
             no_switch=args.no_switch,
             no_restart=args.no_restart,
+            dry_run=args.dry_run,
         )
     if args.command == "add-account":
         return cmd_oauth(
@@ -1350,9 +1730,12 @@ def main(argv: list[str] | None = None) -> int:
             display=args.display,
             no_switch=args.no_switch,
             no_restart=args.no_restart,
+            dry_run=args.dry_run,
         )
     if args.command == "use":
-        return cmd_switch(args.name, no_restart=args.no_restart)
+        return cmd_switch(args.name, no_restart=args.no_restart, dry_run=args.dry_run)
+    if args.command == "rollback":
+        return cmd_rollback(args.target, list_only=args.list_only)
     parser.print_help()
     return 1
 
