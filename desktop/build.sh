@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# desktop/build.sh — build sub2cli.app via PyInstaller, then point at the
-# manual codesign / notarize / GitHub release pipeline.
+# desktop/build.sh — build an unsigned sub2cli.app + DMG via PyInstaller.
 #
 # Prerequisites:
 #   - venv at ../spike/venv with pyinstaller + pywebview + requests + websocket-client + keyring
@@ -12,7 +11,8 @@
 # Outputs:
 #   dist/sub2cli.app           — final .app bundle
 #   dist/sub2cli/              — flat onedir output (.app wraps this)
-#   build/                     — intermediate (gitignored via spike/-style)
+#   dist/sub2cli-<version>.dmg — unsigned installer DMG
+#   build/                     — intermediate (gitignored)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,17 +54,68 @@ echo "✓ dist/sub2cli.app  ($size)"
 # --- 2. Smoke test ---
 
 echo "→ smoke test (--smoke: opens window 1s, exits 0)"
-if timeout 10 dist/sub2cli.app/Contents/MacOS/sub2cli --smoke; then
+run_smoke() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 90 dist/sub2cli.app/Contents/MacOS/sub2cli --smoke
+    return $?
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout 90 dist/sub2cli.app/Contents/MacOS/sub2cli --smoke
+    return $?
+  fi
+
+  dist/sub2cli.app/Contents/MacOS/sub2cli --smoke &
+  local pid=$!
+  for _ in {1..90}; do
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      wait "$pid"
+      return $?
+    fi
+    sleep 1
+  done
+  kill "$pid" >/dev/null 2>&1 || true
+  wait "$pid" >/dev/null 2>&1 || true
+  return 124
+}
+
+if run_smoke; then
   echo "✓ bundled app runs"
 else
-  echo "✗ bundled app failed smoke test (continuing to print codesign hint)"
+  echo "✗ bundled app failed smoke test (continuing to package unsigned dmg)"
 fi
 
-# --- 3. Codesign + notarize hints (manual, needs V's creds) ---
+# --- 3. Unsigned DMG ---
+
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/sub2cli.app/Contents/Info.plist)"
+DMG_STAGE="dist/dmg-stage"
+DMG_PATH="dist/sub2cli-${VERSION}.dmg"
+rm -rf "$DMG_STAGE" "$DMG_PATH"
+mkdir -p "$DMG_STAGE"
+cp -R dist/sub2cli.app "$DMG_STAGE/"
+ln -s /Applications "$DMG_STAGE/Applications"
+hdiutil create \
+  -volname "sub2cli ${VERSION}" \
+  -srcfolder "$DMG_STAGE" \
+  -ov \
+  -format UDZO \
+  "$DMG_PATH"
+rm -rf "$DMG_STAGE"
+echo "✓ $DMG_PATH  ($(du -sh "$DMG_PATH" | cut -f1))"
+
+# --- 4. Distribution notes ---
 
 cat <<EOF
 
-next steps (manual, requires V's Apple Developer credentials):
+unsigned distribution:
+
+  $DMG_PATH
+
+Gatekeeper bypass after drag-installing to /Applications:
+
+  xattr -dr com.apple.quarantine /Applications/sub2cli.app
+  open /Applications/sub2cli.app
+
+optional signed distribution later (requires Apple Developer credentials):
 
   # codesign with Developer ID Application cert
   codesign --deep --force --verify --verbose=2 \\
@@ -85,10 +136,6 @@ next steps (manual, requires V's Apple Developer credentials):
   xcrun stapler staple dist/sub2cli.app
 
   # GitHub release (gh CLI)
-  ditto -c -k --keepParent dist/sub2cli.app dist/sub2cli-\$(date +%Y%m%d).zip
-  gh release create v0.1.0 dist/sub2cli-*.zip \\
-    --title "sub2cli desktop 0.1.0" --notes "First desktop release"
-
-  # auto-update: Sparkle (native) or GitHub-releases polling (Python).
-  # P6 ships the bundle + crash log; Sparkle integration is P6.1 (separate task).
+  gh release create "v$VERSION" "$DMG_PATH" \\
+    --title "sub2cli desktop $VERSION" --notes "Unsigned macOS desktop build."
 EOF

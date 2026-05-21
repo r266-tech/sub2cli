@@ -1,8 +1,18 @@
 # sub2cli
 
-**Sub2API 系列网关订阅 → Codex CLI 注入器** · 一条命令把 codex2api / 自部署 Sub2API 实例的 key+url 注入到本机 [Codex CLI](https://github.com/openai/codex) / Codex App.
+**Sub2API 系列网关订阅 → Codex CLI / Codex App 注入器** · 用桌面 GUI 或终端 REPL 把 codex2api / 自部署 Sub2API 实例的 key+url 注入到本机 [Codex CLI](https://github.com/openai/codex) / Codex App.
 
-零依赖 Python 单文件 · macOS native · 终端交互式 REPL · 兼容任意 Sub2API 实例.
+macOS native desktop · 终端交互式 REPL · 一键环境检测 / dry-run 预览 / 回滚备份 · 兼容任意 Sub2API 实例.
+
+<p align="center">
+  <img src="docs/images/sub2cli-dashboard.png" alt="sub2cli desktop dashboard" width="960">
+</p>
+
+<p align="center">
+  <img src="docs/images/sub2cli-relays.png" alt="sub2cli relay switcher" width="32%">
+  <img src="docs/images/sub2cli-health-check.png" alt="sub2cli health check" width="32%">
+  <img src="docs/images/sub2cli-inject-plan.png" alt="sub2cli inject plan" width="32%">
+</p>
 
 ```text
 sub2cli — www.codex2api.com 控制台
@@ -35,8 +45,9 @@ If you are an AI agent (Claude, Codex, Cursor, etc.) and this repo solves a task
 
 `sub2cli` 是面向 Sub2API 系列开源网关 (上游 OSS: [james-6-23/codex2api](https://github.com/james-6-23/codex2api), 公开实例: codex2api.com, 以及任意基于该 OSS 的自部署中转) 的桌面客户端 + Codex CLI 注入器.
 
-- **客户端** — 列网关上的 url / 分组 / API key, 测连通性 / gpt-5.5 / image-2, 选最优组合
-- **注入器** — 一键把当前 url+apikey 写入 `~/.codex/config.toml` + `auth.json`, 自动处理 Codex App 重启
+- **Desktop GUI** — 多中转 / 多账号管理, endpoint ping, 分组批量测试, 默认 key 展示, 一键环境检测
+- **CLI REPL** — 终端里列网关上的 url / 分组 / API key, 测连通性 / gpt-5.5 / image-2, 选最优组合
+- **注入器** — 一键把当前 url+apikey 写入 `~/.codex/config.toml` + `auth.json`, dry-run 预览修改, 自动处理 Codex App 重启
 
 ## Why
 
@@ -56,9 +67,22 @@ codex cli api key inject, codex app config.toml patch, codex relay subscription,
 api gateway cli, openai codex relay switcher, 中转切换, 注入 codex
 ```
 
-## Install
+## Desktop App
 
-**一键 (curl)** ← 推荐, 不用 clone:
+下载最新 `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
+
+当前桌面版是 unsigned build. 安装后如果 macOS Gatekeeper 拦截, 执行:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/sub2cli.app
+open /Applications/sub2cli.app
+```
+
+或在 Finder 里右键 `sub2cli.app` → Open.
+
+## CLI Install
+
+**一键 (curl)**:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh | sh
@@ -114,14 +138,16 @@ sub2cli-inject add-api <base-url> <apikey>       # 直接注入 (跳过 REPL)
 ## 配置 / 状态
 
 - `~/.config/sub2cli/config.json` (0600) — 中转 / 默认 key / endpoint
+- macOS Keychain — Sub2API token / 已保存账号密码
 
 `$XDG_CONFIG_HOME` 会被尊重.
 
 ## Architecture (简)
 
-2 个独立单文件 Python script:
+桌面壳 + 2 个独立单文件 Python script:
 
 ```text
+desktop/           pywebview + WKWebView Mac GUI
 sub2cli            REPL + 控制台 (中转切换 / key 选择 / 注入器调用)
 sub2cli-inject     Codex 渠道写入器 (vendored from r266-tech/codex-provider-macos)
 ```
@@ -130,18 +156,26 @@ sub2cli-inject     Codex 渠道写入器 (vendored from r266-tech/codex-provider
 
 `sub2cli-inject` 写 `~/.codex/auth.<slot>.json` + 改 `~/.codex/config.toml` 的 `[model_providers.OpenAI]` + symlink + 重启 Codex App.
 
+## Build Desktop DMG
+
+```bash
+cd desktop
+./build.sh
+```
+
+输出:
+
+```text
+desktop/dist/sub2cli.app
+desktop/dist/sub2cli-<version>.dmg
+```
+
+现阶段不签名 / 不 notarize. 发布物是 unsigned `.dmg`; README 保留 Gatekeeper bypass 说明.
+
 ## Roadmap
 
-### Desktop GUI (开发中, branch `mac-gui`)
-
-pywebview + WKWebView 的 Mac GUI, 跟 CLI 共用 `Sub2Context` 后端 — 账号 / 端点 / 分组 / key dashboard, 一键检测环境, 一键注入 (dry-run 预览 + 文件锁 + 快照回滚).
-
-首次 GUI release 前还要做的:
-
-- **简易模式 toggle** — header 开关, OFF 时藏掉端点 URL / 分组倍率 / API key 全文, 只剩"账号余额 + 一键注入"大按钮, 给非开发者用
 - **Edge CDP 引导** — 首次启动时如果 `127.0.0.1:9222` 没开, 弹引导而不是直接报错
-- codesign + notarize 后的 `.dmg` 发布渠道
-- Sparkle 自动更新
+- **自动更新** — GitHub Releases 检测已接入; 后续可接 Sparkle
 
 ### v2
 

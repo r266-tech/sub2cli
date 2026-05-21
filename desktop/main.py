@@ -19,9 +19,36 @@ import threading
 import time
 import traceback
 
+
+def _ensure_ca_bundle() -> None:
+    """Inside the PyInstaller .app, certifi's `where()` points at
+    Contents/Frameworks/certifi/cacert.pem but the file is shipped under
+    Contents/Resources/certifi/cacert.pem. Fix the env so `requests`
+    (used by add_relay / add_account login + GitHub checks) finds it.
+    """
+    exe = os.path.abspath(sys.executable)
+    macos_dir = os.path.dirname(exe)
+    if not macos_dir.endswith("/Contents/MacOS"):
+        return
+    contents_dir = os.path.dirname(macos_dir)
+    for sub in ("Resources", "Frameworks"):
+        cand = os.path.join(contents_dir, sub, "certifi", "cacert.pem")
+        if os.path.exists(cand):
+            os.environ.setdefault("SSL_CERT_FILE", cand)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", cand)
+            os.environ.setdefault("CURL_CA_BUNDLE", cand)
+            return
+
+
+_ensure_ca_bundle()
+
 import webview
 
 from api import JsApi
+
+WINDOW_WIDTH = 1180
+WINDOW_HEIGHT = 820
+WINDOW_MIN_SIZE = (960, 680)
 
 # ---- crash log ----
 
@@ -83,6 +110,25 @@ else:
     UI_DIR = os.path.join(SCRIPT_DIR, "ui")
 
 
+def _set_app_icon_early() -> None:
+    """Set the runtime app icon before the first NSWindow is shown."""
+    candidates = []
+    if RESOURCE_DIR:
+        candidates.append(os.path.join(RESOURCE_DIR, "sub2cli.icns"))
+    candidates.append(os.path.join(SCRIPT_DIR, "assets", "sub2cli.icns"))
+    icon_path = next((p for p in candidates if os.path.exists(p)), None)
+    if not icon_path:
+        return
+    try:
+        from AppKit import NSApplication, NSImage  # type: ignore
+        app = NSApplication.sharedApplication()
+        icon = NSImage.alloc().initWithContentsOfFile_(icon_path)
+        if icon is not None:
+            app.setApplicationIconImage_(icon)
+    except Exception:
+        pass
+
+
 def _load_sub2cli_lib():
     """Load the sibling sub2cli script (no .py extension) as a module.
 
@@ -105,14 +151,15 @@ sub2cli_lib = _load_sub2cli_lib()
 def main() -> int:
     smoke = "--smoke" in sys.argv
 
+    _set_app_icon_early()
     api = JsApi()
     window = webview.create_window(
         "sub2cli",
         url=f"file://{os.path.join(UI_DIR, 'index.html')}",
         js_api=api,
-        width=960,
-        height=640,
-        min_size=(720, 480),
+        width=WINDOW_WIDTH,
+        height=WINDOW_HEIGHT,
+        min_size=WINDOW_MIN_SIZE,
         text_select=True,
     )
 

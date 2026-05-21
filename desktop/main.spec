@@ -78,16 +78,18 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='sub2cli.app',
-    icon=None,
+    icon='assets/sub2cli.icns',
     bundle_identifier='com.r266-tech.sub2cli',
     info_plist={
         'CFBundleName': 'sub2cli',
         'CFBundleDisplayName': 'sub2cli',
-        'CFBundleShortVersionString': '0.1.0',
-        'CFBundleVersion': '0.1.0',
+        'CFBundleShortVersionString': '0.2.0',
+        'CFBundleVersion': '0.2.0',
         'LSMinimumSystemVersion': '12.0',
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,
         'CFBundleIdentifier': 'com.r266-tech.sub2cli',
+        'CFBundleIconFile': 'sub2cli.icns',
+        'CFBundleIconName': 'sub2cli',
     },
 )
