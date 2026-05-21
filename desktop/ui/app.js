@@ -141,6 +141,11 @@ function applyBootstrap(data) {
   renderEndpoints(data.endpoints || [], data.default_endpoint);
   renderGroups(data.groups || [], data.keys || [], data.default_key);
   refreshSidebar();  // sidebar is independent of bootstrap data
+  updateAccountChip((data.user && data.user.email) || null);
+}
+
+function updateAccountChip(email) {
+  $('#account-email').textContent = email || '未设';
 }
 
 // ---- sidebar (multi-relay) ----
@@ -198,6 +203,127 @@ async function switchRelay(domain) {
     setStatus('✓ 已切 relay', 'ok');
   } catch (err) {
     showError('切 relay 失败', err && err.message ? err.message : String(err));
+    setStatus('错误', 'err');
+  }
+}
+
+// ---- account dropdown (Keychain-backed) ----
+
+function openAccountPop() {
+  $('#account-pop').classList.remove('hidden');
+  loadAccountList();
+}
+
+function closeAccountPop() {
+  $('#account-pop').classList.add('hidden');
+}
+
+function fmtTimestamp(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+async function loadAccountList() {
+  const list = $('#account-list');
+  list.replaceChildren(el('div', { className: 'muted small', text: '加载中…' }));
+  try {
+    const r = await window.pywebview.api.list_accounts();
+    if (!r.ok) {
+      list.replaceChildren(el('div', { className: 'muted small', text: r.error || '(空)' }));
+      return;
+    }
+    if (!r.accounts.length) {
+      list.replaceChildren(el('div', {
+        className: 'muted small',
+        text: '尚未保存账号; 点下面"+ 导入当前 Edge tab"',
+      }));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const acc of r.accounts) {
+      const isCur = acc.email === r.current;
+      const row = el('div', { className: 'account-row' + (isCur ? ' current' : '') });
+      const main = el('div', { className: 'account-row-main' });
+      main.appendChild(el('div', { className: 'account-email', text: acc.email }));
+      main.appendChild(el('div', {
+        className: 'account-row-meta',
+        text: (isCur ? '当前 · ' : '') + '上次校验 ' + fmtTimestamp(acc.last_verified),
+      }));
+      row.appendChild(main);
+      if (!isCur) {
+        main.style.cursor = 'pointer';
+        main.addEventListener('click', () => switchAccount(acc.email));
+      }
+      const actions = el('div', { className: 'account-row-actions' });
+      actions.appendChild(el('button', {
+        className: 'ghost-x',
+        text: '✕',
+        attrs: { title: '删除 (从 Keychain + cfg 移除)' },
+        onClick: (e) => { e.stopPropagation(); deleteAccount(acc.email); },
+      }));
+      row.appendChild(actions);
+      frag.appendChild(row);
+    }
+    list.replaceChildren(frag);
+  } catch (err) {
+    list.replaceChildren(el('div', { className: 'muted small', text: '错: ' + String(err) }));
+  }
+}
+
+async function importEdgeAccount() {
+  setStatus('从 Edge 导入账号中…', 'warn');
+  try {
+    const r = await window.pywebview.api.import_edge_account();
+    if (!r.ok) {
+      setStatus(r.needs_login ? '需登录' : '导入失败', 'err');
+      const list = $('#account-list');
+      list.replaceChildren(el('div', { className: 'muted small', text: r.error || '失败' }));
+      return;
+    }
+    updateAccountChip(r.email);
+    setStatus(`✓ 导入 ${r.email}`, 'ok');
+    await loadAccountList();
+    // optional: trigger refresh to update bootstrap data with new account
+    refresh();
+  } catch (err) {
+    setStatus('错误', 'err');
+  }
+}
+
+async function switchAccount(email) {
+  setStatus(`切到 ${email}…`, 'warn');
+  closeAccountPop();
+  showScreen('loading');
+  try {
+    const data = await window.pywebview.api.switch_account(email);
+    if (!data.ok) {
+      showError('切账号失败', data.error);
+      setStatus('错误', 'err');
+      return;
+    }
+    state.pingResults = {};
+    state.groupResults = {};
+    applyBootstrap(data);
+    showScreen('dashboard');
+    setStatus(`✓ 已切 ${email}`, 'ok');
+  } catch (err) {
+    showError('切账号失败', err && err.message ? err.message : String(err));
+    setStatus('错误', 'err');
+  }
+}
+
+async function deleteAccount(email) {
+  try {
+    const r = await window.pywebview.api.delete_account(email);
+    if (!r.ok) {
+      setStatus(r.error || '删除失败', 'err');
+      return;
+    }
+    setStatus(`✓ 删除 ${email}`, 'ok');
+    await loadAccountList();
+  } catch (err) {
     setStatus('错误', 'err');
   }
 }
@@ -578,6 +704,18 @@ $('#btn-inject').addEventListener('click', openInjectModal);
 $('#btn-inject-close').addEventListener('click', closeInjectModal);
 $('#btn-inject-cancel').addEventListener('click', closeInjectModal);
 $('#btn-inject-confirm').addEventListener('click', applyInject);
+
+$('#btn-account').addEventListener('click', (e) => {
+  e.stopPropagation();
+  if ($('#account-pop').classList.contains('hidden')) openAccountPop();
+  else closeAccountPop();
+});
+$('#btn-account-import').addEventListener('click', importEdgeAccount);
+document.addEventListener('click', (e) => {
+  const pop = $('#account-pop');
+  if (pop.classList.contains('hidden')) return;
+  if (!pop.contains(e.target) && e.target.id !== 'btn-account') closeAccountPop();
+});
 
 $('#inject-modal').addEventListener('click', (e) => {
   if (e.target === $('#inject-modal')) closeInjectModal();

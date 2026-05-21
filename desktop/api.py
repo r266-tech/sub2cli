@@ -14,9 +14,15 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+import keyring
+
+
+KEYCHAIN_SERVICE = "sub2cli"
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +54,40 @@ def _mask_key(k: str) -> str:
     return sub2cli_lib.mask_key(k)
 
 
+# ---- macOS Keychain wrappers (sub2cli service) ----
+
+def _kc_username(domain: str, email: str) -> str:
+    return f"{domain}|{email}"
+
+
+def _kc_set(domain: str, email: str, token: str) -> None:
+    keyring.set_password(KEYCHAIN_SERVICE, _kc_username(domain, email), token)
+
+
+def _kc_get(domain: str, email: str) -> str | None:
+    return keyring.get_password(KEYCHAIN_SERVICE, _kc_username(domain, email))
+
+
+def _kc_delete(domain: str, email: str) -> None:
+    try:
+        keyring.delete_password(KEYCHAIN_SERVICE, _kc_username(domain, email))
+    except Exception:
+        # keyring's PasswordDeleteError + macOS variants — swallow on best-effort
+        pass
+
+
+def _accounts_for_domain(cfg: dict, domain: str) -> dict:
+    """Mutable accounts entry for domain in cfg.
+
+    Schema: {"current": email|None, "saved": [{email, last_verified}, ...]}
+    Lives at cfg["accounts"][domain] — separate from cfg["relays"][domain]
+    so sub2cli_lib.save_config() (which overwrites relays[domain] with
+    RELAY_FIELDS only) doesn't clobber it.
+    """
+    accounts = cfg.setdefault("accounts", {})
+    return accounts.setdefault(domain, {"current": None, "saved": []})
+
+
 class JsApi:
     """Thread-safe-ish wrapper around Sub2Context for the pywebview bridge.
 
@@ -67,7 +107,12 @@ class JsApi:
     # ---- internal helpers ----
 
     def _ensure_ctx(self) -> tuple[Any, dict]:
-        """Load config and create Sub2Context if not already cached."""
+        """Load config and create Sub2Context if not already cached.
+
+        If a Keychain-stored account is marked current for the domain, its
+        saved token is used. Otherwise ctx.token lazy-fetches from Edge CDP
+        the first time it's accessed (P0 behavior).
+        """
         if self._ctx is not None and self._cfg is not None:
             return self._ctx, self._cfg
         cfg = sub2cli_lib.load_config()
@@ -77,6 +122,14 @@ class JsApi:
                 "或在桌面 GUI 后续版本中走内置 wizard (P3)。"
             )
         ctx = Sub2Context(cfg["domain"])
+        # If a saved account is marked current for this domain, prefer its
+        # Keychain token over re-fetching from Edge CDP each launch.
+        ad = (cfg.get("accounts") or {}).get(ctx.domain) or {}
+        current_email = ad.get("current")
+        if current_email:
+            saved_token = _kc_get(ctx.domain, current_email)
+            if saved_token:
+                ctx.set_token(saved_token)
         self._ctx = ctx
         self._cfg = cfg
         return ctx, cfg
@@ -388,6 +441,103 @@ class JsApi:
             self._default_key = None
             self._default_ep = None
         return self.bootstrap()
+
+    # ---- accounts (Keychain-backed) ----
+
+    def list_accounts(self) -> dict:
+        """Saved accounts for the current relay + which one is active."""
+        with self._lock:
+            try:
+                ctx, cfg = self._ensure_ctx()
+            except RuntimeError as exc:
+                return {"ok": False, "error": str(exc), "accounts": [], "current": None}
+            ad = _accounts_for_domain(cfg, ctx.domain)
+            return {
+                "ok": True,
+                "accounts": list(ad.get("saved", []) or []),
+                "current": ad.get("current"),
+                "domain": ctx.domain,
+            }
+
+    def import_edge_account(self) -> dict:
+        """Read fresh CDP token for current relay, identify user via /auth/me,
+        store token in macOS Keychain, register in cfg.accounts.
+
+        After this, the active ctx will use the saved token, so subsequent
+        bootstraps don't need Edge open.
+        """
+        with self._lock:
+            try:
+                ctx, cfg = self._ensure_ctx()
+            except RuntimeError as exc:
+                return {"ok": False, "error": str(exc)}
+            # Fetch FRESH token from CDP (don't use any cached token).
+            fresh = Sub2Context(
+                ctx.domain, config_path=ctx.config_path,
+                cdp_host=ctx.cdp_host, cdp_port=ctx.cdp_port,
+            )
+            try:
+                token = fresh.token  # raises TokenError if CDP/login missing
+            except TokenError as exc:
+                return {"ok": False, "error": str(exc), "needs_login": True}
+            user = fresh.fetch_user()
+            if not user or not user.get("email"):
+                return {"ok": False, "error": "/auth/me 拿不到 email"}
+            email = user["email"]
+            _kc_set(ctx.domain, email, token)
+            ad = _accounts_for_domain(cfg, ctx.domain)
+            existing = next((a for a in ad["saved"] if a.get("email") == email), None)
+            now = int(time.time())
+            if existing:
+                existing["last_verified"] = now
+            else:
+                ad["saved"].append({"email": email, "last_verified": now})
+            ad["current"] = email
+            sub2cli_lib.save_config(cfg, ctx.config_path)
+            self._cfg = cfg
+            # Switch the active ctx to use this token going forward.
+            ctx.set_token(token)
+            self._user = user
+        return {"ok": True, "email": email}
+
+    def switch_account(self, email: str) -> dict:
+        """Activate a saved account; reads token from Keychain, re-bootstraps."""
+        with self._lock:
+            try:
+                ctx, cfg = self._ensure_ctx()
+            except RuntimeError as exc:
+                return {"ok": False, "error": str(exc)}
+            ad = _accounts_for_domain(cfg, ctx.domain)
+            if not any(a.get("email") == email for a in ad.get("saved", [])):
+                return {"ok": False, "error": f"账号 {email} 不在已保存列表"}
+            token = _kc_get(ctx.domain, email)
+            if not token:
+                return {"ok": False, "error": f"Keychain 没找到 {email} 的 token"}
+            ctx.set_token(token)
+            ad["current"] = email
+            sub2cli_lib.save_config(cfg, ctx.config_path)
+            self._cfg = cfg
+            # force bootstrap to re-fetch user / keys / etc with new token
+            self._user = None
+            self._default_key = None
+            self._default_ep = None
+        return self.bootstrap()
+
+    def delete_account(self, email: str) -> dict:
+        """Remove an account from Keychain and cfg."""
+        with self._lock:
+            try:
+                ctx, cfg = self._ensure_ctx()
+            except RuntimeError as exc:
+                return {"ok": False, "error": str(exc)}
+            _kc_delete(ctx.domain, email)
+            ad = _accounts_for_domain(cfg, ctx.domain)
+            ad["saved"] = [a for a in ad.get("saved", []) if a.get("email") != email]
+            if ad.get("current") == email:
+                ad["current"] = None
+            sub2cli_lib.save_config(cfg, ctx.config_path)
+            self._cfg = cfg
+        return {"ok": True}
 
     def list_relays_full(self) -> dict:
         """Return all saved relays + which one is current."""

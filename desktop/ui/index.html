@@ -14,6 +14,18 @@
     </div>
     <div class="header-actions">
       <span class="status" id="status">·</span>
+      <div class="account-anchor">
+        <button class="ghost" id="btn-account" title="账号">👤 <span id="account-email">未设</span> ▼</button>
+        <div class="account-pop hidden" id="account-pop">
+          <div class="pop-title">当前 relay 的账号</div>
+          <div class="pop-list" id="account-list">
+            <div class="muted small">加载中…</div>
+          </div>
+          <div class="pop-footer">
+            <button class="primary sm" id="btn-account-import">+ 导入当前 Edge tab</button>
+          </div>
+        </div>
+      </div>
       <button class="ghost" id="btn-health" title="一键检测环境">🩺 检测</button>
       <button class="ghost" id="btn-refresh" title="刷新所有">⟳</button>
     </div>
