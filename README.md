@@ -85,7 +85,7 @@ cd sub2cli
 python -m pip install --user requests websocket-client
 ```
 
-Windows 下会额外生成同名 `.cmd` 包装器。
+Windows 下会额外生成同名 `.cmd` 包装器。包装器会嵌入安装时解析到的 Python 路径；如果之后移动或更换 Python, 重新运行 `.\install.ps1`。
 如果 PowerShell 执行策略拦截脚本:
 
 ```powershell

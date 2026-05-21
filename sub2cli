@@ -551,7 +551,7 @@ def read_key() -> str:
                 return "up"
             if code in ("P", "M"):
                 return "down"
-            return "back"
+            return ""
         if ch in ("\r", "\n"):
             return "enter"
         if ch in ("q", "Q", "\x03"):
@@ -1039,7 +1039,10 @@ def _run_inject(inject_bin: str, url: str, api_key: str, source_label: str) -> N
     print(color(f"  调用:    {inject_bin} add-api <url> <key>", C_DIM))
     print()
     try:
-        rc = subprocess.call([sys.executable, inject_bin, "add-api", url, api_key])
+        if os.name == "nt" and inject_bin.lower().endswith(".cmd"):
+            rc = subprocess.call([inject_bin, "add-api", url, api_key])
+        else:
+            rc = subprocess.call([sys.executable, inject_bin, "add-api", url, api_key])
     except OSError as exc:
         print(color(f"  调用注入器失败: {exc}", C_RED))
         return

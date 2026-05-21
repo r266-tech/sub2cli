@@ -15,7 +15,7 @@ foreach ($bin in $bins) {
     "@echo off",
     "`"$Python`" `"%~dp0$bin`" %*"
   )
-  Set-Content -LiteralPath (Join-Path $InstallDir "$bin.cmd") -Encoding ASCII -Value $cmd
+  Set-Content -LiteralPath (Join-Path $InstallDir "$bin.cmd") -Encoding UTF8 -Value $cmd
   Write-Host "Installed: $(Join-Path $InstallDir "$bin.cmd")"
 }
 

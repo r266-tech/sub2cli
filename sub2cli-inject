@@ -152,13 +152,50 @@ def copy_path_atomic(src: Path, dst: Path) -> bool:
     return True
 
 
-def install_auth_for_windows_slot(auth_target: Path) -> bool:
+def prepare_windows_auth_temp(auth_target: Path) -> tuple[Path, bool]:
+    tmp = AUTH_JSON.with_name(f"{AUTH_JSON.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
     if auth_target.exists():
-        return copy_path_atomic(auth_target, AUTH_JSON)
-    if AUTH_JSON.exists() or AUTH_JSON.is_symlink():
-        AUTH_JSON.unlink()
-        return True
-    return False
+        tmp.write_bytes(auth_target.read_bytes())
+        return tmp, False
+    return tmp, True
+
+
+def install_prepared_windows_auth(tmp: Path, remove_auth: bool) -> None:
+    try:
+        if remove_auth:
+            if AUTH_JSON.exists() or AUTH_JSON.is_symlink():
+                AUTH_JSON.unlink()
+            return
+        tmp.replace(AUTH_JSON)
+    finally:
+        if tmp.exists() or tmp.is_symlink():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def windows_auth_matches(auth_target: Path) -> bool:
+    if not auth_target.exists():
+        return not AUTH_JSON.exists()
+    try:
+        return AUTH_JSON.exists() and AUTH_JSON.read_bytes() == auth_target.read_bytes()
+    except OSError:
+        return False
+
+
+def recover_windows_current_slot(data: dict) -> None:
+    current = data.get("current")
+    slots = data.get("slots", {})
+    if current not in slots:
+        return
+    auth_path = Path(slots[current].get("auth_file", "")).expanduser()
+    if windows_auth_matches(auth_path):
+        return
+    tmp, remove_auth = prepare_windows_auth_temp(auth_path)
+    install_prepared_windows_auth(tmp, remove_auth)
 
 
 def save_current_windows_auth(data: dict) -> None:
@@ -294,6 +331,7 @@ def cmd_init(slot: str = "local", display: str | None = None, *, quiet: bool = F
     data = load_slots(required=False)
     if IS_WINDOWS:
         if data.get("current") and data.get("slots"):
+            recover_windows_current_slot(data)
             if not quiet:
                 print(f"already initialized: current={data['current']}")
                 print(f"slots file: {SLOTS_FILE}")
@@ -780,6 +818,8 @@ def slot_is_clean(data: dict, target_slot: str) -> bool:
 def cmd_switch(name: str, *, no_restart: bool = False) -> int:
     ensure_initialized()
     data = load_slots()
+    if IS_WINDOWS:
+        recover_windows_current_slot(data)
     slots = data.get("slots", {})
     target_slot = resolve_slot(name, slots)
     cfg = slots[target_slot]
@@ -792,11 +832,11 @@ def cmd_switch(name: str, *, no_restart: bool = False) -> int:
         print("  无需修改；Codex App 未重启")
         return 0
 
-    if IS_WINDOWS:
-        save_current_windows_auth(data)
-
     if not no_restart:
         quit_codex()
+
+    if IS_WINDOWS:
+        save_current_windows_auth(data)
 
     auth_target = Path(cfg["auth_file"]).expanduser()
     profile_target = history_profile_target(data, target_slot)
@@ -815,7 +855,7 @@ def cmd_switch(name: str, *, no_restart: bool = False) -> int:
         patch_config(mode="oauth", model=cfg.get("model", DEFAULT_MODEL))
 
     if IS_WINDOWS:
-        install_auth_for_windows_slot(auth_target)
+        auth_tmp, remove_auth = prepare_windows_auth_temp(auth_target)
     else:
         atomic_symlink(AUTH_JSON, auth_target)
         atomic_symlink(APP_PROFILE, profile_target)
@@ -825,6 +865,8 @@ def cmd_switch(name: str, *, no_restart: bool = False) -> int:
     data["current"] = target_slot
     data.setdefault("app_history_slot", target_slot)
     save_slots(data)
+    if IS_WINDOWS:
+        install_prepared_windows_auth(auth_tmp, remove_auth)
 
     verb = "已修复当前渠道" if previous == target_slot else "已切换到"
     print(f"{verb}：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
@@ -882,7 +924,7 @@ def cmd_relay(
         "display_name": display or (existing or {}).get("display_name") or f"Codex - {slot} relay",
         "mode": "relay",
         "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
-        "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+        "app_profile_dir": "" if IS_WINDOWS else str(APP_SUPPORT / f"Codex.{slot}"),
         "base_url": base_url,
         "model": model,
         "api_key": api_key,
@@ -917,7 +959,7 @@ def cmd_oauth(
         "display_name": display or (existing or {}).get("display_name") or f"Codex - {slot}",
         "mode": "oauth",
         "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
-        "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+        "app_profile_dir": "" if IS_WINDOWS else str(APP_SUPPORT / f"Codex.{slot}"),
     }
     save_slots(data)
     print(f"{'已更新' if existing else '已添加'}账号渠道：{slot}")
@@ -1038,7 +1080,7 @@ def read_key() -> str:
                 return "up"
             if code in ("P", "M"):
                 return "down"
-            return "back"
+            return ""
         if ch in ("\r", "\n"):
             return "enter"
         if ch in ("q", "Q", "\x03"):
