@@ -27,7 +27,33 @@ KEYCHAIN_SERVICE = "sub2cli"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-SUB2CLI_PATH = os.path.join(REPO_ROOT, "sub2cli")
+
+
+def _resource_dir() -> str | None:
+    """Where bundled data lives. See desktop/main.py:_resource_dir for spec."""
+    import sys as _sys
+    exe_dir = os.path.dirname(os.path.abspath(_sys.executable))
+    if exe_dir.endswith("/Contents/MacOS"):
+        return os.path.join(os.path.dirname(exe_dir), "Resources")
+    if hasattr(_sys, "_MEIPASS"):
+        return getattr(_sys, "_MEIPASS")
+    return None
+
+
+def _find_sub2cli() -> str:
+    """Locate sub2cli script — PyInstaller resource dir, then repo root."""
+    candidates = []
+    res = _resource_dir()
+    if res:
+        candidates.append(os.path.join(res, "pyscripts", "sub2cli"))
+    candidates.append(os.path.join(REPO_ROOT, "sub2cli"))
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return candidates[-1]  # fall through to load-time error
+
+
+SUB2CLI_PATH = _find_sub2cli()
 
 
 def _load_sub2cli_lib():
@@ -313,13 +339,17 @@ class JsApi:
         return {"ok": True, "default_key": self._serialize_key(chosen)}
 
     def _resolve_inject_bin(self) -> str | None:
-        """Find sub2cli-inject binary; mirrors sub2cli._resolve_inject_bin."""
-        candidates = [
+        """Find sub2cli-inject binary; checks .app resources, repo, PATH."""
+        candidates: list[str | None] = []
+        res = _resource_dir()
+        if res:
+            candidates.append(os.path.join(res, "pyscripts", "sub2cli-inject-bundle"))
+        candidates.extend([
             os.path.join(REPO_ROOT, "sub2cli-inject"),
             os.path.expanduser("~/.local/bin/sub2cli-inject"),
             shutil.which("sub2cli-inject"),
             shutil.which("codex-provider"),
-        ]
+        ])
         for p in candidates:
             if p and os.path.isfile(p) and os.access(p, os.X_OK):
                 return p

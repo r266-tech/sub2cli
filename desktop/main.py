@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """sub2cli desktop — pywebview GUI over Sub2Context.
 
-最小可运行骨架:
-- 加载同仓库的 ../sub2cli 作为 sub2cli_lib (单文件无 .py 扩展, 走 importlib)
-- pywebview 打开 ui/index.html, 用 js_api 暴露 JsApi 给前端
-- --smoke: 启动 ~1s 后自杀, 用于 CI / packaging spike 验证
+加载 sub2cli (sibling 文件无 .py 扩展, 走 importlib.machinery.SourceFileLoader),
+pywebview 开 ui/index.html, JsApi 桥到 Sub2Context.
 
-主面板 / 一键检测 / 一键注入 等真实逻辑在后续 phase 接入 (P2-P4).
+打包 (PyInstaller --onedir 出 .app bundle) 时, sys._MEIPASS 是 bundle 解压点,
+UI_DIR / SUB2CLI_PATH 路径会自动指向 bundle 内部位置.
+
+--smoke: 启动 ~1s 自杀, CI / packaging 验证用.
 """
 from __future__ import annotations
 
@@ -16,13 +17,68 @@ import os
 import sys
 import threading
 import time
+import traceback
 
 import webview
 
+# ---- crash log ----
+
+CRASH_LOG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "sub2cli",
+    "crash-logs",
+)
+
+
+def _write_crash_log(exc: BaseException) -> str | None:
+    try:
+        os.makedirs(CRASH_LOG_DIR, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(CRASH_LOG_DIR, f"crash-{ts}-{os.getpid()}.log")
+        with open(path, "w") as f:
+            f.write(f"sub2cli desktop crash @ {time.ctime()}\n")
+            f.write(f"pid={os.getpid()} platform={sys.platform}\n")
+            f.write(f"argv={sys.argv}\n")
+            f.write(f"python={sys.version}\n\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
+        os.chmod(path, 0o600)
+        return path
+    except Exception:
+        return None
+
+
+# ---- paths (PyInstaller .app + onedir + dev all supported) ----
+
+def _resource_dir() -> str | None:
+    """Where bundled data files live.
+
+    .app bundle (Contents/MacOS/sub2cli): -> Contents/Resources
+    onedir / onefile non-bundle:          -> sys._MEIPASS
+    dev (no bundle):                      -> None (caller falls back)
+    """
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    if exe_dir.endswith("/Contents/MacOS"):
+        return os.path.join(os.path.dirname(exe_dir), "Resources")
+    if hasattr(sys, "_MEIPASS"):
+        return getattr(sys, "_MEIPASS")
+    return None
+
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-SUB2CLI_PATH = os.path.join(REPO_ROOT, "sub2cli")
-UI_DIR = os.path.join(SCRIPT_DIR, "ui")
+RESOURCE_DIR = _resource_dir()
+
+# sub2cli script: bundled into pyscripts/ subdir (avoids EXE name collision)
+if RESOURCE_DIR:
+    SUB2CLI_PATH = os.path.join(RESOURCE_DIR, "pyscripts", "sub2cli")
+    if not os.path.exists(SUB2CLI_PATH):
+        SUB2CLI_PATH = os.path.join(REPO_ROOT, "sub2cli")
+    UI_DIR = os.path.join(RESOURCE_DIR, "ui")
+    if not os.path.exists(UI_DIR):
+        UI_DIR = os.path.join(SCRIPT_DIR, "ui")
+else:
+    SUB2CLI_PATH = os.path.join(REPO_ROOT, "sub2cli")
+    UI_DIR = os.path.join(SCRIPT_DIR, "ui")
 
 
 def _load_sub2cli_lib():
@@ -96,4 +152,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException as _exc:
+        log_path = _write_crash_log(_exc)
+        msg = "sub2cli desktop 崩溃: " + repr(_exc)
+        if log_path:
+            msg += f"\n  日志: {log_path}"
+        print(msg, file=sys.stderr)
+        raise
