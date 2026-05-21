@@ -113,6 +113,7 @@ def main() -> int:
         width=960,
         height=640,
         min_size=(720, 480),
+        text_select=True,
     )
 
     if smoke:
