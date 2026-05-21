@@ -88,6 +88,25 @@ function el(tag, opts = {}) {
   return e;
 }
 
+// ---- mode toggle (简易 / 高级) ----
+
+function setMode(simple) {
+  document.body.classList.toggle('simple-mode', simple);
+  const btn = $('#btn-mode');
+  if (btn) btn.textContent = simple ? '🎚 简易' : '🎚 高级';
+  try { localStorage.setItem('sub2cli.simple_mode', simple ? '1' : '0'); } catch {}
+}
+
+function isSimpleMode() {
+  return document.body.classList.contains('simple-mode');
+}
+
+function initMode() {
+  let simple = false;
+  try { simple = localStorage.getItem('sub2cli.simple_mode') === '1'; } catch {}
+  setMode(simple);
+}
+
 // ---- bootstrap ----
 
 async function bootstrap() {
@@ -170,7 +189,7 @@ async function refreshSidebar() {
         relay.default_endpoint_name ? `线路=${relay.default_endpoint_name}` : null,
       ].filter(Boolean).join(' · ');
       if (metaText) {
-        item.appendChild(el('div', { className: 'sidebar-meta', text: metaText }));
+        item.appendChild(el('div', { className: 'sidebar-meta advanced-only', text: metaText }));
       }
       if (!relay.is_current) {
         item.addEventListener('click', () => switchRelay(relay.domain));
@@ -727,3 +746,6 @@ document.addEventListener('keydown', (e) => {
     if (!$('#inject-modal').classList.contains('hidden')) closeInjectModal();
   }
 });
+
+$('#btn-mode').addEventListener('click', () => setMode(!isSimpleMode()));
+initMode();

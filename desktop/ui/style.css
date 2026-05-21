@@ -565,3 +565,20 @@ button.sm { padding: 3px 8px; font-size: 11px; }
   border-left: 2px solid var(--border-strong);
   user-select: text;
 }
+
+/* ===== simple mode (小白模式) ===== */
+
+body.simple-mode .advanced-only { display: none !important; }
+
+body.simple-mode .footer-cta {
+  justify-content: center;
+  padding: 24px;
+  margin-top: 20px;
+}
+
+body.simple-mode button.primary.big {
+  padding: 14px 40px;
+  font-size: 14px;
+}
+
+#btn-mode { font-size: 11px; }

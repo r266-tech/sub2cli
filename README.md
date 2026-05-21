@@ -130,6 +130,23 @@ sub2cli-inject     Codex 渠道写入器 (vendored from r266-tech/codex-provider
 
 `sub2cli-inject` 写 `~/.codex/auth.<slot>.json` + 改 `~/.codex/config.toml` 的 `[model_providers.OpenAI]` + symlink + 重启 Codex App.
 
+## Roadmap
+
+### Desktop GUI (开发中, branch `mac-gui`)
+
+pywebview + WKWebView 的 Mac GUI, 跟 CLI 共用 `Sub2Context` 后端 — 账号 / 端点 / 分组 / key dashboard, 一键检测环境, 一键注入 (dry-run 预览 + 文件锁 + 快照回滚).
+
+首次 GUI release 前还要做的:
+
+- **简易模式 toggle** — header 开关, OFF 时藏掉端点 URL / 分组倍率 / API key 全文, 只剩"账号余额 + 一键注入"大按钮, 给非开发者用
+- **Edge CDP 引导** — 首次启动时如果 `127.0.0.1:9222` 没开, 弹引导而不是直接报错
+- codesign + notarize 后的 `.dmg` 发布渠道
+- Sparkle 自动更新
+
+### v2
+
+- **跨站健康守护** — 后台 daemon 持续 ping 各 relay, 当前中转降级时弹 macOS 通知 + 一键切换最快可用站
+
 ## Upstream / 致谢
 
 - `sub2cli-inject` vendored from [r266-tech/codex-provider-macos](https://github.com/r266-tech/codex-provider-macos) (MIT)

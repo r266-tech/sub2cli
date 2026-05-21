@@ -14,6 +14,7 @@
     </div>
     <div class="header-actions">
       <span class="status" id="status">·</span>
+      <button class="ghost" id="btn-mode" title="切换简易/高级模式">🎚 高级</button>
       <div class="account-anchor">
         <button class="ghost" id="btn-account" title="账号">👤 <span id="account-email">未设</span> ▼</button>
         <div class="account-pop hidden" id="account-pop">
@@ -90,7 +91,7 @@
             <span class="k">余额</span>
             <span class="v num" id="acc-balance">—</span>
           </div>
-          <div class="row">
+          <div class="row advanced-only">
             <span class="k">并发</span>
             <span class="v num" id="acc-concurrency">—</span>
           </div>
@@ -106,18 +107,18 @@
             <span class="k">分组</span>
             <span class="v" id="key-group">—</span>
           </div>
-          <div class="row">
+          <div class="row advanced-only">
             <span class="k">key</span>
             <span class="v mono" id="key-value">—</span>
             <button class="link" id="btn-reveal">显示</button>
           </div>
-          <div class="row">
+          <div class="row advanced-only">
             <span class="k">端点</span>
             <span class="v mono" id="ep-current">—</span>
           </div>
         </div>
 
-        <div class="card card-wide">
+        <div class="card card-wide advanced-only">
           <div class="card-title-row">
             <div class="card-title">端点</div>
             <button class="link" id="btn-ping-all">全部 ping</button>
@@ -136,7 +137,7 @@
           </table>
         </div>
 
-        <div class="card card-wide">
+        <div class="card card-wide advanced-only">
           <div class="card-title-row">
             <div class="card-title">分组</div>
             <span class="muted small">★ = 默认 key 当前所在分组</span>
@@ -160,7 +161,7 @@
 
       <div class="footer-cta">
         <button class="primary big" id="btn-inject">注入到 Codex</button>
-        <span class="muted small">先 dry-run 看完计划再确认</span>
+        <span class="muted small advanced-only">先 dry-run 看完计划再确认</span>
       </div>
     </section>
   </main>
