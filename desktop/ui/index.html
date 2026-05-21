@@ -140,11 +140,16 @@
         <div class="card card-wide advanced-only">
           <div class="card-title-row">
             <div class="card-title">分组</div>
-            <span class="muted small">★ = 默认 key 当前所在分组</span>
+            <div class="card-actions">
+              <span class="muted small">★ = 默认 key 所在</span>
+              <button class="link sm" id="btn-toggle-all-groups">全选</button>
+              <button class="link sm" id="btn-test-selected-groups" disabled>测试选中 (0)</button>
+            </div>
           </div>
           <table class="t-groups">
             <thead>
               <tr>
+                <th class="checkbox-col"></th>
                 <th></th>
                 <th>倍率</th>
                 <th>名称</th>

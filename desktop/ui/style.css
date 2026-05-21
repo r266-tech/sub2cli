@@ -565,6 +565,28 @@ button.sm { padding: 3px 8px; font-size: 11px; }
   user-select: text;
 }
 
+/* ===== batch group test (checkbox column + actions) ===== */
+
+.card-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.t-groups th.checkbox-col,
+.t-groups td.checkbox-col {
+  width: 28px;
+  padding-left: 4px;
+  padding-right: 4px;
+  text-align: center;
+}
+
+.t-groups td.checkbox-col input[type="checkbox"] {
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+
 /* ===== simple mode (小白模式) ===== */
 
 body.simple-mode .advanced-only { display: none !important; }

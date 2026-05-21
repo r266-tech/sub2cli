@@ -11,6 +11,7 @@ const state = {
   defaultEndpoint: null,
   pingResults: {}, // url → {ok, latency_ms, summary} | {running:true}
   groupResults: {}, // group_id → {chat:{...}, image:{...}}
+  groupSelected: {}, // group_id → boolean (checkbox state for batch test)
 };
 
 // ---- screen routing ----
@@ -495,6 +496,18 @@ function buildGroupRow(g, isDefaultHere, groupResult) {
   const tr = document.createElement('tr');
   if (isDefaultHere) tr.classList.add('current');
 
+  const checkboxTd = el('td', { className: 'checkbox-col' });
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.checked = !!state.groupSelected[g.id];
+  checkbox.addEventListener('change', () => {
+    state.groupSelected[g.id] = checkbox.checked;
+    updateBatchTestButton();
+    updateToggleAllButton();
+  });
+  checkboxTd.appendChild(checkbox);
+  tr.appendChild(checkboxTd);
+
   tr.appendChild(el('td', {
     children: [isDefaultHere ? el('span', { className: 'star', text: '★' }) : null],
   }));
@@ -530,6 +543,77 @@ function renderGroups(groups, _keys, defaultKey) {
     frag.appendChild(buildGroupRow(g, isDefaultHere, r));
   }
   tbody.replaceChildren(frag);
+  updateBatchTestButton();
+  updateToggleAllButton();
+}
+
+// ---- batch group test (checkbox + parallel) ----
+
+function getSelectedGroupIds() {
+  return state.groups.filter((g) => state.groupSelected[g.id]).map((g) => g.id);
+}
+
+function updateBatchTestButton() {
+  const btn = $('#btn-test-selected-groups');
+  if (!btn) return;
+  const n = getSelectedGroupIds().length;
+  btn.disabled = n === 0;
+  btn.textContent = `测试选中 (${n})`;
+}
+
+function updateToggleAllButton() {
+  const btn = $('#btn-toggle-all-groups');
+  if (!btn) return;
+  const total = state.groups.length;
+  const sel = getSelectedGroupIds().length;
+  btn.textContent = (total > 0 && sel === total) ? '反选' : '全选';
+}
+
+function toggleAllGroups() {
+  const total = state.groups.length;
+  const sel = getSelectedGroupIds().length;
+  if (total > 0 && sel === total) {
+    state.groupSelected = {};
+  } else {
+    for (const g of state.groups) state.groupSelected[g.id] = true;
+  }
+  renderGroups(state.groups, [], state.defaultKey);
+}
+
+async function testSelectedGroups() {
+  const ids = getSelectedGroupIds();
+  if (!ids.length) return;
+  // SERIAL: server-side "current default group" is per-account state;
+  // parallel calls would all race on the switch and end up hitting whichever
+  // group landed last. Must do switch → send → await → next, one at a time.
+  for (const id of ids) {
+    state.groupResults[id] = { chat: { running: true }, image: { running: true } };
+  }
+  renderGroups(state.groups, [], state.defaultKey);
+  let done = 0;
+  for (const id of ids) {
+    setStatus(`串行测试 ${done + 1}/${ids.length}…`, 'warn');
+    try {
+      const r = await window.pywebview.api.test_group(id);
+      if (!r.ok) {
+        state.groupResults[id] = {
+          chat: { ok: false, status: 'err', summary: r.error },
+          image: { ok: false, status: 'err', summary: r.error },
+        };
+      } else {
+        state.groupResults[id] = { chat: r.chat, image: r.image };
+        if (r.default_key) state.defaultKey = r.default_key;
+      }
+    } catch (err) {
+      state.groupResults[id] = {
+        chat: { ok: false, status: 'err', summary: String(err) },
+        image: { ok: false, status: 'err', summary: String(err) },
+      };
+    }
+    done++;
+    renderGroups(state.groups, [], state.defaultKey);  // 每个完成立刻刷
+  }
+  setStatus(`✓ 完成 ${done}/${ids.length} 个分组`, 'ok');
 }
 
 // ---- async actions ----
@@ -749,3 +833,6 @@ document.addEventListener('keydown', (e) => {
 
 $('#btn-mode').addEventListener('click', () => setMode(!isSimpleMode()));
 initMode();
+
+$('#btn-test-selected-groups').addEventListener('click', testSelectedGroups);
+$('#btn-toggle-all-groups').addEventListener('click', toggleAllGroups);
