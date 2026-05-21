@@ -1,0 +1,4 @@
+pywebview>=6.0
+pyobjc-framework-WebKit>=10.3
+requests>=2.31.0
+websocket-client>=1.7.0

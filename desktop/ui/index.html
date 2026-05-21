@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>sub2cli</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-name">sub2cli</span>
+      <span class="brand-subtitle">Sub2API → Codex 桌面控制台</span>
+    </div>
+    <div class="status" id="status">连接中…</div>
+  </header>
+
+  <main class="app-main">
+    <section class="hero">
+      <h1>sub2cli desktop</h1>
+      <p class="muted">P1 骨架 — 主面板 / 一键检测 / 一键注入 在后续 phase 接入</p>
+      <div class="actions">
+        <button id="btn-hello" class="primary">检测 Sub2Context 桥</button>
+        <button id="btn-relays" class="secondary">列已保存的 relay</button>
+      </div>
+      <pre id="output" class="output">(尚未运行)</pre>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
