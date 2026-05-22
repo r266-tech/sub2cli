@@ -2,8 +2,7 @@
 # desktop/build.sh — build an unsigned sub2cli.app + DMG via PyInstaller.
 #
 # Prerequisites:
-#   - venv at ../spike/venv with pyinstaller + pywebview + requests + websocket-client + keyring
-#   - sub2cli-inject standalone binary at ../spike/dist/sub2cli-inject-bundle
+#   - python3
 #
 # Run:
 #   cd desktop && ./build.sh
@@ -17,41 +16,72 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-VENV="$REPO_ROOT/spike/venv"
-INJECT_BIN="$REPO_ROOT/spike/dist/sub2cli-inject-bundle"
+VENV="${SUB2CLI_BUILD_VENV:-$SCRIPT_DIR/.venv}"
+BUILD_ROOT="$SCRIPT_DIR/.build"
+INJECT_ENTRY="$BUILD_ROOT/sub2cli_inject_entry.py"
+INJECT_DIST="$BUILD_ROOT/inject-dist"
+INJECT_BIN="$INJECT_DIST/sub2cli-inject-bundle"
 
 cd "$SCRIPT_DIR"
 
-# --- 0. Prereq checks ---
-
-[[ -x "$VENV/bin/pyinstaller" ]] || {
-  echo "✗ pyinstaller not found in $VENV. Run:"
-  echo "    python3 -m venv $VENV"
-  echo "    $VENV/bin/pip install -r requirements.txt pyinstaller"
-  exit 1
+run_pyinstaller_child() {
+  env \
+    -u _PYI_APPLICATION_HOME_DIR \
+    -u _PYI_ARCHIVE_FILE \
+    -u _PYI_PARENT_PROCESS_LEVEL \
+    PYINSTALLER_RESET_ENVIRONMENT=1 \
+    "$@"
 }
 
-[[ -f "$INJECT_BIN" ]] || {
-  echo "✗ sub2cli-inject standalone binary not found at $INJECT_BIN."
-  echo "  Build it first:"
-  echo "    cp $REPO_ROOT/sub2cli-inject $REPO_ROOT/spike/sub2cli_inject_entry.py"
-  echo "    cd $REPO_ROOT/spike && ./venv/bin/pyinstaller --onefile \\"
-  echo "      --name sub2cli-inject-bundle --distpath dist --workpath build \\"
-  echo "      --specpath . sub2cli_inject_entry.py"
-  exit 1
-}
+# --- 0. Build environment ---
 
-# --- 1. Build .app ---
+if [[ ! -x "$VENV/bin/python" ]]; then
+  echo "→ create build venv: $VENV"
+  python3 -m venv "$VENV"
+fi
+
+echo "→ ensure PyInstaller/runtime deps"
+PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV/bin/python" -m pip install -r requirements.txt pyinstaller >/dev/null
+
+# --- 1. Build bundled injector from source ---
+
+rm -rf "$BUILD_ROOT"
+mkdir -p "$BUILD_ROOT"
+cp "$REPO_ROOT/sub2cli-inject" "$INJECT_ENTRY"
+echo "→ pyinstaller sub2cli-inject (output: $INJECT_BIN)"
+"$VENV/bin/pyinstaller" --noconfirm --onefile \
+  --name sub2cli-inject-bundle \
+  --distpath "$INJECT_DIST" \
+  --workpath "$BUILD_ROOT/inject-build" \
+  --specpath "$BUILD_ROOT" \
+  "$INJECT_ENTRY"
+[[ -x "$INJECT_BIN" ]] || { echo "✗ injector binary not produced: $INJECT_BIN"; exit 1; }
+
+# --- 2. Build .app ---
 
 echo "→ pyinstaller main.spec (output: dist/sub2cli.app)"
 rm -rf build dist
 "$VENV/bin/pyinstaller" --noconfirm main.spec
 
 [[ -d "dist/sub2cli.app" ]] || { echo "✗ no .app produced"; exit 1; }
+
+APP_PYSCRIPTS="dist/sub2cli.app/Contents/Resources/pyscripts"
+APP_INJECT_BIN="$APP_PYSCRIPTS/sub2cli-inject-bundle"
+mkdir -p "$APP_PYSCRIPTS"
+rm -f "$APP_INJECT_BIN"
+cp "$INJECT_BIN" "$APP_INJECT_BIN"
+chmod 755 "$APP_INJECT_BIN"
+if run_pyinstaller_child "$APP_INJECT_BIN" --help >/dev/null; then
+  echo "✓ bundled injector runs"
+else
+  echo "✗ bundled injector failed smoke test"
+  exit 1
+fi
+
 size=$(du -sh dist/sub2cli.app | cut -f1)
 echo "✓ dist/sub2cli.app  ($size)"
 
-# --- 2. Smoke test ---
+# --- 3. Smoke test ---
 
 echo "→ smoke test (--smoke: opens window 1s, exits 0)"
 run_smoke() {
@@ -81,10 +111,11 @@ run_smoke() {
 if run_smoke; then
   echo "✓ bundled app runs"
 else
-  echo "✗ bundled app failed smoke test (continuing to package unsigned dmg)"
+  echo "✗ bundled app failed smoke test"
+  exit 1
 fi
 
-# --- 3. Unsigned DMG ---
+# --- 4. Unsigned DMG ---
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/sub2cli.app/Contents/Info.plist)"
 DMG_STAGE="dist/dmg-stage"
@@ -102,7 +133,7 @@ hdiutil create \
 rm -rf "$DMG_STAGE"
 echo "✓ $DMG_PATH  ($(du -sh "$DMG_PATH" | cut -f1))"
 
-# --- 4. Distribution notes ---
+# --- 5. Distribution notes ---
 
 cat <<EOF
 

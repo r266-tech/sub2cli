@@ -7,6 +7,7 @@ const state = {
   bootstrapped: false,
   endpoints: [],
   groups: [],
+  subscriptions: [],
   defaultKey: null,
   defaultEndpoint: null,
   pingResults: {}, // url → {ok, latency_ms, summary} | {running:true}
@@ -14,11 +15,20 @@ const state = {
   groupSelected: {}, // group_id → boolean (checkbox state for batch test)
   lastDomain: null,  // current relay domain, for modal hints
   currentEmail: null,
+  viewMode: 'relay',
+  codexAccounts: [],
+  currentCodexAccount: null,
+  currentInjectTarget: 'relay',
+  configTargetRunning: false,
+  dragSorting: false,
   lastInjectBackup: null,
   lastInjectChanges: null,
 };
 
 const PROJECT_URL = 'https://github.com/r266-tech/sub2cli';
+const RELAY_ORDER_KEY = 'sub2cli.sidebar.relayOrder';
+const CODEX_ORDER_KEY = 'sub2cli.sidebar.codexOrder';
+let latestUpdateInfo = null;
 
 // ---- screen routing ----
 
@@ -28,17 +38,9 @@ function showScreen(id) {
   }
 }
 
-function setStatus(_text, cls = '') {
-  const chip = $('#brand-subtitle');
-  if (!chip) return;
-  if (cls) chip.dataset.state = cls;
-}
+function setStatus(_text, _cls = '') {}
 
-function setBrandSubtitle(text) {
-  const body = $('#brand-subtitle-text');
-  if (!body) return;
-  body.textContent = text ? `已连接 ${text}` : '等待 relay';
-}
+function setBrandSubtitle(_text) {}
 
 function showError(title, msg) {
   $('#error-title').textContent = title;
@@ -61,6 +63,21 @@ function fmtMoney(v) {
   return '$' + v.toFixed(2);
 }
 
+function asNumber(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function fmtUsd(v) {
+  const n = asNumber(v);
+  if (n == null) return '—';
+  return '$' + n.toFixed(2);
+}
+
 function fmtLatency(ms) {
   if (typeof ms !== 'number') return '?';
   return ms + 'ms';
@@ -69,6 +86,48 @@ function fmtLatency(ms) {
 function fmtRate(r) {
   if (r === null || r === undefined) return '?';
   return r + 'x';
+}
+
+function fmtAgo(iso) {
+  if (!iso) return 'Updated —';
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return 'Updated —';
+  const delta = Math.max(0, Date.now() - ts);
+  const mins = Math.round(delta / 60000);
+  if (mins < 1) return 'Updated just now';
+  if (mins < 60) return `Updated ${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `Updated ${hours}h ago`;
+  return `Updated ${Math.round(hours / 24)}d ago`;
+}
+
+function fmtDurationFromNow(ts) {
+  if (!ts) return '—';
+  const ms = (Number(ts) * 1000) - Date.now();
+  if (!Number.isFinite(ms)) return '—';
+  if (ms <= 0) return 'now';
+  const totalMinutes = Math.round(ms / 60000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const mins = totalMinutes % 60;
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${mins}m`;
+  return `${mins}m`;
+}
+
+function fmtRemainingDays(iso) {
+  if (!iso) return '—';
+  const ms = Date.parse(iso) - Date.now();
+  if (!Number.isFinite(ms)) return '—';
+  if (ms <= 0) return '已过期';
+  const days = Math.ceil(ms / 86400000);
+  if (days >= 1) return `剩余 ${days} 天`;
+  return '今天到期';
+}
+
+function leftPercent(used) {
+  if (typeof used !== 'number') return '—';
+  return `${Math.max(0, Math.round(100 - used))}%`;
 }
 
 // build a <span class="tag ..."> element for a probe/test result cell
@@ -179,14 +238,18 @@ function applyBootstrap(data) {
   state.lastDomain = data.domain || data.site || null;
   state.endpoints = data.endpoints || [];
   state.groups = data.groups || [];
+  state.subscriptions = data.subscriptions || [];
   state.defaultKey = data.default_key;
   state.defaultEndpoint = data.default_endpoint;
   setBrandSubtitle(data.site || data.domain || '');
   renderAccount(data);
+  renderSubscriptions(state.subscriptions);
   renderDefaultKey(data);
   renderEndpoints(data.endpoints || [], data.default_endpoint);
   renderGroups(data.groups || [], data.keys || [], data.default_key);
   refreshSidebar();  // sidebar is independent of bootstrap data
+  refreshCodexAccounts();
+  updateContextLabels();
   updateAccountChip((data.user && data.user.email) || null);
 }
 
@@ -194,9 +257,118 @@ function updateAccountChip(email) {
   state.currentEmail = email || null;
   $('#account-email').textContent = email || '未设';
   updateAccountDeleteButton(email || null);
+  updateContextLabels();
+}
+
+function currentRelayLabel() {
+  return (state.lastDomain || '').replace(/^https?:\/\//, '').replace(/\/$/, '') || '—';
+}
+
+function currentCodexLabel() {
+  const acc = state.currentCodexAccount;
+  if (!acc) return '未设置';
+  return acc.email || acc.display_name || acc.slot || '未设置';
+}
+
+function updateContextLabels() {
+  const relay = currentRelayLabel();
+  const codex = currentCodexLabel();
+  const popRelay = $('#pop-current-relay');
+  const popCodex = $('#pop-current-codex');
+  const choiceRelay = $('#choice-relay');
+  const choiceCodex = $('#choice-codex');
+  const choiceRelayMeta = $('#choice-relay-meta');
+  const choiceCodexMeta = $('#choice-codex-meta');
+  if (popRelay) popRelay.textContent = relay;
+  if (popCodex) popCodex.textContent = codex;
+  if (choiceRelay) choiceRelay.textContent = relay;
+  if (choiceCodex) choiceCodex.textContent = codex;
+  if (choiceRelayMeta) {
+    const key = state.defaultKey && state.defaultKey.name ? state.defaultKey.name : '默认 key';
+    const ep = state.defaultEndpoint && state.defaultEndpoint.name ? state.defaultEndpoint.name : '默认端点';
+    choiceRelayMeta.textContent = `${key} · ${ep}`;
+  }
+  if (choiceCodexMeta) {
+    choiceCodexMeta.textContent = state.currentCodexAccount
+      ? `${state.currentCodexAccount.plan_label || 'Codex'} · ${state.currentCodexAccount.slot}${state.currentCodexAccount.is_registered ? '' : ' · 待注册'}`
+      : '请先在官号列表新增或选择账号';
+  }
 }
 
 // ---- sidebar (multi-relay) ----
+
+function readOrder(key) {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) || '[]');
+    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function writeOrder(key, values) {
+  localStorage.setItem(key, JSON.stringify((values || []).filter(Boolean)));
+}
+
+function applyStoredOrder(items, key, getId) {
+  const order = readOrder(key);
+  if (!order.length) return items;
+  const rank = new Map(order.map((id, index) => [id, index]));
+  return [...items].sort((a, b) => {
+    const ar = rank.has(getId(a)) ? rank.get(getId(a)) : Number.MAX_SAFE_INTEGER;
+    const br = rank.has(getId(b)) ? rank.get(getId(b)) : Number.MAX_SAFE_INTEGER;
+    if (ar !== br) return ar - br;
+    return items.indexOf(a) - items.indexOf(b);
+  });
+}
+
+function getDragAfterElement(container, y) {
+  const items = [...container.querySelectorAll('.sortable-item:not(.dragging)')];
+  return items.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = y - box.top - box.height / 2;
+    if (offset < 0 && offset > closest.offset) return { offset, element: child };
+    return closest;
+  }, { offset: Number.NEGATIVE_INFINITY, element: null }).element;
+}
+
+function installSortableList(container, options) {
+  if (!container || container.dataset.sortableReady === '1') return;
+  container.dataset.sortableReady = '1';
+  container.addEventListener('dragover', (e) => {
+    const dragging = container.querySelector('.sortable-item.dragging');
+    if (!dragging) return;
+    e.preventDefault();
+    const after = getDragAfterElement(container, e.clientY);
+    if (after == null) container.appendChild(dragging);
+    else container.insertBefore(dragging, after);
+  });
+  container.addEventListener('drop', (e) => {
+    const dragging = container.querySelector('.sortable-item.dragging');
+    if (!dragging) return;
+    e.preventDefault();
+    const order = [...container.querySelectorAll('.sortable-item')]
+      .map((item) => item.dataset.sortKey)
+      .filter(Boolean);
+    options.onOrder(order);
+  });
+}
+
+function makeSortableItem(item, key) {
+  item.classList.add('sortable-item');
+  item.draggable = true;
+  item.dataset.sortKey = key;
+  item.addEventListener('dragstart', (e) => {
+    state.dragSorting = true;
+    item.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', key);
+  });
+  item.addEventListener('dragend', () => {
+    item.classList.remove('dragging');
+    setTimeout(() => { state.dragSorting = false; }, 120);
+  });
+}
 
 async function refreshSidebar() {
   const list = $('#sidebar-list');
@@ -209,17 +381,20 @@ async function refreshSidebar() {
       }));
       return;
     }
+    const relays = applyStoredOrder(r.relays || [], RELAY_ORDER_KEY, (relay) => relay.domain);
     const frag = document.createDocumentFragment();
-    for (const relay of r.relays) {
+    for (const relay of relays) {
       const item = el('div', { className: 'relay-item' + (relay.is_current ? ' active' : '') });
+      makeSortableItem(item, relay.domain);
       const info = el('div', { className: 'relay-info' });
       info.appendChild(el('span', { className: 'relay-domain', text: relay.site || relay.domain }));
       item.appendChild(info);
-      item.appendChild(el('div', { className: 'relay-indicator' }));
-      if (!relay.is_current) {
-        item.style.cursor = 'pointer';
-        item.addEventListener('click', () => switchRelay(relay.domain));
-      }
+      if (relay.is_current) item.addEventListener('click', () => {
+        if (!state.dragSorting) showRelayDashboard();
+      });
+      else item.addEventListener('click', () => {
+        if (!state.dragSorting) switchRelay(relay.domain);
+      });
       item.addEventListener('contextmenu', (e) => {
         e.preventDefault();
         if (confirm(`删除中转站 ${relay.site || relay.domain}?\n会清掉它在 Keychain 里的 token 和密码 (不可恢复).`)) {
@@ -232,9 +407,142 @@ async function refreshSidebar() {
       frag.appendChild(el('div', { className: 'muted small', text: '(尚无 relay; 跑 ./sub2cli 走 wizard)' }));
     }
     list.replaceChildren(frag);
+    installSortableList(list, {
+      onOrder: (order) => {
+        writeOrder(RELAY_ORDER_KEY, order);
+        setStatus('✓ 已保存中转列表顺序', 'ok');
+      },
+    });
   } catch (err) {
     list.replaceChildren(el('div', { className: 'muted small', text: '错: ' + String(err) }));
   }
+}
+
+async function refreshCodexAccounts() {
+  const list = $('#codex-account-list');
+  if (!list) return;
+  try {
+    const r = await window.pywebview.api.list_codex_accounts();
+    if (!r.ok) {
+      list.replaceChildren(el('div', { className: 'muted small', text: r.error || '(空)' }));
+      state.codexAccounts = [];
+      state.currentCodexAccount = null;
+      updateContextLabels();
+      return;
+    }
+    state.codexAccounts = applyStoredOrder(r.accounts || [], CODEX_ORDER_KEY, codexAccountKey);
+    state.currentCodexAccount = r.current_official || state.codexAccounts[0] || null;
+    renderCodexAccountList();
+    updateContextLabels();
+    if (state.viewMode === 'official') renderOfficialDashboard(state.currentCodexAccount);
+  } catch (err) {
+    list.replaceChildren(el('div', { className: 'muted small', text: '错: ' + String(err) }));
+  }
+}
+
+function renderCodexAccountList() {
+  const list = $('#codex-account-list');
+  const frag = document.createDocumentFragment();
+  state.codexAccounts = applyStoredOrder(state.codexAccounts, CODEX_ORDER_KEY, codexAccountKey);
+  for (const acc of state.codexAccounts) {
+    const active = state.currentCodexAccount && state.currentCodexAccount.slot === acc.slot;
+    const item = el('div', { className: 'codex-account-item' + (active ? ' active' : '') });
+    makeSortableItem(item, codexAccountKey(acc));
+    const main = el('div', { className: 'codex-account-main' });
+    main.appendChild(el('div', { className: 'codex-account-name', text: codexAccountName(acc) }));
+    item.appendChild(main);
+    item.addEventListener('click', () => {
+      if (!state.dragSorting) selectCodexAccount(acc.slot);
+    });
+    frag.appendChild(item);
+  }
+  if (!state.codexAccounts.length) {
+    frag.appendChild(el('div', {
+      className: 'muted small',
+      text: '尚无官方账号; 点标题右侧 添加',
+    }));
+  }
+  list.replaceChildren(frag);
+  installSortableList(list, {
+    onOrder: (order) => {
+      writeOrder(CODEX_ORDER_KEY, order);
+      state.codexAccounts = applyStoredOrder(state.codexAccounts, CODEX_ORDER_KEY, codexAccountKey);
+      setStatus('✓ 已保存官号列表顺序', 'ok');
+    },
+  });
+}
+
+function codexAccountKey(acc) {
+  return (acc && (acc.slot || acc.identity_key || acc.email || acc.display_name)) || '';
+}
+
+function codexAccountName(acc) {
+  if (!acc) return '未命名账号';
+  return acc.email || acc.display_name || acc.slot || '未命名账号';
+}
+
+function codexPlanTitle(acc) {
+  if (!acc) return '—';
+  const plan = acc.plan_label || 'Codex';
+  const slot = (acc.slot || '').trim();
+  if (slot && !['local', 'default', 'official'].includes(slot.toLowerCase())) {
+    return `${plan}.${slot}`;
+  }
+  return plan;
+}
+
+function mergeCodexAccountsPreserveOrder(nextAccounts) {
+  const incoming = nextAccounts || [];
+  if (!state.codexAccounts.length) return applyStoredOrder(incoming, CODEX_ORDER_KEY, codexAccountKey);
+  const byKey = new Map(incoming.map((acc) => [codexAccountKey(acc), acc]));
+  const used = new Set();
+  const merged = state.codexAccounts.map((oldAcc) => {
+    const key = codexAccountKey(oldAcc);
+    const next = byKey.get(key);
+    if (next) {
+      used.add(key);
+      return next;
+    }
+    return oldAcc;
+  });
+  for (const acc of incoming) {
+    const key = codexAccountKey(acc);
+    if (!used.has(key)) merged.push(acc);
+  }
+  return applyStoredOrder(merged, CODEX_ORDER_KEY, codexAccountKey);
+}
+
+async function selectCodexAccount(slot) {
+  const local = state.codexAccounts.find((a) => a.slot === slot);
+  if (local) state.currentCodexAccount = local;
+  state.viewMode = 'official';
+  renderMainMode();
+  renderCodexAccountList();
+  updateContextLabels();
+  renderOfficialDashboard(state.currentCodexAccount);
+  try {
+    const r = await window.pywebview.api.select_codex_account(slot);
+    if (r.ok) {
+      state.codexAccounts = mergeCodexAccountsPreserveOrder(r.accounts);
+      state.currentCodexAccount = r.current_official || state.currentCodexAccount;
+      renderCodexAccountList();
+      updateContextLabels();
+      renderOfficialDashboard(state.currentCodexAccount);
+    }
+  } catch (_) {}
+}
+
+function showRelayDashboard() {
+  state.viewMode = 'relay';
+  renderMainMode();
+}
+
+function renderMainMode() {
+  const relay = $('#relay-dashboard');
+  const official = $('#official-dashboard');
+  if (!relay || !official) return;
+  relay.classList.toggle('hidden', state.viewMode !== 'relay');
+  official.classList.toggle('hidden', state.viewMode !== 'official');
 }
 
 async function removeRelay(domain) {
@@ -247,7 +555,7 @@ async function removeRelay(domain) {
       return;
     }
     if (data.needs_setup) {
-      showError('请添加中转', '已删除最后一个中转, 点 "+ 新增中转" 添加');
+      showError('请添加中转', '已删除最后一个中转, 点中转标题右侧 添加');
       return;
     }
     // when current relay was removed, backend already re-bootstrapped to next relay
@@ -276,7 +584,9 @@ async function switchRelay(domain) {
     }
     state.pingResults = {};
     state.groupResults = {};
+    state.viewMode = 'relay';
     applyBootstrap(data);
+    renderMainMode();
     showScreen('dashboard');
     setStatus('✓ 已切 relay', 'ok');
   } catch (err) {
@@ -407,6 +717,62 @@ async function submitAddAccount() {
   }
 }
 
+function openAddCodexAccountModal() {
+  $('#add-codex-slot').value = '';
+  $('#add-codex-display').value = '';
+  $('#add-codex-error').classList.add('hidden');
+  $('#add-codex-error').textContent = '';
+  const submit = $('#btn-add-codex-submit');
+  submit.disabled = false;
+  submit.textContent = '登录并添加';
+  $('#add-codex-account-modal').classList.remove('hidden');
+  setTimeout(() => $('#add-codex-slot').focus(), 50);
+}
+
+function closeAddCodexAccountModal() {
+  $('#add-codex-account-modal').classList.add('hidden');
+}
+
+async function submitAddCodexAccount() {
+  const slot = $('#add-codex-slot').value.trim();
+  const display = $('#add-codex-display').value.trim();
+  const errBox = $('#add-codex-error');
+  errBox.classList.add('hidden');
+  errBox.textContent = '';
+  if (!slot) {
+    errBox.textContent = '账号标识必填';
+    errBox.classList.remove('hidden');
+    return;
+  }
+  const btn = $('#btn-add-codex-submit');
+  btn.disabled = true;
+  btn.textContent = '等待登录…';
+  setStatus('正在打开 Codex 登录…', 'warn');
+  try {
+    const r = await window.pywebview.api.add_codex_account(slot, display);
+    if (!r || !r.ok) {
+      errBox.textContent = (r && (r.error || r.stderr || r.stdout)) || '添加失败';
+      errBox.classList.remove('hidden');
+      return;
+    }
+    closeAddCodexAccountModal();
+    state.codexAccounts = r.accounts || [];
+    state.currentCodexAccount = (r.accounts || []).find((a) => a.slot === slot) || r.current_official || state.currentCodexAccount;
+    state.viewMode = 'official';
+    renderMainMode();
+    renderCodexAccountList();
+    updateContextLabels();
+    renderOfficialDashboard(state.currentCodexAccount);
+    setStatus('✓ 已登录并添加官方账号', 'ok');
+  } catch (err) {
+    errBox.textContent = err && err.message ? err.message : String(err);
+    errBox.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '登录并添加';
+  }
+}
+
 async function switchAccount(email) {
   setStatus(`切到 ${email}…`, 'warn');
   closeAccountPop();
@@ -451,7 +817,258 @@ function deleteCurrentAccount() {
   deleteAccount(email);
 }
 
-// ---- inject modal (dry-run gate + apply) ----
+// ---- configure Codex modal (choice → direct apply + rollback) ----
+
+function openConfigTargetModal() {
+  updateContextLabels();
+  resetConfigTargetUi();
+  $('#config-target-modal').classList.remove('hidden');
+}
+
+function closeConfigTargetModal() {
+  if (state.configTargetRunning) return;
+  $('#config-target-modal').classList.add('hidden');
+}
+
+function startRelayConfig() {
+  state.currentInjectTarget = 'relay';
+  applyConfigTarget('relay');
+}
+
+function startOfficialConfig() {
+  state.currentInjectTarget = 'official';
+  applyConfigTarget('official');
+}
+
+function chooseOfficialAccount() {
+  const acc = state.currentCodexAccount;
+  if (!acc) {
+    setStatus('请先在左侧选择官方账号', 'warn');
+    return;
+  }
+  state.viewMode = 'official';
+  renderMainMode();
+  renderCodexAccountList();
+  updateContextLabels();
+  setStatus(`✓ 已选定官方账号：${acc.email || acc.display_name || acc.slot}`, 'ok');
+}
+
+function resetConfigTargetUi() {
+  state.lastInjectBackup = null;
+  state.configTargetRunning = false;
+  const result = $('#config-target-result');
+  if (result) {
+    result.className = 'config-result hidden';
+    result.replaceChildren();
+  }
+  resetConfigTargetButtons();
+}
+
+function resetConfigTargetButtons() {
+  const relayBtn = $('#btn-config-relay');
+  const officialBtn = $('#btn-config-official');
+  if (relayBtn) {
+    relayBtn.disabled = false;
+    relayBtn.textContent = '配置';
+  }
+  if (officialBtn) {
+    officialBtn.disabled = false;
+    officialBtn.textContent = '配置';
+  }
+}
+
+function setConfigTargetBusy(target, text = '配置中…') {
+  const relayBtn = $('#btn-config-relay');
+  const officialBtn = $('#btn-config-official');
+  const active = target === 'official' ? officialBtn : relayBtn;
+  [relayBtn, officialBtn].forEach((btn) => {
+    if (!btn) return;
+    btn.disabled = true;
+    btn.textContent = btn === active ? text : '等待';
+  });
+}
+
+function configTargetTitle(target) {
+  return target === 'official' ? '官方账号' : '当前中转';
+}
+
+function configTargetDetail(target) {
+  if (target === 'official') {
+    const acc = state.currentCodexAccount;
+    return acc ? `${acc.email || acc.display_name || acc.slot} · ${acc.plan_label || 'Codex'}` : '未选择官方账号';
+  }
+  const key = state.defaultKey && state.defaultKey.name ? state.defaultKey.name : '默认 key';
+  const ep = state.defaultEndpoint && state.defaultEndpoint.name ? state.defaultEndpoint.name : '默认端点';
+  return `${currentRelayLabel()} · ${key} · ${ep}`;
+}
+
+function buildApplyLog(r, targetLabel) {
+  const autoRollback = r && r.auto_rollback;
+  return planLog([
+    r && r.ok ? `[READY] ${targetLabel} configured.` : `[ERR] ${targetLabel} configure failed.`,
+    r && r.error ? `[ERR] reason: ${r.error}` : null,
+    r && r.returncode !== undefined ? `[INFO] returncode: ${r.returncode ?? 'timeout'}` : null,
+    r && r.backup_name ? `[INFO] backup: ${r.backup_name}` : null,
+    r && r.rollback_command ? `[INFO] undo command: ${r.rollback_command}` : null,
+    r && r.stdout ? `[INFO] stdout:\n${r.stdout}` : null,
+    r && r.stderr ? `[INFO] stderr:\n${r.stderr}` : null,
+    autoRollback ? `[INFO] auto rollback: ${autoRollback.ok ? 'ok' : 'failed'}` : null,
+    autoRollback && autoRollback.error ? `[ERR] rollback reason: ${autoRollback.error}` : null,
+    autoRollback && autoRollback.returncode !== undefined ? `[INFO] rollback returncode: ${autoRollback.returncode ?? 'timeout'}` : null,
+    autoRollback && autoRollback.stdout ? `[INFO] rollback stdout:\n${autoRollback.stdout}` : null,
+    autoRollback && autoRollback.stderr ? `[INFO] rollback stderr:\n${autoRollback.stderr}` : null,
+  ]);
+}
+
+function renderConfigTargetResult(kind, title, detail, options = {}) {
+  const box = $('#config-target-result');
+  if (!box) return;
+  box.className = `config-result ${kind || 'running'}`;
+  const tagText = options.tag || (kind === 'ok' ? '[READY]' : kind === 'err' ? '[ERR]' : kind === 'warn' ? '[WARN]' : '[SYS]');
+  const children = [
+    el('div', {
+      className: 'config-result-head',
+      children: [
+        el('div', { className: 'config-result-title', text: title }),
+        el('div', { className: 'config-result-tag', text: tagText }),
+      ],
+    }),
+    el('div', { className: 'config-result-detail', text: detail || '' }),
+  ];
+  if (options.log) {
+    children.push(el('pre', { className: 'config-result-log', text: options.log }));
+  }
+  if (options.undo && state.lastInjectBackup) {
+    children.push(el('div', {
+      className: 'config-result-actions',
+      children: [
+        el('button', {
+          className: `btn-action ${options.undoDanger === false ? '' : 'danger'}`,
+          text: options.undoLabel || '撤销本次配置',
+          attrs: { type: 'button' },
+          onClick: undoConfigTarget,
+        }),
+      ],
+    }));
+  }
+  box.replaceChildren(...children);
+}
+
+async function applyConfigTarget(target) {
+  if (state.configTargetRunning) return;
+  const isOfficial = target === 'official';
+  if (isOfficial && !state.currentCodexAccount) {
+    renderConfigTargetResult('warn', '没有可配置的官方账号', '请先在左侧官号列表新增或选择一个官方账号。', { tag: '[WARN]' });
+    setStatus('请先选择官方账号', 'warn');
+    return;
+  }
+
+  state.configTargetRunning = true;
+  state.currentInjectTarget = target;
+  state.lastInjectBackup = null;
+  setConfigTargetBusy(target);
+  setStatus('配置中…', 'warn');
+  renderConfigTargetResult(
+    'running',
+    `正在配置 ${configTargetTitle(target)} 到 Codex`,
+    `${configTargetDetail(target)}。正在写入 auth.json / config.toml, 成功后会显示撤销按钮。`
+  );
+
+  try {
+    const r = isOfficial
+      ? await window.pywebview.api.codex_account_config_apply(state.currentCodexAccount && state.currentCodexAccount.slot)
+      : await window.pywebview.api.inject_apply();
+    const autoRollback = r && r.auto_rollback;
+    const log = buildApplyLog(r || {}, configTargetTitle(target));
+
+    if (r && r.ok) {
+      state.lastInjectBackup = r.backup_name || null;
+      renderConfigTargetResult(
+        'ok',
+        '配置成功',
+        state.lastInjectBackup
+          ? `Codex 已切到${configTargetTitle(target)}。保留撤销点 ${state.lastInjectBackup}, 需要时可一键恢复到配置前。`
+          : `Codex 已切到${configTargetTitle(target)}。本次输出未识别到撤销点。`,
+        { log, undo: !!state.lastInjectBackup }
+      );
+      setStatus('✓ 配置完成', 'ok');
+      if (isOfficial) refreshCodexAccounts();
+      return;
+    }
+
+    const rollbackOk = !!(autoRollback && autoRollback.ok);
+    const rollbackFailed = !!(r && r.backup_name && (!autoRollback || !autoRollback.ok));
+    state.lastInjectBackup = rollbackFailed ? r.backup_name : null;
+    renderConfigTargetResult(
+      rollbackOk ? 'warn' : 'err',
+      rollbackOk ? '配置失败，已自动回滚' : '配置失败',
+      rollbackOk
+        ? `写入失败后已恢复到配置前状态。下面日志可直接反馈给开发者排查。`
+        : (rollbackFailed
+          ? `写入失败，自动回滚未确认成功。保留 ${r.backup_name}, 可点击重试回滚并把日志反馈给开发者。`
+          : `配置失败发生在生成撤销点之前，未识别到可回滚备份。下面日志可直接反馈给开发者。`),
+      {
+        tag: rollbackOk ? '[ROLLBACK]' : '[ERR]',
+        log,
+        undo: rollbackFailed,
+        undoLabel: '重试回滚',
+      }
+    );
+    setStatus('✗ 配置失败', 'err');
+  } catch (err) {
+    state.lastInjectBackup = null;
+    renderConfigTargetResult(
+      'err',
+      '配置调用失败',
+      err && err.message ? err.message : String(err),
+      { log: planLog([`[ERR] exception: ${err && err.stack ? err.stack : String(err)}`]) }
+    );
+    setStatus('配置失败', 'err');
+  } finally {
+    state.configTargetRunning = false;
+    resetConfigTargetButtons();
+  }
+}
+
+async function undoConfigTarget() {
+  const backupName = state.lastInjectBackup;
+  if (!backupName || state.configTargetRunning) return;
+  state.configTargetRunning = true;
+  setConfigTargetBusy(state.currentInjectTarget, '回滚中…');
+  setStatus('撤销配置中…', 'warn');
+  renderConfigTargetResult('running', '正在撤销本次配置', `回滚到 ${backupName}, 恢复配置前的 Codex auth/config/profile 状态。`);
+  try {
+    const r = await window.pywebview.api.inject_rollback(backupName);
+    renderConfigTargetResult(
+      r.ok ? 'ok' : 'err',
+      r.ok ? '已撤销本次配置' : '撤销失败',
+      r.ok ? `已恢复 ${backupName}。` : `rollback 返回 rc=${r.returncode ?? '?'}, 请把日志反馈给开发者。`,
+      {
+        tag: r.ok ? '[READY]' : '[ERR]',
+        log: planLog([
+          r.error ? `[ERR] reason: ${r.error}` : null,
+          r.stdout ? `[INFO] stdout:\n${r.stdout}` : null,
+          r.stderr ? `[INFO] stderr:\n${r.stderr}` : null,
+        ]),
+        undo: !r.ok,
+        undoLabel: '重试回滚',
+      }
+    );
+    setStatus(r.ok ? '✓ 已撤销配置' : '✗ 撤销失败', r.ok ? 'ok' : 'err');
+    if (r.ok) state.lastInjectBackup = null;
+  } catch (err) {
+    renderConfigTargetResult(
+      'err',
+      '撤销调用失败',
+      err && err.message ? err.message : String(err),
+      { log: planLog([`[ERR] exception: ${err && err.stack ? err.stack : String(err)}`]), undo: true, undoLabel: '重试回滚' }
+    );
+    setStatus('撤销失败', 'err');
+  } finally {
+    state.configTargetRunning = false;
+    resetConfigTargetButtons();
+  }
+}
 
 function openInjectModal() {
   $('#inject-modal').classList.remove('hidden');
@@ -462,8 +1079,11 @@ function openInjectModal() {
   undoBtn.disabled = true;
   const confirmBtn = $('#btn-inject-confirm');
   confirmBtn.disabled = true;
-  confirmBtn.textContent = '开始注入';
-  loadInjectPlan();
+  confirmBtn.textContent = '执行中…';
+  confirmBtn.classList.add('hidden');
+  requestAnimationFrame(() => {
+    applyInject();
+  });
 }
 
 function closeInjectModal() {
@@ -580,95 +1200,49 @@ function renderInjectState(title, steps, options = {}) {
   }
   if (options.log) {
     children.push(el('div', { className: `plan-label ${options.logClass || ''}`, text: options.logTitle || '[INFO] 详细输出' }));
-    children.push(el('pre', { className: 'plan-preview dryrun-log', text: options.log }));
+    children.push(el('pre', { className: 'plan-preview inject-log', text: options.log }));
   }
   body.replaceChildren(...children);
   requestAnimationFrame(updateInjectScrollbar);
-}
-
-async function loadInjectPlan() {
-  state.lastInjectBackup = null;
-  $('#btn-inject-undo').classList.add('hidden');
-  $('#btn-inject-undo').disabled = true;
-  renderInjectState('正在生成注入计划', [
-    { state: 'ok', title: '读取当前默认配置', detail: '使用当前默认 key 和端点作为注入目标' },
-    { state: 'running', title: '执行 dry-run', detail: '扫描 Codex 配置和历史 session, 只计算改动, 不写入文件' },
-    { state: 'pending', title: '等待确认', detail: '计划通过后才允许写入 Codex' },
-  ]);
-  try {
-    const r = await window.pywebview.api.inject_plan();
-    if (!r.ok) {
-      state.lastInjectChanges = null;
-      renderInjectState('注入计划生成失败', [
-        { state: 'ok', title: '读取当前默认配置', detail: '已完成' },
-        { state: 'err', title: 'dry-run 失败', detail: r.error || '未知错误' },
-        { state: 'pending', title: '未写入', detail: '没有修改 Codex 配置' },
-      ], {
-        logClass: 'plan-result err',
-        logTitle: '[ERR] 详细错误',
-        log: planLog([
-          `[ERR] ${r.error || '未知错误'}`,
-          r.stderr ? `[INFO] stderr:\n${r.stderr}` : null,
-          r.stdout ? `[INFO] stdout:\n${r.stdout}` : null,
-        ]),
-      });
-      $('#btn-inject-confirm').textContent = '[ERR] 不可注入';
-      $('#btn-inject-confirm').disabled = true;
-      return;
-    }
-    state.lastInjectChanges = r.changes || [];
-    renderInjectState('注入计划已就绪', [
-      { state: 'ok', title: '读取当前默认配置', detail: r.label || '已完成' },
-      { state: 'ok', title: 'dry-run 通过', detail: 'sub2cli-inject 已确认可执行' },
-      { state: 'running', title: '等待确认写入', detail: '点击确认后才会修改 Codex 配置并生成回滚备份' },
-    ], {
-      changes: r.changes || [],
-      logTitle: '[CHECK] Dry-run 原始输出',
-      log: planLog([
-        r.command ? `[SYS] ${r.command}` : null,
-        r.plan_text || '(空)',
-      ]),
-    });
-    $('#btn-inject-confirm').textContent = '开始注入';
-    $('#btn-inject-confirm').disabled = false;
-  } catch (err) {
-    renderInjectState('注入计划调用失败', [
-      { state: 'err', title: '调用失败', detail: err && err.message ? err.message : String(err) },
-      { state: 'pending', title: '未写入', detail: '没有修改 Codex 配置' },
-    ]);
-    state.lastInjectChanges = null;
-    $('#btn-inject-confirm').textContent = '[ERR] 不可注入';
-    $('#btn-inject-confirm').disabled = true;
-  }
 }
 
 async function applyInject() {
   const confirmBtn = $('#btn-inject-confirm');
   confirmBtn.disabled = true;
   confirmBtn.textContent = '执行中…';
+  confirmBtn.classList.add('hidden');
   $('#btn-inject-undo').classList.add('hidden');
   $('#btn-inject-undo').disabled = true;
-  setStatus('注入中…', 'warn');
-  renderInjectState('正在注入 Codex', [
-    { state: 'ok', title: 'dry-run 已确认', detail: '计划已经通过' },
-    { state: 'running', title: '写入 Codex 配置', detail: '保存 API 渠道、切换 auth.json、更新 config.toml' },
+  setStatus('配置中…', 'warn');
+  const isOfficial = state.currentInjectTarget === 'official';
+  renderInjectState('正在配置 Codex', [
+    { state: 'ok', title: `读取${isOfficial ? '官方账号' : '当前中转'}`, detail: isOfficial ? '使用已选择的官方账号作为配置目标' : '使用当前默认 key 和端点作为配置目标' },
+    { state: 'running', title: '写入 Codex 配置', detail: isOfficial ? '导入账号 auth、切换 auth.json、更新 config.toml 为 OAuth 模式' : '保存 API 渠道、切换 auth.json、更新 config.toml' },
     { state: 'pending', title: '刷新 Codex App', detail: '写入成功后会按 sub2cli-inject 逻辑重启/打开 Codex' },
-    { state: 'pending', title: '准备撤销点', detail: '成功后会显示撤销本次注入按钮' },
+    { state: 'pending', title: '准备撤销点', detail: '成功后会显示撤销本次配置按钮' },
   ], {
-    changes: state.lastInjectChanges || [
+    changes: state.lastInjectChanges || (isOfficial ? [
+      { path: '~/.codex/provider-slots.json', detail: '切换 current 到官方账号槽位' },
+      { path: '~/.codex/auth.json', detail: '复制官方账号 OAuth 登录文件' },
+      { path: '~/.codex/config.toml', detail: '切回 Codex OAuth provider' },
+      { path: 'Codex App', detail: '需要时重新打开以加载官方账号' },
+    ] : [
       { path: '~/.codex/provider-slots.json', detail: '新增或更新当前中转的 API 渠道' },
       { path: '~/.codex/auth.json', detail: '切换到该渠道的 API key 登录文件' },
       { path: '~/.codex/config.toml', detail: '写入 Codex provider 的 base_url/model 配置' },
       { path: '~/Library/Application Support/Codex', detail: '保持或切换 Codex App profile symlink' },
       { path: 'Codex 历史 session', detail: '必要时归一历史会话 provider, 让旧会话继续走当前渠道' },
       { path: 'Codex App', detail: '需要时重新打开以加载新配置' },
-    ],
+    ]),
   });
   try {
-    const r = await window.pywebview.api.inject_apply();
+    const r = isOfficial
+      ? await window.pywebview.api.codex_account_config_apply(state.currentCodexAccount && state.currentCodexAccount.slot)
+      : await window.pywebview.api.inject_apply();
     state.lastInjectBackup = r.backup_name || null;
-    renderInjectState(r.ok ? '注入完成' : '注入失败', [
-      { state: 'ok', title: 'dry-run 已确认', detail: '计划已经通过' },
+    const autoRollback = r.auto_rollback || null;
+    renderInjectState(r.ok ? '配置完成' : '配置失败', [
+      { state: 'ok', title: `读取${isOfficial ? '官方账号' : '当前中转'}`, detail: '已完成' },
       {
         state: r.ok ? 'ok' : 'err',
         title: r.ok ? '写入 Codex 配置完成' : '写入 Codex 配置失败',
@@ -677,22 +1251,19 @@ async function applyInject() {
       {
         state: r.ok ? 'ok' : 'pending',
         title: '刷新 Codex App',
-        detail: r.ok ? '已按注入器输出处理' : '未完成',
+        detail: r.ok ? '已按配置器输出处理' : '未完成',
       },
       {
-        state: r.ok && r.backup_name ? 'ok' : (r.ok ? 'warn' : 'pending'),
-        title: '撤销点',
-        detail: r.backup_name ? `可回滚到 ${r.backup_name}` : (r.ok ? '未从输出中识别到回滚备份名' : '失败时不提供撤销'),
+        state: r.ok && r.backup_name ? 'ok' : (r.ok ? 'warn' : (autoRollback ? (autoRollback.ok ? 'ok' : 'err') : 'pending')),
+        title: r.ok ? '撤销点' : '失败回滚',
+        detail: r.ok
+          ? (r.backup_name ? `可回滚到 ${r.backup_name}` : '未从输出中识别到回滚备份名')
+          : (autoRollback ? (autoRollback.ok ? `已自动回滚 ${autoRollback.backup_name}` : `自动回滚失败: ${autoRollback.error || ('rc=' + (autoRollback.returncode ?? '?'))}`) : '未生成可回滚备份'),
       },
     ], {
       logClass: r.ok ? 'plan-result ok' : 'plan-result err',
-      logTitle: r.ok ? '[READY] 注入输出' : '[ERR] 注入输出',
-      log: planLog([
-        r.ok ? '[READY] Injection completed.' : `[ERR] Injection failed (rc=${r.returncode ?? '?'})`,
-        r.rollback_command ? `[INFO] 撤销命令: ${r.rollback_command}` : null,
-        r.stdout ? `[INFO] stdout:\n${r.stdout}` : null,
-        r.stderr ? `[INFO] stderr:\n${r.stderr}` : null,
-      ]),
+      logTitle: r.ok ? '[READY] 配置输出' : '[ERR] 配置输出',
+      log: buildApplyLog(r, isOfficial ? '官方账号' : '当前中转'),
     });
     if (r.ok && r.backup_name) {
       const undoBtn = $('#btn-inject-undo');
@@ -700,11 +1271,12 @@ async function applyInject() {
       undoBtn.disabled = false;
     }
     confirmBtn.textContent = r.ok ? '[READY] 完成' : '[ERR] 失败';
-    setStatus(r.ok ? '✓ 注入完成' : '✗ 注入失败', r.ok ? 'ok' : 'err');
+    setStatus(r.ok ? '✓ 配置完成' : '✗ 配置失败', r.ok ? 'ok' : 'err');
+    if (r.ok && isOfficial) refreshCodexAccounts();
   } catch (err) {
     setStatus('错误', 'err');
     confirmBtn.textContent = '[ERR] 失败';
-    renderInjectState('注入调用失败', [
+    renderInjectState('配置调用失败', [
       { state: 'err', title: '调用失败', detail: err && err.message ? err.message : String(err) },
       { state: 'pending', title: '撤销点', detail: '未完成, 不提供撤销' },
     ]);
@@ -717,16 +1289,16 @@ async function undoInject() {
   const undoBtn = $('#btn-inject-undo');
   undoBtn.disabled = true;
   $('#btn-inject-confirm').disabled = true;
-  setStatus('撤销注入中…', 'warn');
-  renderInjectState('正在撤销本次注入', [
+  setStatus('撤销配置中…', 'warn');
+  renderInjectState('正在撤销本次配置', [
     { state: 'running', title: '恢复备份', detail: `回滚到 ${backupName}` },
     { state: 'pending', title: '恢复 Codex 配置', detail: '恢复 auth.json/config.toml/App profile 等状态' },
   ]);
   try {
     const r = await window.pywebview.api.inject_rollback(backupName);
-    renderInjectState(r.ok ? '已撤销本次注入' : '撤销失败', [
+    renderInjectState(r.ok ? '已撤销本次配置' : '撤销失败', [
       { state: r.ok ? 'ok' : 'err', title: '恢复备份', detail: r.ok ? `已恢复 ${backupName}` : `rollback 返回 rc=${r.returncode ?? '?'}` },
-      { state: r.ok ? 'ok' : 'pending', title: 'Codex 配置', detail: r.ok ? '已恢复到注入前状态' : '未确认恢复' },
+      { state: r.ok ? 'ok' : 'pending', title: 'Codex 配置', detail: r.ok ? '已恢复到配置前状态' : '未确认恢复' },
     ], {
       logClass: r.ok ? 'plan-result ok' : 'plan-result err',
       logTitle: r.ok ? '[READY] 撤销输出' : '[ERR] 撤销输出',
@@ -735,7 +1307,7 @@ async function undoInject() {
         r.stderr ? `[INFO] stderr:\n${r.stderr}` : null,
       ]),
     });
-    setStatus(r.ok ? '✓ 已撤销注入' : '✗ 撤销失败', r.ok ? 'ok' : 'err');
+    setStatus(r.ok ? '✓ 已撤销配置' : '✗ 撤销失败', r.ok ? 'ok' : 'err');
     if (r.ok) {
       state.lastInjectBackup = null;
       undoBtn.classList.add('hidden');
@@ -753,6 +1325,102 @@ async function undoInject() {
 
 // ---- renderers ----
 
+function usageWindow(snapshot, name) {
+  const limits = snapshot && snapshot.rate_limits && snapshot.rate_limits.rateLimits;
+  if (!limits) return null;
+  return limits[name] || null;
+}
+
+function setOptionalText(selector, text) {
+  const node = $(selector);
+  if (node) node.textContent = text;
+}
+
+function setUsageWindow(prefix, win, secondaryText) {
+  const used = win && typeof win.usedPercent === 'number' ? win.usedPercent : null;
+  const left = used == null ? '—' : `${Math.max(0, Math.round(100 - used))}%`;
+  const usedWidth = used == null ? 0 : Math.max(0, Math.min(100, used));
+  $(`#${prefix}-used-bar`).style.width = `${usedWidth}%`;
+  $(`#${prefix}-left`).textContent = left;
+  $(`#${prefix}-reset`).textContent = win ? fmtDurationFromNow(win.resetsAt) : '—';
+  if (prefix === 'session') {
+    $('#session-reserve').textContent = secondaryText || '—';
+  } else {
+    $('#weekly-deficit').textContent = secondaryText || '—';
+  }
+}
+
+async function renderOfficialDashboard(acc) {
+  acc = acc || state.currentCodexAccount;
+  if (!acc) {
+    $('#official-email').textContent = '未添加官方账号';
+    $('#official-plan').textContent = '—';
+    $('#official-updated').textContent = 'Updated —';
+    setOptionalText('#official-slot', '—');
+    setOptionalText('#official-auth', '—');
+    setOptionalText('#official-profile', '—');
+    setUsageWindow('session', null, '—');
+    setUsageWindow('weekly', null, '—');
+    $('#official-usage-source').textContent = '[INFO] 点官号列表标题右侧 添加 创建 Codex 官方账号槽位';
+    return;
+  }
+  $('#official-email').textContent = acc.email || acc.display_name || acc.slot;
+  $('#official-plan').textContent = codexPlanTitle(acc);
+  $('#official-updated').textContent = 'Updating…';
+  setOptionalText('#official-slot', acc.slot || '—');
+  setOptionalText('#official-auth', acc.source_auth_file && acc.source_auth_file !== acc.auth_file
+    ? `${acc.source_auth_file} → ${acc.auth_file || '—'}`
+    : (acc.auth_file || '—'));
+  setOptionalText('#official-profile', acc.app_profile_dir || '—');
+  $('#official-usage-source').textContent = '[INFO] 正在读取 Codex app-server 用量…';
+  setUsageWindow('session', null, '—');
+  setUsageWindow('weekly', null, '—');
+  try {
+    const r = await window.pywebview.api.codex_account_usage(acc.slot);
+    if (!r.ok) {
+      $('#official-usage-source').textContent = `[ERR] ${r.error || '读取失败'}`;
+      return;
+    }
+    const account = r.account || acc;
+    if (account) {
+      state.currentCodexAccount = account;
+      $('#official-email').textContent = account.email || account.display_name || account.slot;
+      $('#official-plan').textContent = codexPlanTitle(account);
+      setOptionalText('#official-auth', account.source_auth_file && account.source_auth_file !== account.auth_file
+        ? `${account.source_auth_file} → ${account.auth_file || '—'}`
+        : (account.auth_file || '—'));
+      setOptionalText('#official-profile', account.app_profile_dir || '—');
+      updateContextLabels();
+    }
+    const snapshot = r.snapshot;
+    if (snapshot && snapshot.error) {
+      setUsageWindow('session', null, '—');
+      setUsageWindow('weekly', null, '—');
+      $('#official-updated').textContent = fmtAgo(account.last_refresh);
+      $('#official-usage-source').textContent = `[WARN] ${snapshot.error}`;
+      return;
+    }
+    const rpcAccount = snapshot && snapshot.account && snapshot.account.account;
+    if (rpcAccount) {
+      $('#official-email').textContent = rpcAccount.email || $('#official-email').textContent;
+      $('#official-plan').textContent = rpcAccount.planType ? codexPlanTitle(account) : $('#official-plan').textContent;
+    }
+    const primary = usageWindow(snapshot, 'primary');
+    const secondary = usageWindow(snapshot, 'secondary');
+    setUsageWindow('session', primary, primary ? `${Math.max(0, Math.round(primary.usedPercent || 0))}%` : '—');
+    setUsageWindow('weekly', secondary, secondary ? `${Math.max(0, Math.round(secondary.usedPercent || 0))}%` : '—');
+    $('#official-updated').textContent = snapshot
+      ? fmtAgo(new Date().toISOString())
+      : fmtAgo(account.last_refresh);
+    $('#official-usage-source').textContent = snapshot
+      ? '[READY] Codex app-server · account/read + account/rateLimits/read'
+      : '[WARN] 未能读取实时用量, 仅显示本地 auth 信息';
+  } catch (err) {
+    $('#official-updated').textContent = fmtAgo(acc.last_refresh);
+    $('#official-usage-source').textContent = `[ERR] ${err && err.message ? err.message : String(err)}`;
+  }
+}
+
 function renderAccount(data) {
   const u = data.user || {};
   $('#acc-email').textContent = u.email || '—';
@@ -763,15 +1431,69 @@ function renderAccount(data) {
     statusRow.textContent = status === 'active' ? 'Active (正常)' : status;
     statusRow.className = 'grid-value' + (status === 'active' ? ' highlight-green' : '');
   }
-  // badge top-right: "ACTIVE" / status
-  const badge = $('#acc-status-badge');
-  if (badge) {
-    badge.textContent = status.toUpperCase();
-    badge.className = 'badge-label';
-    if (status !== 'active' && status !== '—') badge.classList.add('err');
-  }
   $('#acc-balance').textContent = fmtMoney(u.balance);
   $('#acc-concurrency').textContent = u.concurrency != null ? String(u.concurrency) : '—';
+}
+
+function subscriptionIsActive(sub) {
+  if (!sub || sub.status !== 'active') return false;
+  if (!sub.expires_at) return true;
+  const expiresMs = Date.parse(sub.expires_at);
+  return !Number.isFinite(expiresMs) || expiresMs > Date.now();
+}
+
+function buildSubscriptionUsage(label, used, limit) {
+  const usedNum = asNumber(used);
+  const limitNum = asNumber(limit);
+  const pct = usedNum == null || !limitNum || limitNum <= 0
+    ? 0
+    : Math.max(0, Math.min(100, (usedNum / limitNum) * 100));
+  const row = el('div', { className: 'subscription-usage-row' });
+  row.appendChild(el('span', { className: 'subscription-usage-label', text: label }));
+  const bar = el('span', { className: 'subscription-usage-bar', attrs: { 'aria-hidden': 'true' } });
+  bar.appendChild(el('span', { attrs: { style: `width: ${pct.toFixed(1)}%;` } }));
+  row.appendChild(bar);
+  row.appendChild(el('span', {
+    className: 'subscription-usage-value',
+    text: `${fmtUsd(usedNum)}/${fmtUsd(limitNum)}`,
+  }));
+  return row;
+}
+
+function buildSubscriptionItem(sub) {
+  const item = el('div', { className: 'subscription-item' });
+  const head = el('div', { className: 'subscription-head' });
+  const rateLabel = sub.rate_multiplier != null ? ` (${sub.rate_multiplier}x)` : '';
+  head.appendChild(el('div', { className: 'subscription-name', text: `${sub.group_name || '未命名卡'}${rateLabel}` }));
+  head.appendChild(el('div', { className: 'subscription-remain', text: fmtRemainingDays(sub.expires_at) }));
+  item.appendChild(head);
+
+  const usage = el('div', { className: 'subscription-usage' });
+  usage.appendChild(buildSubscriptionUsage('每日', sub.daily_usage_usd, sub.daily_limit_usd));
+  usage.appendChild(buildSubscriptionUsage('每周', sub.weekly_usage_usd, sub.weekly_limit_usd));
+  usage.appendChild(buildSubscriptionUsage('每月', sub.monthly_usage_usd, sub.monthly_limit_usd));
+  item.appendChild(usage);
+  return item;
+}
+
+function renderSubscriptions(subscriptions) {
+  const list = $('#subscription-list');
+  const count = $('#subscription-count');
+  if (!list || !count) return;
+  const all = Array.isArray(subscriptions) ? subscriptions : [];
+  const active = all.filter(subscriptionIsActive);
+  count.textContent = `${active.length} ACTIVE`;
+  count.classList.toggle('empty', active.length === 0);
+
+  const frag = document.createDocumentFragment();
+  if (!all.length) {
+    frag.appendChild(el('div', { className: 'subscription-empty', text: '[INFO] 未读取到订阅卡' }));
+  } else if (!active.length) {
+    frag.appendChild(el('div', { className: 'subscription-empty warn', text: '[WARN] 无有效订阅卡' }));
+  } else {
+    for (const sub of active) frag.appendChild(buildSubscriptionItem(sub));
+  }
+  list.replaceChildren(frag);
 }
 
 function renderDefaultKey(data) {
@@ -795,43 +1517,10 @@ function renderDefaultKey(data) {
   $('#ep-current').textContent = ep ? ep.endpoint : '—';
 }
 
-function endpointStatusCell(isCurrent, pingResult) {
-  let circleClass = isCurrent ? 'good' : 'medium';
-  let labelClass = isCurrent ? 'status-checked' : 'status-dim';
-  let label = isCurrent ? '[ON]' : '[IDLE]';
-
-  if (pingResult) {
-    if (pingResult.running) {
-      circleClass = 'medium';
-      labelClass = 'status-running';
-      label = '[PING]';
-    } else if (pingResult.ok) {
-      circleClass = 'good';
-      labelClass = 'status-checked';
-      label = '[OK]';
-    } else {
-      circleClass = 'bad';
-      labelClass = 'status-failed';
-      label = '[ERR]';
-    }
-  }
-
-  return el('div', {
-    className: 'ping-indicator',
-    children: [
-      el('span', { className: `indicator-circle ${circleClass}` }),
-      el('span', { className: labelClass, text: label }),
-    ],
-  });
-}
-
 function buildEndpointRow(ep, isCurrent, pingResult) {
   const tr = document.createElement('tr');
   if (isCurrent) tr.classList.add('current');
 
-  tr.appendChild(el('td', {
-    children: [endpointStatusCell(isCurrent, pingResult)],
-  }));
   tr.appendChild(el('td', { text: ep.name || '?' }));
   tr.appendChild(el('td', { className: 'mono', text: ep.endpoint || '' }));
 
@@ -845,7 +1534,7 @@ function buildEndpointRow(ep, isCurrent, pingResult) {
   } else {
     actionsTd.appendChild(el('button', {
       className: 'link sm',
-      text: '[选用]',
+      text: '选用',
       onClick: () => setDefaultEndpoint(ep.name),
     }));
   }
@@ -868,18 +1557,35 @@ function renderEndpoints(endpoints, defaultEp) {
 function buildGroupRow(g, isDefaultHere, groupResult) {
   const tr = document.createElement('tr');
   if (isDefaultHere) tr.classList.add('current');
+  const selectedForTest = !!state.groupSelected[g.id];
+  if (selectedForTest) tr.classList.add('selected-for-test');
 
-  const checkboxTd = el('td', { className: 'checkbox-col checkbox-custom-parent' });
-  const checkbox = document.createElement('input');
-  checkbox.type = 'checkbox';
-  checkbox.className = 'checkbox-custom';
-  checkbox.checked = !!state.groupSelected[g.id];
-  checkbox.addEventListener('change', () => {
-    state.groupSelected[g.id] = checkbox.checked;
-    updateBatchTestButton();
-    updateToggleAllButton();
+  const checkboxTd = el('td', { className: 'checkbox-col group-select-cell' });
+  const selectBtn = el('button', {
+    className: 'group-select-mark' + (selectedForTest ? ' active' : ''),
+    attrs: {
+      type: 'button',
+      'aria-pressed': selectedForTest ? 'true' : 'false',
+      'aria-label': selectedForTest ? '取消选择此分组' : '选择此分组用于批量测速',
+      title: selectedForTest ? '取消选择此分组' : '选择此分组用于批量测速',
+    },
+    onClick: () => {
+      const next = !state.groupSelected[g.id];
+      state.groupSelected[g.id] = next;
+      selectBtn.classList.toggle('active', next);
+      selectBtn.setAttribute('aria-pressed', next ? 'true' : 'false');
+      selectBtn.setAttribute('aria-label', next ? '取消选择此分组' : '选择此分组用于批量测速');
+      selectBtn.title = next ? '取消选择此分组' : '选择此分组用于批量测速';
+      tr.classList.toggle('selected-for-test', next);
+      updateBatchTestButton();
+      updateToggleAllButton();
+    },
   });
-  checkboxTd.appendChild(checkbox);
+  checkboxTd.appendChild(selectBtn);
+  checkboxTd.addEventListener('click', (e) => {
+    if (e.target === selectBtn) return;
+    selectBtn.click();
+  });
   tr.appendChild(checkboxTd);
 
   tr.appendChild(el('td', { text: fmtRate(g.rate_multiplier) }));
@@ -894,11 +1600,15 @@ function buildGroupRow(g, isDefaultHere, groupResult) {
   tr.appendChild(imgTd);
 
   const actionsTd = el('td', { className: 'right' });
-  actionsTd.appendChild(el('button', {
-    className: 'link sm',
-    text: '[测试]',
-    onClick: () => testGroup(g.id),
-  }));
+  if (isDefaultHere) {
+    actionsTd.appendChild(el('span', { className: 'switch-action inactive', text: '当前选用' }));
+  } else {
+    actionsTd.appendChild(el('button', {
+      className: 'link sm',
+      text: '选用',
+      onClick: () => setDefaultGroup(g.id),
+    }));
+  }
   tr.appendChild(actionsTd);
 
   return tr;
@@ -918,7 +1628,7 @@ function renderGroups(groups, _keys, defaultKey) {
   updateToggleAllButton();
 }
 
-// ---- batch group test (checkbox + parallel) ----
+// ---- batch group test (selection rail + serial probe) ----
 
 function getSelectedGroupIds() {
   return state.groups.filter((g) => state.groupSelected[g.id]).map((g) => g.id);
@@ -926,10 +1636,16 @@ function getSelectedGroupIds() {
 
 function updateBatchTestButton() {
   const btn = $('#btn-test-selected-groups');
-  if (!btn) return;
+  const summary = $('#group-selection-summary');
   const n = getSelectedGroupIds().length;
-  btn.disabled = n === 0;
-  btn.textContent = `测试选中 (${n})`;
+  if (btn) {
+    btn.disabled = n === 0;
+    btn.textContent = n > 0 ? `测试 ${n}` : '测试';
+  }
+  if (summary) {
+    summary.textContent = `已选 ${n}`;
+    summary.classList.toggle('active', n > 0);
+  }
 }
 
 function updateToggleAllButton() {
@@ -937,7 +1653,9 @@ function updateToggleAllButton() {
   if (!btn) return;
   const total = state.groups.length;
   const sel = getSelectedGroupIds().length;
-  btn.textContent = (total > 0 && sel === total) ? '反选' : '全选';
+  btn.disabled = total === 0;
+  btn.textContent = (total > 0 && sel === total) ? '清空' : '全选';
+  btn.title = (total > 0 && sel === total) ? '清空已选分组' : '全选分组用于批量测速';
 }
 
 function toggleAllGroups() {
@@ -1030,28 +1748,19 @@ async function setDefaultEndpoint(name) {
   }
 }
 
-async function testGroup(groupId) {
-  state.groupResults[groupId] = { chat: { running: true }, image: { running: true } };
-  renderGroups(state.groups, [], state.defaultKey);
-  setStatus(`测试分组 ${groupId}…`, 'warn');
+async function setDefaultGroup(groupId) {
+  setStatus('切分组中…', 'warn');
   try {
-    const r = await window.pywebview.api.test_group(groupId);
+    const r = await window.pywebview.api.set_default_group(groupId);
     if (!r.ok) {
-      state.groupResults[groupId] = {
-        chat: { ok: false, status: 'err', summary: r.error },
-        image: { ok: false, status: 'err', summary: r.error },
-      };
-      setStatus(r.error || '测试失败', 'err');
+      setStatus(r.error || '切分组失败', 'err');
     } else {
-      state.groupResults[groupId] = { chat: r.chat, image: r.image };
       state.defaultKey = r.default_key;
-      setStatus('✓ 分组测试完成', 'ok');
+      renderDefaultKey({ default_key: state.defaultKey, default_endpoint: state.defaultEndpoint });
+      updateContextLabels();
+      setStatus('✓ 已切分组', 'ok');
     }
   } catch (err) {
-    state.groupResults[groupId] = {
-      chat: { ok: false, status: 'err', summary: String(err) },
-      image: { ok: false, status: 'err', summary: String(err) },
-    };
     setStatus('错误', 'err');
   }
   renderGroups(state.groups, [], state.defaultKey);
@@ -1109,7 +1818,8 @@ function buildCheckRow(check) {
   body.appendChild(el('div', { className: 'check-name', text: check.name }));
   body.appendChild(el('div', { className: 'check-msg', text: check.message || '' }));
   if (check.fix_hint) {
-    body.appendChild(el('div', { className: 'check-hint', text: '修复: ' + check.fix_hint }));
+    const hintLabel = check.severity === 'warn' ? '提示: ' : '修复: ';
+    body.appendChild(el('div', { className: 'check-hint', text: hintLabel + check.fix_hint }));
   }
   row.appendChild(body);
 
@@ -1163,6 +1873,7 @@ window.addEventListener('pywebviewready', () => {
     window.pywebview.api.customize_chrome().catch(() => {});
   }
   installHeaderDrag();
+  refreshCodexAccounts();
   bootstrap();
   initVersionChip();
 });
@@ -1174,7 +1885,7 @@ function installHeaderDrag() {
   if (!header) return;
   const isInteractive = (el) =>
     el && el.closest && el.closest(
-      'button, a, input, select, textarea, [role="button"], .dropdown, .modal-overlay, .version-chip.has-update'
+      'button, a, input, select, textarea, [role="button"], .dropdown, .modal-overlay'
     );
   header.addEventListener('mousedown', (e) => {
     if (e.button !== 0) return;
@@ -1192,6 +1903,7 @@ function installHeaderDrag() {
 
 async function initVersionChip() {
   const chip = $('#app-version');
+  const updateBtn = $('#btn-update');
   try {
     const info = await window.pywebview.api.hello();
     chip.textContent = 'v' + (info.version || '?');
@@ -1202,24 +1914,57 @@ async function initVersionChip() {
   // background-poll for updates; silent on failure
   try {
     const r = await window.pywebview.api.check_update();
-    if (r && r.ok && r.has_update && r.latest && r.html_url) {
-      chip.textContent = `v${r.current} → v${r.latest}`;
-      chip.classList.add('has-update');
-      chip.title = `新版 v${r.latest} 可用 · 点击打开 GitHub 项目`;
-      chip.addEventListener('click', (e) => {
-        e.stopPropagation();
-        openProjectPage();
-      });
+    if (r && r.ok && r.has_update && r.latest) {
+      latestUpdateInfo = r;
+      chip.textContent = 'v' + (r.current || '?');
+      chip.title = `当前版本 v${r.current || '?'} · 新版 v${r.latest} 可用`;
+      if (updateBtn) {
+        updateBtn.classList.remove('hidden');
+        updateBtn.title = `打开 v${r.latest} release`;
+      }
     }
   } catch (_) {}
+}
+
+async function installAppUpdate() {
+  const btn = $('#btn-update');
+  if (!latestUpdateInfo || !btn) return;
+  btn.disabled = true;
+  const previousTitle = btn.title;
+  btn.title = `打开 v${latestUpdateInfo.latest} release 页面…`;
+  try {
+    const url = latestUpdateInfo.html_url || PROJECT_URL;
+    const r = await window.pywebview.api.open_url(url);
+    if (!r || !r.ok) {
+      btn.disabled = false;
+      btn.title = (r && r.error) || '打开 release 失败';
+      alert((r && r.error) || '打开 release 失败');
+      return;
+    }
+    btn.title = '已打开 release 页面，按 README 手动替换 unsigned app';
+  } catch (err) {
+    btn.disabled = false;
+    btn.title = previousTitle;
+    alert(err && err.message ? err.message : String(err));
+  }
 }
 
 // ---- sidebar toggle ----
 
 const SIDEBAR_KEY = 'sub2cli.sidebar.collapsed';
+
+function clearSidebarSplit() {
+  const relay = document.querySelector('.relay-zone');
+  const official = document.querySelector('.official-zone');
+  if (relay) relay.style.flex = '';
+  if (official) official.style.flex = '';
+  try { localStorage.removeItem('sub2cli.sidebar.relayRatio'); } catch {}
+}
+
 function applySidebarState() {
   const collapsed = localStorage.getItem(SIDEBAR_KEY) === '1';
   document.body.classList.toggle('sidebar-collapsed', collapsed);
+  requestAnimationFrame(clearSidebarSplit);
 }
 applySidebarState();
 $('#btn-sidebar-toggle').addEventListener('click', () => {
@@ -1228,11 +1973,17 @@ $('#btn-sidebar-toggle').addEventListener('click', () => {
   applySidebarState();
 });
 
+function initSidebarResizer() {
+  clearSidebarSplit();
+}
+initSidebarResizer();
+
 $('#btn-refresh').addEventListener('click', () => {
   if (!state.bootstrapped) bootstrap();
   else refresh();
 });
 $('#btn-github').addEventListener('click', openProjectPage);
+$('#btn-update').addEventListener('click', installAppUpdate);
 $('#brand-link').addEventListener('click', openProjectPage);
 $('#brand-link').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') {
@@ -1257,7 +2008,13 @@ $('#health-modal').addEventListener('click', (e) => {
   if (e.target === $('#health-modal')) closeHealthModal();
 });
 
-$('#btn-inject').addEventListener('click', openInjectModal);
+$('#btn-inject').addEventListener('click', openConfigTargetModal);
+$('#btn-config-target-close').addEventListener('click', closeConfigTargetModal);
+$('#btn-config-relay').addEventListener('click', startRelayConfig);
+$('#btn-config-official').addEventListener('click', startOfficialConfig);
+$('#config-target-modal').addEventListener('click', (e) => {
+  if (e.target === $('#config-target-modal')) closeConfigTargetModal();
+});
 $('#btn-inject-close').addEventListener('click', closeInjectModal);
 $('#btn-inject-cancel').addEventListener('click', closeInjectModal);
 $('#btn-inject-confirm').addEventListener('click', applyInject);
@@ -1287,6 +2044,19 @@ $('#add-account-modal').addEventListener('click', (e) => {
     else if (e.key === 'Escape') closeAddAccountModal();
   });
 });
+$('#btn-add-codex-account').addEventListener('click', openAddCodexAccountModal);
+$('#btn-add-codex-close').addEventListener('click', closeAddCodexAccountModal);
+$('#btn-add-codex-cancel').addEventListener('click', closeAddCodexAccountModal);
+$('#btn-add-codex-submit').addEventListener('click', submitAddCodexAccount);
+$('#add-codex-account-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'add-codex-account-modal') closeAddCodexAccountModal();
+});
+['add-codex-slot', 'add-codex-display'].forEach((id) => {
+  $('#' + id).addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submitAddCodexAccount();
+    else if (e.key === 'Escape') closeAddCodexAccountModal();
+  });
+});
 document.addEventListener('click', (e) => {
   const pop = $('#account-pop');
   if (pop.classList.contains('hidden')) return;
@@ -1300,7 +2070,9 @@ $('#inject-modal').addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (!$('#health-modal').classList.contains('hidden')) closeHealthModal();
+    if (!$('#config-target-modal').classList.contains('hidden')) closeConfigTargetModal();
     if (!$('#inject-modal').classList.contains('hidden')) closeInjectModal();
+    if (!$('#add-codex-account-modal').classList.contains('hidden')) closeAddCodexAccountModal();
   }
 });
 
@@ -1308,6 +2080,8 @@ clearModeState();
 
 $('#btn-test-selected-groups').addEventListener('click', testSelectedGroups);
 $('#btn-toggle-all-groups').addEventListener('click', toggleAllGroups);
+$('#btn-save-config').addEventListener('click', () => setStatus('✓ 配置已保存', 'ok'));
+$('#btn-use-official').addEventListener('click', chooseOfficialAccount);
 
 // ---- add-relay modal (probe-first stepped flow) ----
 

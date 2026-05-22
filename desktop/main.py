@@ -170,6 +170,7 @@ def main() -> int:
                 window.destroy()
             except Exception:
                 pass
+            os._exit(0)
 
         threading.Thread(target=_quit_soon, daemon=True).start()
 

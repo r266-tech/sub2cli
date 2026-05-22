@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """sub2cli-inject — Codex 渠道切换器 (vendored from r266-tech/codex-provider-macos).
 
-sub2cli 用 add-api 子命令注入 url + apikey 到本机 Codex CLI / Codex App.
+sub2cli 用 add-api 子命令配置 url + apikey 到本机 Codex CLI / Codex App.
 单文件 Python, 无第三方依赖, MIT 许可.
 """
 
@@ -46,6 +46,7 @@ SLOTS_FILE = CODEX_HOME / "provider-slots.json"
 BACKUP_ROOT = CODEX_HOME / "provider-switch-backups"
 LOCK_FILE = CODEX_HOME / ".sub2cli-inject.lock"
 SNAPSHOT_FILENAME = "pre-switch-snapshot.json"
+AUTO_ROLLBACK_MARKER = ".auto-rollback-done"
 
 OAUTH_PROVIDER = "openai"
 RELAY_PROVIDER = "OpenAI"
@@ -91,12 +92,19 @@ class Sub2cliLock:
     `with Sub2cliLock(): ...`. Raises LockBusy if another process holds it.
     """
 
+    _depth = 0
+
     def __init__(self, path: Path = LOCK_FILE, *, timeout: float = 0.0) -> None:
         self.path = path
         self.timeout = timeout
         self._fd: int | None = None
+        self._nested = False
 
     def __enter__(self) -> "Sub2cliLock":
+        if Sub2cliLock._depth > 0:
+            Sub2cliLock._depth += 1
+            self._nested = True
+            return self
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fd = os.open(str(self.path), os.O_CREAT | os.O_WRONLY, 0o600)
         deadline = time.time() + self.timeout if self.timeout > 0 else None
@@ -105,6 +113,7 @@ class Sub2cliLock:
                 fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 os.ftruncate(self._fd, 0)
                 os.write(self._fd, f"pid={os.getpid()} t={int(time.time())}\n".encode())
+                Sub2cliLock._depth = 1
                 return self
             except OSError as exc:
                 if exc.errno not in (errno.EAGAIN, errno.EACCES):
@@ -120,6 +129,10 @@ class Sub2cliLock:
                 time.sleep(0.1)
 
     def __exit__(self, *_exc: object) -> None:
+        if self._nested:
+            Sub2cliLock._depth = max(0, Sub2cliLock._depth - 1)
+            return
+        Sub2cliLock._depth = 0
         if self._fd is not None:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
@@ -160,7 +173,29 @@ def atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
         raise
 
 
+def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.chmod(tmp, mode)
+        tmp.replace(path)
+    except Exception:
+        if tmp.exists() or tmp.is_symlink():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
 def atomic_symlink(link_path: Path, target: Path) -> None:
+    """Replace link_path with a symlink to target. Used for APP_PROFILE.
+
+    AUTH_JSON is no longer symlinked — codex CLI/App atomic-writes auth.json
+    when refreshing tokens, which would replace any symlink with a real file
+    (cat-and-mouse). Use copy_auth_atomic() instead for auth.json.
+    """
     if link_path.exists() and not link_path.is_symlink():
         fail(f"{link_path} is a real file/dir, not a symlink. Run init first or move it aside manually.")
     link_path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,6 +207,84 @@ def atomic_symlink(link_path: Path, target: Path) -> None:
     os.replace(tmp, link_path)
 
 
+# ==================== auth.json as a real file (no longer symlinked) ====================
+
+def read_auth_bytes() -> bytes | None:
+    """Return AUTH_JSON bytes regardless of whether it's a real file or symlink.
+
+    Returns None if AUTH_JSON doesn't exist or can't be read.
+    """
+    if not AUTH_JSON.exists():
+        return None
+    try:
+        return AUTH_JSON.read_bytes()
+    except OSError:
+        return None
+
+
+def copy_auth_atomic(src: Path, *, mode: int = 0o600) -> None:
+    """Atomic-write src's content to AUTH_JSON as a real file (replacing any
+    existing symlink or file). Used by cmd_switch when changing slots.
+    """
+    if not src.exists():
+        fail(f"slot auth file missing: {src}")
+    data = src.read_bytes()
+    AUTH_JSON.parent.mkdir(parents=True, exist_ok=True)
+    tmp = AUTH_JSON.with_name(f"{AUTH_JSON.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, AUTH_JSON)
+    except Exception:
+        if tmp.exists() or tmp.is_symlink():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def flush_auth_to_slot(slot_auth_file: Path, *, mode: int = 0o600) -> bool:
+    """Save current AUTH_JSON content back to its slot's auth_file so that
+    in-flight OAuth refresh tokens written by codex aren't lost on switch.
+
+    Returns True if a flush was performed (content changed), False if no-op.
+    """
+    cur = read_auth_bytes()
+    if cur is None:
+        return False
+    slot_auth_file.parent.mkdir(parents=True, exist_ok=True)
+    if slot_auth_file.exists():
+        try:
+            if slot_auth_file.read_bytes() == cur:
+                return False
+        except OSError:
+            pass
+    tmp = slot_auth_file.with_name(f"{slot_auth_file.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_bytes(cur)
+        os.chmod(tmp, mode)
+        os.replace(tmp, slot_auth_file)
+    except Exception:
+        if tmp.exists() or tmp.is_symlink():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+    return True
+
+
+def auth_content_equals(slot_auth_file: Path) -> bool:
+    """Check if AUTH_JSON content matches a slot's auth_file content."""
+    if not AUTH_JSON.exists() or not slot_auth_file.exists():
+        return False
+    try:
+        return AUTH_JSON.read_bytes() == slot_auth_file.read_bytes()
+    except OSError:
+        return False
+
+
 def symlink_points_to(link_path: Path, target: Path) -> bool:
     if not link_path.is_symlink():
         return False
@@ -181,8 +294,53 @@ def symlink_points_to(link_path: Path, target: Path) -> bool:
         return False
 
 
+def path_present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def lexical_abs(path: Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def path_key(path: Path) -> str:
+    return str(lexical_abs(path))
+
+
+def is_within(path: Path, base: Path) -> bool:
+    try:
+        lexical_abs(path).relative_to(lexical_abs(base))
+        return True
+    except ValueError:
+        return False
+
+
+def safe_unlink_file(path: Path) -> bool:
+    if not path_present(path):
+        return False
+    if path.is_dir() and not path.is_symlink():
+        fail(f"refuse to unlink directory as file: {path}")
+    path.unlink()
+    return True
+
+
+def safe_remove_profile_dir(path: Path) -> bool:
+    if not path_present(path):
+        return False
+    if not is_within(path, APP_SUPPORT):
+        fail(f"refuse to remove profile outside Application Support: {path}")
+    if not lexical_abs(path).name.startswith("Codex."):
+        fail(f"refuse to remove non-slot Codex profile: {path}")
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return True
+    if path.is_dir():
+        shutil.rmtree(path)
+        return True
+    return False
+
+
 def toml_quote(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    return json.dumps(str(value), ensure_ascii=False)[1:-1]
 
 
 def normalize_base_url(value: str) -> str:
@@ -271,10 +429,56 @@ def decode_auth_email(auth_file: Path) -> str | None:
         return None
 
 
+def _migrate_legacy_auth_symlink(*, quiet: bool = False) -> bool:
+    """If AUTH_JSON is a legacy symlink (v0.2.0 layout), break it into a real
+    file in place. Idempotent — safe to call from any cmd_init entry path,
+    including upgrade users who already have populated slots.
+
+    Returns True iff a migration was performed.
+    """
+    if not AUTH_JSON.is_symlink():
+        return False
+    legacy_target = Path(os.readlink(AUTH_JSON)).expanduser()
+    if not legacy_target.is_absolute():
+        legacy_target = (AUTH_JSON.parent / legacy_target).resolve(strict=False)
+    if legacy_target.exists():
+        try:
+            content = legacy_target.read_bytes()
+        except OSError:
+            content = b""
+        AUTH_JSON.unlink()
+        if content:
+            AUTH_JSON.write_bytes(content)
+            os.chmod(AUTH_JSON, 0o600)
+        if not quiet:
+            print(f"  ↳ migrated legacy auth.json symlink → real file ({len(content)} bytes)")
+    else:
+        AUTH_JSON.unlink()
+        if not quiet:
+            print(f"  ↳ removed dangling legacy auth.json symlink ({legacy_target} missing)")
+    return True
+
+
 def cmd_init(slot: str = "local", display: str | None = None, *, quiet: bool = False) -> int:
+    if Sub2cliLock._depth == 0:
+        try:
+            with Sub2cliLock():
+                return cmd_init(slot=slot, display=display, quiet=quiet)
+        except LockBusy as exc:
+            fail(str(exc), code=4)
     slot = validate_slot(slot)
     data = load_slots(required=False)
-    if data.get("current") and data.get("slots") and AUTH_JSON.is_symlink() and APP_PROFILE.is_symlink():
+
+    # Idempotent legacy migration: run BEFORE the early-return so upgrade
+    # users (v0.2.0 layout: slots already populated, auth.json still a symlink)
+    # get their symlink broken into a real file. Without this, codex's next
+    # token-refresh atomic-write would replace the symlink anyway — but later
+    # switches would race the symlink check against codex's writes.
+    legacy_migrated = _migrate_legacy_auth_symlink(quiet=quiet)
+
+    # Already initialized if slots are configured and APP_PROFILE is a symlink.
+    # AUTH_JSON is now intentionally a real file (no longer symlinked).
+    if data.get("current") and data.get("slots") and APP_PROFILE.is_symlink():
         if not quiet:
             print(f"already initialized: current={data['current']}")
             print(f"slots file: {SLOTS_FILE}")
@@ -287,12 +491,21 @@ def cmd_init(slot: str = "local", display: str | None = None, *, quiet: bool = F
     auth_slot = CODEX_HOME / f"auth.{slot}.json"
     profile_slot = APP_SUPPORT / f"Codex.{slot}"
 
-    if AUTH_JSON.is_symlink():
-        auth_slot = Path(os.readlink(AUTH_JSON)).expanduser()
-    elif AUTH_JSON.exists():
-        if auth_slot.exists():
-            fail(f"{auth_slot} already exists; refusing to overwrite it")
-        AUTH_JSON.rename(auth_slot)
+    if AUTH_JSON.exists():
+        # Real file already (typical post-codex-refresh state). Preserve content
+        # into auth_slot if absent, then leave AUTH_JSON in place.
+        if not auth_slot.exists():
+            auth_slot.parent.mkdir(parents=True, exist_ok=True)
+            auth_slot.write_bytes(AUTH_JSON.read_bytes())
+            os.chmod(auth_slot, 0o600)
+        elif auth_slot.read_bytes() != AUTH_JSON.read_bytes():
+            # Existing auth_slot differs — keep the newer (AUTH_JSON) so live
+            # tokens are preserved. Back up the old slot file.
+            bak = auth_slot.with_suffix(auth_slot.suffix + f".pre-init-{int(time.time())}.bak")
+            bak.write_bytes(auth_slot.read_bytes())
+            os.chmod(bak, 0o600)
+            auth_slot.write_bytes(AUTH_JSON.read_bytes())
+            os.chmod(auth_slot, 0o600)
 
     if APP_PROFILE.is_symlink():
         profile_slot = Path(os.readlink(APP_PROFILE)).expanduser()
@@ -304,8 +517,6 @@ def cmd_init(slot: str = "local", display: str | None = None, *, quiet: bool = F
         profile_slot.mkdir(parents=True, exist_ok=True)
 
     atomic_symlink(APP_PROFILE, profile_slot)
-    if auth_slot.exists() or AUTH_JSON.is_symlink():
-        atomic_symlink(AUTH_JSON, auth_slot)
 
     email = decode_auth_email(auth_slot) if auth_slot.exists() else None
     display_name = display or (f"Codex - {email}" if email else f"Codex - {slot}")
@@ -618,7 +829,17 @@ def normalize_rollouts(target_provider: str, *, backup_dir: Path | None, dry_run
     return stats
 
 
-def normalize_sessions(target_provider: str, *, dry_run: bool = False) -> dict:
+def normalize_sessions(
+    target_provider: str,
+    *,
+    dry_run: bool = False,
+    backup_dir: Path | None = None,
+) -> dict:
+    """Normalize sessions DB + rollouts to target_provider. If caller passes a
+    `backup_dir` (e.g. the switch-level backup), reuse it so a later rollback
+    finds the state_5.sqlite snapshot and rollout-provider-changes audit
+    inside the same dir it restores config.toml / auth.json from.
+    """
     if target_provider not in THREAD_PROVIDERS:
         fail(f"unsupported target provider {target_provider!r}; expected openai or OpenAI")
     preview = {
@@ -628,16 +849,25 @@ def normalize_sessions(target_provider: str, *, dry_run: bool = False) -> dict:
         "state_db": None,
         "rollouts": None,
     }
-    backup_dir = None if dry_run else new_backup_dir(f"thread-provider-{target_provider}")
+    if not dry_run and backup_dir is None:
+        backup_dir = new_backup_dir(f"thread-provider-{target_provider}")
+    if dry_run:
+        backup_dir = None  # don't write anything in dry-run
     preview["backup_dir"] = str(backup_dir) if backup_dir is not None else None
     preview["state_db"] = normalize_state_db(target_provider, backup_dir=backup_dir, dry_run=dry_run)
     preview["rollouts"] = normalize_rollouts(target_provider, backup_dir=backup_dir, dry_run=dry_run)
     if backup_dir is not None:
-        atomic_write_json(backup_dir / "manifest.json", preview)
+        # Name the manifest so it doesn't collide with switch_pre_switch's
+        # other manifest files inside the same backup_dir.
+        atomic_write_json(backup_dir / "thread-provider-manifest.json", preview)
     return preview
 
 
-def normalize_sessions_if_needed(target_provider: str) -> dict:
+def normalize_sessions_if_needed(
+    target_provider: str,
+    *,
+    backup_dir: Path | None = None,
+) -> dict:
     preview = normalize_sessions(target_provider, dry_run=True)
     db_changed = int(preview["state_db"].get("changed", 0))
     db_error = preview["state_db"].get("error")
@@ -649,7 +879,7 @@ def normalize_sessions_if_needed(target_provider: str) -> dict:
         preview["backup_dir"] = None
         preview["skipped"] = True
         return preview
-    return normalize_sessions(target_provider, dry_run=False)
+    return normalize_sessions(target_provider, dry_run=False, backup_dir=backup_dir)
 
 
 def sessions_need_normalize(target_provider: str) -> bool:
@@ -705,51 +935,155 @@ def slot_thread_provider(cfg: dict) -> str:
 
 def slot_is_clean(data: dict, target_slot: str) -> bool:
     cfg = data["slots"][target_slot]
-    auth_target = Path(cfg["auth_file"]).expanduser()
     profile_target = history_profile_target(data, target_slot)
     if data.get("current") != target_slot:
         return False
-    if not symlink_points_to(AUTH_JSON, auth_target):
-        return False
     if not symlink_points_to(APP_PROFILE, profile_target):
         return False
+    # AUTH_JSON is a real file. For relay we check exact content; for oauth we
+    # check auth_mode and size (token refresh changes bytes, so we can't compare
+    # byte-equal with the slot's auth_file).
     if cfg.get("mode") == "relay":
         api_key = str(cfg.get("api_key") or "")
         try:
-            if json.loads(auth_target.read_text()) != {"OPENAI_API_KEY": api_key, "auth_mode": "apikey"}:
+            if json.loads(AUTH_JSON.read_text()) != {"OPENAI_API_KEY": api_key, "auth_mode": "apikey"}:
                 return False
         except (OSError, json.JSONDecodeError):
             return False
-    elif not auth_target.exists() or auth_target.stat().st_size < 10:
-        return False
+    else:
+        # OAuth: full token JSON is several KB; API-key JSON is ~120 bytes.
+        # Catch relay→oauth switch failures (auth.json still holds API-key JSON).
+        if not AUTH_JSON.exists() or AUTH_JSON.stat().st_size < 1000:
+            return False
+        try:
+            if json.loads(AUTH_JSON.read_text()).get("auth_mode") == "apikey":
+                return False
+        except (OSError, json.JSONDecodeError):
+            return False
     return config_clean_for_slot(cfg) and not sessions_need_normalize(slot_thread_provider(cfg))
 
 
 # ==================== Dry-run plan + snapshot/restore ====================
 
+def collect_slot_auth_paths(data: dict) -> list[Path]:
+    paths: list[Path] = []
+    for cfg in (data.get("slots") or {}).values():
+        raw = str((cfg or {}).get("auth_file") or "").strip()
+        if raw:
+            paths.append(Path(raw).expanduser())
+    return paths
+
+
+def collect_slot_profile_paths(data: dict) -> list[Path]:
+    paths: list[Path] = []
+    for cfg in (data.get("slots") or {}).values():
+        raw = str((cfg or {}).get("app_profile_dir") or "").strip()
+        if raw:
+            paths.append(Path(raw).expanduser())
+    return paths
+
+
+def managed_existing_paths(data: dict | None = None) -> list[str]:
+    paths: list[Path] = [CONFIG_TOML, AUTH_JSON, SLOTS_FILE, APP_PROFILE]
+    if data:
+        paths.extend(collect_slot_auth_paths(data))
+        paths.extend(collect_slot_profile_paths(data))
+    try:
+        paths.extend(CODEX_HOME.glob("auth.*.json"))
+    except OSError:
+        pass
+    return sorted({path_key(p) for p in paths if path_present(p)})
+
+
+def backup_existing_slot_auth_files(backup_dir: Path, data: dict | None = None) -> dict[str, str]:
+    candidates: list[Path] = []
+    if data:
+        candidates.extend(collect_slot_auth_paths(data))
+    try:
+        candidates.extend(CODEX_HOME.glob("auth.*.json"))
+    except OSError:
+        pass
+
+    backups: dict[str, str] = {}
+    auth_backup_dir = backup_dir / "slot-auth"
+    seen: set[str] = set()
+    for raw in candidates:
+        path = raw.expanduser()
+        key = path_key(path)
+        if key in seen or not path_present(path):
+            continue
+        seen.add(key)
+        if path.is_dir() and not path.is_symlink():
+            continue
+        target = auth_backup_dir / f"{len(backups):04d}.bin"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.write_bytes(path.read_bytes())
+        except OSError:
+            continue
+        os.chmod(target, 0o600)
+        backups[key] = str(target)
+    return backups
+
+
 def snapshot_pre_switch(backup_dir: Path) -> dict:
     """Capture rollback-able state of ~/.codex into backup_dir.
 
-    Captures: full config.toml content, current AUTH_JSON symlink target,
-    current APP_PROFILE symlink target. state_5.sqlite + rollout JSONLs
-    are backed up separately by backup_state_db() / rollout audit.
+    Captures: full config.toml content, AUTH_JSON file content (as bytes),
+    current APP_PROFILE symlink target. state_5.sqlite + rollout JSONLs are
+    backed up separately by backup_state_db() / rollout audit.
+
+    Schema 3: auth.json is a real file (not symlinked), and rollback also
+    removes managed config/auth/profile artifacts that did not exist before.
     """
+    slots_state: dict | None = None
+    if SLOTS_FILE.exists():
+        try:
+            slots_state = json.loads(SLOTS_FILE.read_text())
+        except (OSError, json.JSONDecodeError):
+            slots_state = None
+
     snap: dict = {
-        "schema": 1,
+        "schema": 3,
         "timestamp": int(time.time()),
+        "config_toml_existed": path_present(CONFIG_TOML),
         "config_toml_backup": None,
-        "auth_json_target": None,
+        "auth_json_existed": path_present(AUTH_JSON),
+        "auth_json_backup": None,
+        "app_profile_existed": path_present(APP_PROFILE),
         "app_profile_target": None,
+        "provider_slots_backup": None,
+        "provider_slots_existed": SLOTS_FILE.exists(),
+        "current_slot": None,
+        "app_history_slot": None,
+        "managed_existing_paths": managed_existing_paths(slots_state),
+        "slot_auth_backups": backup_existing_slot_auth_files(backup_dir, slots_state),
     }
     if CONFIG_TOML.exists():
         target = backup_dir / "config.toml"
         target.write_text(CONFIG_TOML.read_text())
         os.chmod(target, 0o600)
         snap["config_toml_backup"] = str(target)
-    if AUTH_JSON.is_symlink():
-        snap["auth_json_target"] = os.readlink(AUTH_JSON)
+    if AUTH_JSON.exists():
+        target = backup_dir / "auth.json"
+        target.write_bytes(AUTH_JSON.read_bytes())
+        os.chmod(target, 0o600)
+        snap["auth_json_backup"] = str(target)
     if APP_PROFILE.is_symlink():
         snap["app_profile_target"] = os.readlink(APP_PROFILE)
+    if SLOTS_FILE.exists():
+        target = backup_dir / SLOTS_FILE.name
+        target.write_text(SLOTS_FILE.read_text())
+        os.chmod(target, 0o600)
+        snap["provider_slots_backup"] = str(target)
+    # Record provider-slots.json pointers so rollback can revert `current` /
+    # `app_history_slot` and `status` reads as "consistent" again.
+    if slots_state:
+        try:
+            snap["current_slot"] = slots_state.get("current")
+            snap["app_history_slot"] = slots_state.get("app_history_slot")
+        except AttributeError:
+            pass
     atomic_write_json(backup_dir / SNAPSHOT_FILENAME, snap)
     return snap
 
@@ -773,11 +1107,16 @@ def compute_switch_plan(data: dict, target_slot: str) -> dict:
         plan["actions"].append({"type": "noop", "reason": "已是当前渠道, 状态一致"})
         return plan
 
-    cur_auth = os.readlink(AUTH_JSON) if AUTH_JSON.is_symlink() else None
+    # AUTH_JSON should be a real file post-migration. Path.stat() follows
+    # legacy symlinks (size = target's size), so this works for both layouts.
+    cur_size = AUTH_JSON.stat().st_size if AUTH_JSON.exists() else None
+    cur_kind = "symlink" if AUTH_JSON.is_symlink() else "real-file"
     plan["actions"].append({
-        "type": "symlink",
+        "type": "auth_copy",
         "path": str(AUTH_JSON),
-        "from": cur_auth,
+        "from_size": cur_size,
+        "from_kind": cur_kind,
+        "from_slot": data.get("current"),
         "to": str(auth_target),
     })
     cur_profile = os.readlink(APP_PROFILE) if APP_PROFILE.is_symlink() else None
@@ -839,6 +1178,17 @@ def print_switch_plan(plan: dict) -> None:
             print(f"    {i}. symlink: {a['path']}")
             print(f"       from: {a['from']}")
             print(f"       to:   {a['to']}")
+        elif t == "auth_copy":
+            print(f"    {i}. copy:    {a['path']}  (real file, atomic write)")
+            from_desc = a.get("from_slot") or "(none)"
+            from_size = a.get("from_size")
+            from_kind = a.get("from_kind", "")
+            if from_size is not None:
+                tag = f" ({from_kind})" if from_kind else ""
+                print(f"       from: slot={from_desc} (current auth.json {from_size} bytes{tag})")
+            else:
+                print(f"       from: slot={from_desc} (no current auth.json)")
+            print(f"       src:  {a['to']}")
         elif t == "write":
             print(f"    {i}. write:  {a['path']}  ({a['what']})")
         elif t == "patch_toml":
@@ -862,34 +1212,225 @@ def print_switch_plan(plan: dict) -> None:
     print("  (no changes applied; rerun without --dry-run to execute)")
 
 
+def restore_rollouts_from_audit(audit_path: Path) -> dict:
+    """Reverse-apply a rollout-provider-changes.jsonl audit: at each recorded
+    offset, write the `from` provider bytes back over `to`. Used by rollback
+    so that codex.app's session sidebar sees the original provider tags.
+
+    Returns: {scanned, reverted, errors, missing} stats.
+    """
+    stats = {"scanned": 0, "reverted": 0, "errors": 0, "missing": 0}
+    if not audit_path.exists():
+        return stats
+    by_path: dict[str, list[dict]] = {}
+    with audit_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("error") or "offset" not in rec or "from" not in rec or "to" not in rec:
+                continue
+            by_path.setdefault(rec["path"], []).append(rec)
+    for raw_path, records in by_path.items():
+        path = Path(raw_path)
+        if not path.exists():
+            stats["missing"] += len(records)
+            continue
+        try:
+            before = path.stat()
+            with path.open("r+b") as handle:
+                for record in records:
+                    stats["scanned"] += 1
+                    from_provider = str(record["from"]).encode()
+                    to_provider = str(record["to"]).encode()
+                    # provider names in THREAD_PROVIDERS happen to all be 6 bytes
+                    # (`openai` / `OpenAI`) so byte-offset reverse is safe.
+                    if len(from_provider) != len(to_provider):
+                        stats["errors"] += 1
+                        continue
+                    handle.seek(int(record["offset"]))
+                    current = handle.read(len(to_provider))
+                    if current != to_provider:
+                        stats["errors"] += 1
+                        continue
+                    handle.seek(int(record["offset"]))
+                    handle.write(from_provider)
+                    stats["reverted"] += 1
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Preserve original mtime so codex.app's session-list sort doesn't change.
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        except OSError:
+            stats["errors"] += len(records)
+    return stats
+
+
 def restore_from_backup(backup_dir: Path) -> int:
-    """Restore config.toml + symlinks + sqlite from a backup_dir snapshot."""
+    """Restore config.toml + AUTH_JSON content + APP_PROFILE symlink + sqlite
+    from a backup_dir snapshot. Supports schema 1 (legacy symlink), schema 2
+    (real-file auth.json), and schema 3 cleanup metadata.
+    """
     snap_path = backup_dir / SNAPSHOT_FILENAME
     if not snap_path.exists():
         fail(f"snapshot not found: {snap_path}")
     snap = json.loads(snap_path.read_text())
+    schema = snap.get("schema")
+    if schema not in (1, 2, 3):
+        fail(f"unknown snapshot schema {schema!r} in {snap_path} (expected 1, 2 or 3)")
     quit_codex()
     restored: list[str] = []
+    warnings: list[str] = []
+    try:
+        post_slots_state = load_slots(required=False) if SLOTS_FILE.exists() else {"slots": {}}
+    except SystemExit as exc:
+        post_slots_state = {"slots": {}}
+        warnings.append(f"current provider-slots unreadable before restore: {exc}")
     if snap.get("config_toml_backup"):
         src = Path(snap["config_toml_backup"])
         if src.exists():
             atomic_write_text(CONFIG_TOML, src.read_text())
             restored.append(f"config.toml ← {src.name}")
-    if snap.get("auth_json_target"):
+        else:
+            warnings.append(f"config.toml backup missing: {src}")
+    elif snap.get("config_toml_existed") is False and path_present(CONFIG_TOML):
+        try:
+            safe_unlink_file(CONFIG_TOML)
+            restored.append("config.toml removed")
+        except SystemExit as exc:
+            warnings.append(f"config.toml was NOT removed: {exc}")
+    # Schema 2/3: restore auth.json from saved bytes.
+    if snap.get("auth_json_backup"):
+        src = Path(snap["auth_json_backup"])
+        if src.exists():
+            copy_auth_atomic(src)
+            restored.append(f"auth.json ← {src.name}")
+        else:
+            warnings.append(f"auth.json backup missing: {src} — auth.json was NOT restored")
+    # Schema 1 (legacy): restore auth.json by copying the target's content
+    # as a real file (no longer symlinking).
+    elif snap.get("auth_json_target"):
         target = Path(snap["auth_json_target"]).expanduser()
-        atomic_symlink(AUTH_JSON, target)
-        restored.append(f"auth.json → {target}")
+        if not target.is_absolute():
+            target = (AUTH_JSON.parent / target).resolve(strict=False)
+        if target.exists():
+            copy_auth_atomic(target)
+            restored.append(f"auth.json ← {target} (legacy)")
+        else:
+            warnings.append(f"legacy auth.json target missing: {target} — auth.json was NOT restored")
+    elif snap.get("auth_json_existed") is False and path_present(AUTH_JSON):
+        try:
+            safe_unlink_file(AUTH_JSON)
+            restored.append("auth.json removed")
+        except SystemExit as exc:
+            warnings.append(f"auth.json was NOT removed: {exc}")
+    for key, src_name in (snap.get("slot_auth_backups") or {}).items():
+        src = Path(src_name)
+        dst = Path(key)
+        if src.exists():
+            try:
+                atomic_write_bytes(dst, src.read_bytes())
+                restored.append(f"{dst.name} ← {src.parent.name}/{src.name}")
+            except OSError as exc:
+                warnings.append(f"slot auth was NOT restored: {dst}: {exc}")
+        else:
+            warnings.append(f"slot auth backup missing: {src}")
     if snap.get("app_profile_target"):
         target = Path(snap["app_profile_target"]).expanduser()
-        atomic_symlink(APP_PROFILE, target)
-        restored.append(f"App profile → {target}")
+        try:
+            atomic_symlink(APP_PROFILE, target)
+            restored.append(f"App profile → {target}")
+        except SystemExit:
+            warnings.append(f"App profile symlink refused (target may be a real dir): {target}")
+    elif snap.get("app_profile_existed") is False and path_present(APP_PROFILE):
+        try:
+            safe_unlink_file(APP_PROFILE)
+            restored.append("App profile removed")
+        except SystemExit as exc:
+            warnings.append(f"App profile was NOT removed: {exc}")
     state_db_backup = backup_dir / STATE_DB.name
     if state_db_backup.exists():
-        if STATE_DB.exists():
-            STATE_DB.unlink()
+        # SQLite may run in WAL mode (state_5.sqlite-wal / -shm sidecars).
+        # If we only replace the main file, the WAL is replayed at open time
+        # and silently re-applies the post-switch UPDATE — the rollback looks
+        # successful but threads come back tagged with the new provider.
+        # Wipe main + WAL + SHM together, then copy backup's main file.
+        wal = STATE_DB.parent / f"{STATE_DB.name}-wal"
+        shm = STATE_DB.parent / f"{STATE_DB.name}-shm"
+        for p in (STATE_DB, wal, shm):
+            if p.exists():
+                p.unlink()
         shutil.copyfile(state_db_backup, STATE_DB)
         os.chmod(STATE_DB, 0o600)
         restored.append(f"state DB ← {state_db_backup.name}")
+    # Restore the full slot registry. Switching and add-api mutate more than
+    # just `current`, so pointer-only rollback can leave supposedly removed
+    # relay/API-key slots behind.
+    if snap.get("provider_slots_backup"):
+        src = Path(snap["provider_slots_backup"])
+        if src.exists():
+            atomic_write_json(SLOTS_FILE, json.loads(src.read_text()))
+            restored.append(f"{SLOTS_FILE.name} ← {src.name}")
+        else:
+            warnings.append(f"provider-slots backup missing: {src}")
+    elif snap.get("provider_slots_existed") is False and SLOTS_FILE.exists():
+        SLOTS_FILE.unlink()
+        restored.append(f"{SLOTS_FILE.name} removed")
+    elif snap.get("current_slot"):
+        # Legacy snapshot fallback.
+        try:
+            slots_state = load_slots(required=False)
+            if slots_state.get("current") != snap["current_slot"]:
+                slots_state["current"] = snap["current_slot"]
+                if snap.get("app_history_slot"):
+                    slots_state["app_history_slot"] = snap["app_history_slot"]
+                save_slots(slots_state)
+                restored.append(f"current → {snap['current_slot']}")
+        except OSError as exc:
+            warnings.append(f"could not revert slot pointer: {exc}")
+    baseline_paths = set(snap.get("managed_existing_paths") or [])
+    for path in collect_slot_auth_paths(post_slots_state):
+        if path_key(path) not in baseline_paths and path_present(path):
+            if not is_within(path, CODEX_HOME):
+                warnings.append(f"created slot auth outside CODEX_HOME was NOT removed: {path}")
+                continue
+            try:
+                safe_unlink_file(path)
+                restored.append(f"{path.name} removed")
+            except SystemExit as exc:
+                warnings.append(f"created slot auth was NOT removed: {path}: {exc}")
+    for path in collect_slot_profile_paths(post_slots_state):
+        if path_key(path) not in baseline_paths and path_present(path):
+            try:
+                safe_remove_profile_dir(path)
+                restored.append(f"{path.name} removed")
+            except SystemExit as exc:
+                warnings.append(f"created profile was NOT removed: {path}: {exc}")
+    # Reverse-apply rollout provider tag changes (in-place edits to rollout
+    # JSONLs). Without this, codex.app's session sidebar filters by stale
+    # provider tag and "loses" history visible-but-not-deleted.
+    rollout_audit = backup_dir / "rollout-provider-changes.jsonl"
+    if rollout_audit.exists():
+        roll_stats = restore_rollouts_from_audit(rollout_audit)
+        if roll_stats["reverted"]:
+            restored.append(
+                f"rollout headers ← {rollout_audit.name} "
+                f"(reverted {roll_stats['reverted']}/{roll_stats['scanned']})"
+            )
+        if roll_stats["errors"]:
+            warnings.append(
+                f"rollout revert had {roll_stats['errors']} error(s) — "
+                f"some session_meta tags may still show post-switch provider"
+            )
+        if roll_stats["missing"]:
+            warnings.append(
+                f"{roll_stats['missing']} rollout file(s) gone since switch; cannot revert tags"
+            )
+    for w in warnings:
+        print(f"⚠️  {w}", file=sys.stderr)
     if not restored:
         print("没有可恢复的项 (snapshot 为空)")
         return 1
@@ -897,29 +1438,60 @@ def restore_from_backup(backup_dir: Path) -> int:
     for r in restored:
         print(f"  · {r}")
     print(f"  备份来源: {backup_dir}")
-    return 0
+    return 1 if warnings else 0
 
 
-def cmd_switch(name: str, *, no_restart: bool = False, dry_run: bool = False) -> int:
-    ensure_initialized()
-    data = load_slots()
-    slots = data.get("slots", {})
-    target_slot = resolve_slot(name, slots)
-    cfg = slots[target_slot]
-    mode = cfg.get("mode", "oauth")
-    if mode not in ("oauth", "relay"):
-        fail(f"slot {target_slot!r} has invalid mode {mode!r}")
+def auto_rollback_after_failure(backup_dir: Path | None, context: str) -> None:
+    if not backup_dir:
+        return
+    snap_path = backup_dir / SNAPSHOT_FILENAME
+    if not snap_path.exists():
+        return
+    marker = backup_dir / AUTO_ROLLBACK_MARKER
+    if marker.exists():
+        return
+    print(f"  {context}失败，正在自动回滚到配置前状态…", file=sys.stderr)
+    try:
+        rc = restore_from_backup(backup_dir)
+    except BaseException as exc:
+        print(f"  自动回滚失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    try:
+        marker.write_text(f"rc={rc} time={int(time.time())}\n")
+        os.chmod(marker, 0o600)
+    except OSError:
+        pass
+    if rc == 0:
+        print("  自动回滚完成", file=sys.stderr)
+    else:
+        print(f"  自动回滚完成但有警告 (rc={rc})", file=sys.stderr)
 
+
+def cmd_switch(
+    name: str,
+    *,
+    no_restart: bool = False,
+    dry_run: bool = False,
+    backup_dir: Path | None = None,
+    recover_missing_oauth_auth: bool = True,
+) -> int:
     if dry_run:
+        # Read-only; no lock needed. Computed from a one-shot snapshot.
+        data = load_slots()
+        slots = data.get("slots", {})
+        target_slot = resolve_slot(name, slots)
+        cfg = slots[target_slot]
+        mode = cfg.get("mode", "oauth")
+        if mode not in ("oauth", "relay"):
+            fail(f"slot {target_slot!r} has invalid mode {mode!r}")
         plan = compute_switch_plan(data, target_slot)
         print_switch_plan(plan)
         return 0
 
-    if slot_is_clean(data, target_slot):
-        print(f"当前已是：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
-        print("  无需修改；Codex App 未重启")
-        return 0
-
+    # Acquire lock BEFORE reasoning about state, so a second invocation
+    # entering at the same time re-loads inside the lock and sees the
+    # committed result of the first. (The old order load→clean-check→lock
+    # could act on stale data.)
     try:
         lock_ctx = Sub2cliLock()
         lock_ctx.__enter__()
@@ -927,8 +1499,26 @@ def cmd_switch(name: str, *, no_restart: bool = False, dry_run: bool = False) ->
         fail(str(exc), code=4)
         return 4
     try:
-        backup_dir = new_backup_dir(f"switch-to-{target_slot}")
-        snapshot_pre_switch(backup_dir)
+        ensure_initialized()
+        data = load_slots()
+        slots = data.get("slots", {})
+        target_slot = resolve_slot(name, slots)
+        cfg = slots[target_slot]
+        mode = cfg.get("mode", "oauth")
+        if mode not in ("oauth", "relay"):
+            fail(f"slot {target_slot!r} has invalid mode {mode!r}")
+
+        if slot_is_clean(data, target_slot):
+            print(f"当前已是：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
+            print("  无需修改；Codex App 未重启")
+            return 0
+
+        printed_rollback = False
+        if backup_dir is None:
+            backup_dir = new_backup_dir(f"switch-to-{target_slot}")
+            snapshot_pre_switch(backup_dir)
+            print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
+            printed_rollback = True
 
         if not no_restart:
             quit_codex()
@@ -937,6 +1527,21 @@ def cmd_switch(name: str, *, no_restart: bool = False, dry_run: bool = False) ->
         profile_target = history_profile_target(data, target_slot)
         auth_target.parent.mkdir(parents=True, exist_ok=True)
         profile_target.mkdir(parents=True, exist_ok=True)
+
+        # Before switching, flush the live AUTH_JSON content back to the
+        # previous slot's auth_file, so any in-flight OAuth refresh tokens
+        # written by codex CLI/App since the last switch aren't lost.
+        previous = data.get("current")
+        if previous and previous != target_slot:
+            prev_cfg = data.get("slots", {}).get(previous) or {}
+            prev_auth = Path(prev_cfg.get("auth_file", "")).expanduser()
+            prev_mode = prev_cfg.get("mode", "oauth")
+            # Only flush for oauth — relay's API-key JSON is static and rewritten below.
+            if prev_mode == "oauth" and prev_auth and str(prev_auth):
+                try:
+                    flush_auth_to_slot(prev_auth)
+                except OSError:
+                    pass
 
         if mode == "relay":
             api_key = str(cfg.get("api_key") or "").strip()
@@ -948,18 +1553,47 @@ def cmd_switch(name: str, *, no_restart: bool = False, dry_run: bool = False) ->
         else:
             patch_config(mode="oauth", model=cfg.get("model", DEFAULT_MODEL))
 
-        atomic_symlink(AUTH_JSON, auth_target)
+        # Install target slot's auth as the live AUTH_JSON (real file).
+        # Cases:
+        #   1. auth_target exists → copy it onto AUTH_JSON.
+        #   2. auth_target missing BUT current AUTH_JSON looks like a valid
+        #      oauth token → promote it into auth_target (recover from a
+        #      manually-deleted slot file without losing the live login).
+        #   3. otherwise → clear AUTH_JSON so codex CLI sees ENOENT and
+        #      prompts the user to `codex login` for this slot.
+        if auth_target.exists():
+            copy_auth_atomic(auth_target)
+        else:
+            cur = read_auth_bytes()
+            recovered = False
+            if cur and len(cur) >= 1000 and mode == "oauth" and recover_missing_oauth_auth:
+                try:
+                    parsed = json.loads(cur)
+                    if parsed.get("auth_mode") != "apikey":
+                        auth_target.parent.mkdir(parents=True, exist_ok=True)
+                        auth_target.write_bytes(cur)
+                        os.chmod(auth_target, 0o600)
+                        # AUTH_JSON already holds the right content; no overwrite needed.
+                        recovered = True
+                        print(f"  ↳ 自当前 auth.json 恢复 oauth token 到 {auth_target}")
+                except (ValueError, json.JSONDecodeError):
+                    pass
+            if not recovered:
+                if AUTH_JSON.exists() or AUTH_JSON.is_symlink():
+                    AUTH_JSON.unlink()
         atomic_symlink(APP_PROFILE, profile_target)
-        session_stats = normalize_sessions_if_needed(slot_thread_provider(cfg))
+        session_stats = normalize_sessions_if_needed(slot_thread_provider(cfg), backup_dir=backup_dir)
 
-        previous = data.get("current")
         data["current"] = target_slot
         data.setdefault("app_history_slot", target_slot)
         save_slots(data)
 
         verb = "已修复当前渠道" if previous == target_slot else "已切换到"
         print(f"{verb}：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
-        print(f"  auth.json   -> {auth_target}")
+        if AUTH_JSON.exists():
+            print(f"  auth.json   <- {auth_target}")
+        else:
+            print(f"  auth.json   已清空；等待 `codex login` 写入 {auth_target}")
         print(f"  App profile -> {profile_target}（历史保留）")
         if mode == "relay":
             print(f"  base_url    -> {cfg.get('base_url')}")
@@ -972,8 +1606,12 @@ def cmd_switch(name: str, *, no_restart: bool = False, dry_run: bool = False) ->
             print("  Codex App 已重新打开")
         else:
             print("  --no-restart：Codex App 未重新打开")
-        print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
+        if not printed_rollback:
+            print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
         return 0
+    except BaseException:
+        auto_rollback_after_failure(backup_dir, "切换")
+        raise
     finally:
         lock_ctx.__exit__(None, None, None)
 
@@ -990,7 +1628,6 @@ def cmd_relay(
     no_restart: bool = False,
     dry_run: bool = False,
 ) -> int:
-    ensure_initialized()
     base_url = normalize_base_url(base_url)
     api_key = api_key.strip()
     if not api_key:
@@ -1033,42 +1670,96 @@ def cmd_relay(
         print_switch_plan(compute_switch_plan(simulated, slot))
         return 0
 
-    data = load_slots()
-    slots = data.setdefault("slots", {})
-    existing = slots.get(slot)
-    if existing and existing.get("mode") != "relay":
-        fail(f"渠道 {slot!r} 已存在，但不是 API 渠道")
+    with Sub2cliLock():
+        backup_dir = new_backup_dir(f"add-api-{slot}")
+        snapshot_pre_switch(backup_dir)
+        print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
+        try:
+            ensure_initialized()
 
-    slots[slot] = {
-        "display_name": display or (existing or {}).get("display_name") or f"Codex - {slot} relay",
-        "mode": "relay",
-        "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
-        "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
-        "base_url": base_url,
-        "model": model,
-        "api_key": api_key,
-    }
-    save_slots(data)
-    print(f"{'已更新' if existing else '已添加'} API 渠道：{slot}")
-    print(f"  base_url: {base_url}")
-    print(f"  model:    {model}")
+            data = load_slots()
+            slots = data.setdefault("slots", {})
+            existing = slots.get(slot)
+            if existing and existing.get("mode") != "relay":
+                fail(f"渠道 {slot!r} 已存在，但不是 API 渠道")
 
-    if no_switch:
-        print(f"  稍后切换：codex-provider use {slot}")
-        return 0
-    return cmd_switch(slot, no_restart=no_restart)
+            slots[slot] = {
+                "display_name": display or (existing or {}).get("display_name") or f"Codex - {slot} relay",
+                "mode": "relay",
+                "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
+                "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+                "base_url": base_url,
+                "model": model,
+                "api_key": api_key,
+            }
+            save_slots(data)
+            print(f"{'已更新' if existing else '已添加'} API 渠道：{slot}")
+            print(f"  base_url: {base_url}")
+            print(f"  model:    {model}")
+
+            if no_switch:
+                print(f"  稍后切换：codex-provider use {slot}")
+                print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
+                return 0
+            return cmd_switch(slot, no_restart=no_restart, backup_dir=backup_dir)
+        except BaseException:
+            auto_rollback_after_failure(backup_dir, "配置 API 渠道")
+            raise
+
+
+def read_api_key_secure(*, from_stdin: bool) -> str:
+    if from_stdin or not sys.stdin.isatty():
+        return sys.stdin.read().strip()
+    if sys.stdout.isatty():
+        return getpass.getpass("API key（隐藏输入）: ").strip()
+    return ""
+
+
+def reject_positional_api_key(argv: list[str]) -> None:
+    """Reject legacy `add-api <url> <key>` before argparse can echo the key."""
+    value_options = {"--name", "--slot", "--model", "--display"}
+    positionals = 0
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            positionals += max(0, len(argv) - i - 1)
+            break
+        if arg.startswith("--"):
+            name = arg.split("=", 1)[0]
+            if name in value_options and "=" not in arg:
+                i += 2
+                continue
+            i += 1
+            continue
+        positionals += 1
+        if positionals >= 2:
+            fail("出于安全原因，API key 不能作为命令行参数传入；请使用 --api-key-stdin 或交互式隐藏输入")
+        i += 1
 
 
 def cmd_oauth(
     slot: str,
     *,
     display: str | None = None,
+    auth_file: str | None = None,
     no_switch: bool = False,
     no_restart: bool = False,
     dry_run: bool = False,
 ) -> int:
-    ensure_initialized()
     slot = validate_slot(slot)
+    auth_source = Path(auth_file).expanduser() if auth_file else None
+    if auth_source and not auth_source.exists():
+        fail(f"auth file not found: {auth_source}")
+    if auth_source:
+        try:
+            parsed = json.loads(auth_source.read_text())
+        except Exception as exc:
+            fail(f"auth file is not valid JSON: {exc}")
+        if parsed.get("auth_mode") == "apikey":
+            fail(f"auth file is API-key auth, not a Codex OAuth account: {auth_source}")
+        if not decode_auth_email(auth_source):
+            fail(f"auth file does not contain a readable Codex account email: {auth_source}")
 
     if dry_run:
         existing_data = load_slots(required=False)
@@ -1092,29 +1783,65 @@ def cmd_oauth(
         print_switch_plan(compute_switch_plan(simulated, slot))
         return 0
 
-    data = load_slots()
-    slots = data.setdefault("slots", {})
-    existing = slots.get(slot)
-    if existing and existing.get("mode") != "oauth":
-        fail(f"渠道 {slot!r} 已存在，但不是账号渠道")
+    with Sub2cliLock():
+        backup_dir = new_backup_dir(f"add-account-{slot}")
+        snapshot_pre_switch(backup_dir)
+        print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
+        try:
+            ensure_initialized()
 
-    slots[slot] = {
-        "display_name": display or (existing or {}).get("display_name") or f"Codex - {slot}",
-        "mode": "oauth",
-        "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
-        "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
-    }
-    save_slots(data)
-    print(f"{'已更新' if existing else '已添加'}账号渠道：{slot}")
-    if no_switch:
-        print(f"  稍后切换：codex-provider use {slot}")
-        print("  切过去后运行：codex login")
-        return 0
-    rc = cmd_switch(slot, no_restart=no_restart)
-    auth_target = Path(slots[slot]["auth_file"]).expanduser()
-    if not auth_target.exists() or auth_target.stat().st_size < 10:
-        print("  下一步：运行 `codex login`，登录这个账号")
-    return rc
+            data = load_slots()
+            slots = data.setdefault("slots", {})
+            existing = slots.get(slot)
+            if existing and existing.get("mode") != "oauth":
+                fail(f"渠道 {slot!r} 已存在，但不是账号渠道")
+            auth_target = CODEX_HOME / f"auth.{slot}.json"
+            if auth_source:
+                existing_email = decode_auth_email(Path(existing.get("auth_file", "")).expanduser()) if existing else None
+                source_email = decode_auth_email(auth_source)
+                if existing_email and source_email and existing_email.lower() != source_email.lower():
+                    fail(f"渠道 {slot!r} 已属于 {existing_email}, 不能覆盖为 {source_email}")
+                if auth_source.resolve(strict=False) != auth_target.resolve(strict=False):
+                    auth_target.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = auth_target.with_name(f"{auth_target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+                    try:
+                        tmp.write_bytes(auth_source.read_bytes())
+                        os.chmod(tmp, 0o600)
+                        os.replace(tmp, auth_target)
+                    except Exception:
+                        if tmp.exists() or tmp.is_symlink():
+                            try:
+                                tmp.unlink()
+                            except OSError:
+                                pass
+                        raise
+
+            slots[slot] = {
+                "display_name": display or (existing or {}).get("display_name") or f"Codex - {slot}",
+                "mode": "oauth",
+                "auth_file": str(auth_target),
+                "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+            }
+            save_slots(data)
+            print(f"{'已更新' if existing else '已添加'}账号渠道：{slot}")
+            if no_switch:
+                print(f"  稍后切换：codex-provider use {slot}")
+                print("  切过去后运行：codex login")
+                print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
+                return 0
+            rc = cmd_switch(
+                slot,
+                no_restart=no_restart,
+                backup_dir=backup_dir,
+                recover_missing_oauth_auth=auth_source is not None,
+            )
+            auth_target = Path(slots[slot]["auth_file"]).expanduser()
+            if not auth_target.exists() or auth_target.stat().st_size < 10:
+                print("  下一步：运行 `codex login`，登录这个账号")
+            return rc
+        except BaseException:
+            auto_rollback_after_failure(backup_dir, "配置账号渠道")
+            raise
 
 
 def cmd_list() -> int:
@@ -1147,7 +1874,15 @@ def cmd_status() -> int:
     provider = slot_thread_provider(cfg)
     print(f"当前渠道：{cfg.get('display_name', current)} ({current}) [{cfg.get('mode', 'oauth')}]")
     print(f"  渠道文件:    {SLOTS_FILE}")
-    print(f"  auth.json:   {'-> ' + os.readlink(AUTH_JSON) if AUTH_JSON.is_symlink() else str(AUTH_JSON)}")
+    if AUTH_JSON.is_symlink():
+        # Legacy: leftover symlink from pre-schema-2 install.
+        print(f"  auth.json:   -> {os.readlink(AUTH_JSON)} (legacy symlink)")
+    elif AUTH_JSON.exists():
+        cur_auth_file = Path(cfg.get("auth_file", "")).expanduser()
+        match = "matches" if auth_content_equals(cur_auth_file) else "diverged"
+        print(f"  auth.json:   {AUTH_JSON} ({AUTH_JSON.stat().st_size} bytes, {match} {cur_auth_file.name})")
+    else:
+        print(f"  auth.json:   {AUTH_JSON} (missing)")
     print(f"  App profile: {'-> ' + os.readlink(APP_PROFILE) if APP_PROFILE.is_symlink() else str(APP_PROFILE)}")
     print(f"  App 运行中:  {'是' if codex_running() else '否'}")
     counts = thread_provider_counts()
@@ -1162,6 +1897,12 @@ def cmd_status() -> int:
 
 
 def cmd_remove(slot: str, *, hard: bool = False) -> int:
+    if Sub2cliLock._depth == 0:
+        try:
+            with Sub2cliLock():
+                return cmd_remove(slot, hard=hard)
+        except LockBusy as exc:
+            fail(str(exc), code=4)
     data = load_slots()
     slot = resolve_slot(slot, data.get("slots", {}))
     if slot == data.get("current"):
@@ -1186,6 +1927,12 @@ def cmd_remove(slot: str, *, hard: bool = False) -> int:
 
 
 def cmd_normalize_sessions(target: str | None, *, dry_run: bool) -> int:
+    if not dry_run and Sub2cliLock._depth == 0:
+        try:
+            with Sub2cliLock():
+                return cmd_normalize_sessions(target, dry_run=dry_run)
+        except LockBusy as exc:
+            fail(str(exc), code=4)
     if target in (None, "", "current"):
         data = load_slots()
         current = data.get("current")
@@ -1577,8 +2324,9 @@ def run_internal_command(command: str, argv: list[str]) -> int:
         return cmd_list()
 
     if command == "relay":
+        reject_positional_api_key(argv)
         parser.add_argument("base_url")
-        parser.add_argument("api_key")
+        parser.add_argument("--api-key-stdin", action="store_true")
         parser.add_argument("--slot")
         parser.add_argument("--model", default=DEFAULT_MODEL)
         parser.add_argument("--display")
@@ -1586,9 +2334,12 @@ def run_internal_command(command: str, argv: list[str]) -> int:
         parser.add_argument("--no-switch", action="store_true")
         parser.add_argument("--no-restart", action="store_true")
         args = parser.parse_args(argv)
+        api_key = read_api_key_secure(from_stdin=args.api_key_stdin)
+        if not api_key:
+            fail("API key 不能为空；请用 --api-key-stdin 从 stdin 传入，或在交互终端隐藏输入")
         return cmd_relay(
             args.base_url,
-            args.api_key,
+            api_key,
             slot=args.slot,
             model=args.model,
             display=args.display,
@@ -1600,12 +2351,14 @@ def run_internal_command(command: str, argv: list[str]) -> int:
     if command == "oauth":
         parser.add_argument("slot")
         parser.add_argument("--display")
+        parser.add_argument("--auth-file")
         parser.add_argument("--no-switch", action="store_true")
         parser.add_argument("--no-restart", action="store_true")
         args = parser.parse_args(argv)
         return cmd_oauth(
             args.slot,
             display=args.display,
+            auth_file=args.auth_file,
             no_switch=args.no_switch,
             no_restart=args.no_restart,
         )
@@ -1658,6 +2411,8 @@ def main(argv: list[str] | None = None) -> int:
     }
     if argv and argv[0] in internal_commands:
         return run_internal_command(argv[0], argv[1:])
+    if argv and argv[0] == "add-api":
+        reject_positional_api_key(argv[1:])
 
     parser = argparse.ArgumentParser(
         prog="codex-provider",
@@ -1670,7 +2425,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_add_api = sub.add_parser("add-api", help="添加 API key 渠道，并切过去")
     p_add_api.add_argument("base_url")
-    p_add_api.add_argument("api_key")
+    p_add_api.add_argument("--api-key-stdin", action="store_true")
     p_add_api.add_argument("--name", "--slot", dest="slot")
     p_add_api.add_argument("--model", default=DEFAULT_MODEL)
     p_add_api.add_argument("--display")
@@ -1683,6 +2438,8 @@ def main(argv: list[str] | None = None) -> int:
     p_add_account = sub.add_parser("add-account", help="添加 Codex 登录账号，并切过去")
     p_add_account.add_argument("name")
     p_add_account.add_argument("--display")
+    p_add_account.add_argument("--auth-file",
+                               help="从已有 Codex OAuth auth.json 导入账号登录文件")
     p_add_account.add_argument("--no-switch", action="store_true")
     p_add_account.add_argument("--no-restart", action="store_true")
     p_add_account.add_argument("--dry-run", action="store_true",
@@ -1713,9 +2470,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list":
         return cmd_list()
     if args.command == "add-api":
+        api_key = read_api_key_secure(from_stdin=args.api_key_stdin)
+        if not api_key:
+            fail("API key 不能为空；请用 --api-key-stdin 从 stdin 传入，或在交互终端隐藏输入")
         return cmd_relay(
             args.base_url,
-            args.api_key,
+            api_key,
             slot=args.slot,
             model=args.model,
             display=args.display,
@@ -1728,6 +2488,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_oauth(
             args.name,
             display=args.display,
+            auth_file=args.auth_file,
             no_switch=args.no_switch,
             no_restart=args.no_restart,
             dry_run=args.dry_run,
@@ -1741,4 +2502,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("已取消", file=sys.stderr)
+        raise SystemExit(130)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"错误：{type(exc).__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(1)

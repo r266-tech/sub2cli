@@ -15,21 +15,35 @@
       <span class="brand-name">sub2cli</span>
       <span class="version-chip" id="app-version" title="当前版本">v…</span>
     </div>
+    <button class="btn-update hidden" id="btn-update" title="更新 sub2cli" aria-label="更新 sub2cli">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M8 12.5V3.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+        <path d="M4.7 6.8 8 3.5l3.3 3.3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
     <button class="btn-sidebar-toggle" id="btn-sidebar-toggle" title="收起 / 展开侧边栏" aria-label="toggle sidebar">
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
         <rect x="1.5" y="2.5" width="13" height="11" rx="2.5" stroke="currentColor" stroke-width="1.3"/>
         <line x1="5.5" y1="2.8" x2="5.5" y2="13.2" stroke="currentColor" stroke-width="1.3"/>
       </svg>
     </button>
-    <div class="brand-subtitle" id="brand-subtitle">
-      <span class="status-dot"></span>
-      <span id="brand-subtitle-text">bootstrap...</span>
-    </div>
   </div>
   <div class="header-actions">
+    <button class="btn-action btn-config-top" id="btn-inject" title="选择配置到 Codex 的目标">⚡ 配置 Codex</button>
     <div class="dropdown account-anchor">
       <button class="btn-action" id="btn-account" title="账号">👤 <span id="account-email">未设</span> <span style="font-size: 8px;">▼</span></button>
       <div class="account-pop hidden" id="account-pop">
+        <div class="account-context" id="account-context">
+          <div class="account-context-row">
+            <span>当前中转</span>
+            <strong id="pop-current-relay">—</strong>
+          </div>
+          <div class="account-context-row">
+            <span>当前官方账号</span>
+            <strong id="pop-current-codex">—</strong>
+          </div>
+        </div>
+        <div class="pop-title">中转账号</div>
         <div class="pop-list" id="account-list">
           <div class="muted small">加载中…</div>
         </div>
@@ -54,16 +68,25 @@
 <div class="workspace">
 
   <aside>
-    <div>
+    <div class="sidebar-zone relay-zone">
       <div class="sidebar-section-title">
         <span>中转</span>
-        <span class="sidebar-active-label">● ACTIVE</span>
+        <button class="sidebar-title-action" id="btn-add-relay" type="button" title="添加中转">[+]</button>
       </div>
       <div class="relay-list" id="sidebar-list">
         <div class="muted small">载入中…</div>
       </div>
     </div>
-    <button class="btn-add-relay" id="btn-add-relay" type="button">+ 新增中转</button>
+    <div class="sidebar-resizer" id="sidebar-resizer" role="separator" aria-orientation="horizontal" aria-label="调整列表高度" tabindex="0"></div>
+    <div class="sidebar-zone official-zone">
+      <div class="sidebar-section-title">
+        <span>官号列表</span>
+        <button class="sidebar-title-action" id="btn-add-codex-account" type="button" title="添加官方账号">[+]</button>
+      </div>
+      <div class="codex-account-list" id="codex-account-list">
+        <div class="muted small">载入中…</div>
+      </div>
+    </div>
   </aside>
 
   <main>
@@ -87,12 +110,12 @@
 
     <section id="dashboard" class="screen hidden">
 
+      <div class="relay-dashboard" id="relay-dashboard">
       <div class="cards-row">
 
         <div class="card" id="card-account">
           <div class="card-header">
             <div class="card-title">👥 账号</div>
-            <span class="badge-label" id="acc-status-badge">—</span>
           </div>
           <div class="card-grid">
             <div class="grid-label">邮箱:</div>
@@ -125,6 +148,15 @@
           </div>
         </div>
 
+        <div class="card card-subscriptions" id="card-subscriptions">
+          <div class="card-header">
+            <div class="card-title">💳 我的订阅 <span class="subscription-count" id="subscription-count">0 ACTIVE</span></div>
+          </div>
+          <div class="subscription-list" id="subscription-list">
+            <div class="muted small">载入中…</div>
+          </div>
+        </div>
+
       </div>
 
       <div class="table-container">
@@ -137,7 +169,6 @@
         <table class="t-endpoints">
           <thead>
             <tr>
-              <th style="width: 80px;">状态</th>
               <th>名称</th>
               <th>URL</th>
               <th class="right">延迟</th>
@@ -151,15 +182,16 @@
       <div class="table-container">
         <div class="table-header">
           <div class="table-title">📊 分组</div>
-          <div class="table-action-group">
-            <button class="btn-action" id="btn-toggle-all-groups">全选</button>
-            <button class="btn-action" id="btn-test-selected-groups" disabled>测试选中 (0)</button>
+          <div class="table-action-group group-action-group">
+            <span class="group-selection-summary" id="group-selection-summary">已选 0</span>
+            <button class="btn-action" id="btn-toggle-all-groups" type="button" disabled>全选</button>
+            <button class="btn-action" id="btn-test-selected-groups" disabled>测试</button>
           </div>
         </div>
         <table class="t-groups">
           <thead>
             <tr>
-              <th class="checkbox-col">☐</th>
+              <th class="checkbox-col" aria-label="选择"></th>
               <th>倍率</th>
               <th>名称</th>
               <th class="right">gpt-5.5</th>
@@ -172,8 +204,71 @@
       </div>
 
       <footer>
-        <button class="btn-primary primary big" id="btn-inject">⚡ 注入 Codex</button>
+        <button class="btn-primary primary big" id="btn-save-config">保存配置</button>
       </footer>
+      </div>
+
+      <div class="official-dashboard hidden" id="official-dashboard">
+        <div class="codexbar-card official-console">
+          <div class="official-head">
+            <div class="official-title-row">
+              <span class="official-tag">[SYS]</span>
+              <span class="official-title">CODEX_OFFICIAL</span>
+              <span class="official-state"><span class="official-dot"></span>[READY]</span>
+            </div>
+            <div class="official-updated" id="official-updated">Updated —</div>
+          </div>
+
+          <div class="official-console-body">
+            <section class="official-meta-block">
+              <div class="official-section-label">[ACCOUNT]</div>
+              <div class="official-detail-grid">
+                <span>EMAIL</span>
+                <strong class="official-email" id="official-email">—</strong>
+                <span>PLAN</span>
+                <strong class="official-plan" id="official-plan">—</strong>
+                <span>SLOT</span>
+                <strong id="official-slot">—</strong>
+                <span>AUTH</span>
+                <strong id="official-auth">—</strong>
+                <span>PROFILE</span>
+                <strong id="official-profile">—</strong>
+              </div>
+            </section>
+
+            <section class="official-telemetry">
+              <div class="official-section-label">[TELEMETRY]</div>
+              <div class="usage-section">
+                <div class="usage-title">
+                  <span>[SESSION]</span>
+                  <strong id="session-left">—</strong>
+                </div>
+                <div class="usage-bar" aria-hidden="true"><span id="session-used-bar" style="width: 0%;"></span></div>
+                <div class="usage-grid">
+                  <div><strong id="session-reserve">—</strong><span>USED</span></div>
+                  <div class="right"><strong id="session-reset">—</strong><span>RESET</span></div>
+                </div>
+              </div>
+              <div class="usage-section">
+                <div class="usage-title">
+                  <span>[WEEKLY]</span>
+                  <strong id="weekly-left">—</strong>
+                </div>
+                <div class="usage-bar weekly" aria-hidden="true"><span id="weekly-used-bar" style="width: 0%;"></span></div>
+                <div class="usage-grid">
+                  <div><strong id="weekly-deficit">—</strong><span>USED</span></div>
+                  <div class="right"><strong id="weekly-reset">—</strong><span>RESET</span></div>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <div class="official-console-footer">
+            <div class="usage-source" id="official-usage-source">[INFO] 读取 Codex app-server 中…</div>
+            <button class="btn-primary primary official-use-btn" id="btn-use-official">保存配置</button>
+          </div>
+        </div>
+      </div>
 
     </section>
 
@@ -256,10 +351,65 @@
   </div>
 </div>
 
+<div class="modal-overlay hidden" id="config-target-modal">
+  <div class="modal-container" style="width: 680px;">
+    <div class="modal-title">
+      <span>⚡ 选择配置到 Codex</span>
+      <button class="link" id="btn-config-target-close" style="margin-left: auto;">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="config-choice-row">
+        <div>
+          <div class="config-choice-label">当前中转</div>
+          <div class="config-choice-value" id="choice-relay">—</div>
+          <div class="config-choice-meta" id="choice-relay-meta">使用保存好的中转 url + key</div>
+        </div>
+        <button class="btn-action primary" id="btn-config-relay">配置</button>
+      </div>
+      <div class="config-choice-row">
+        <div>
+          <div class="config-choice-label">当前官方账号</div>
+          <div class="config-choice-value" id="choice-codex">—</div>
+          <div class="config-choice-meta" id="choice-codex-meta">使用保存好的 Codex 官方账号</div>
+        </div>
+        <button class="btn-action primary" id="btn-config-official">配置</button>
+      </div>
+      <div class="config-result hidden" id="config-target-result" aria-live="polite"></div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="add-codex-account-modal">
+  <div class="modal-container" style="width: 520px;">
+    <div class="modal-title">
+      <span>➕ 新增 Codex 官方账号</span>
+      <button class="link" id="btn-add-codex-close" style="margin-left: auto;">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label>账号标识 <span class="required">*</span></label>
+        <input type="text" id="add-codex-slot" placeholder="work / personal / shanda" autocomplete="off" />
+      </div>
+      <div class="form-row">
+        <label>显示名称 <span class="optional">(可选)</span></label>
+        <input type="text" id="add-codex-display" placeholder="Codex - name@example.com" autocomplete="off" />
+      </div>
+      <div class="form-hint">
+        点击后会打开 Codex / OpenAI 登录流程。登录成功后账号会自动出现在官号列表；不会立即切换当前 Codex，点「选用」或顶部「配置 Codex」才会注入。
+      </div>
+      <div class="form-error hidden" id="add-codex-error"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-action" id="btn-add-codex-cancel">取消</button>
+      <button class="btn-action primary" id="btn-add-codex-submit">登录并添加</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay hidden" id="inject-modal">
   <div class="modal-container" style="width: 760px;">
     <div class="modal-title">
-      <span>⚙️ CODEX 注入计划</span>
+      <span>⚙️ CODEX 配置计划</span>
       <button class="link" id="btn-inject-close" style="margin-left: auto;">✕</button>
     </div>
     <div class="modal-scroll-wrap">
@@ -272,8 +422,8 @@
     </div>
     <div class="modal-actions">
       <button class="btn-action" id="btn-inject-cancel">取消</button>
-      <button class="btn-action danger hidden" id="btn-inject-undo" disabled>撤销本次注入</button>
-      <button class="btn-action" id="btn-inject-confirm" disabled style="background: var(--success-dim); color: var(--success); border-color: var(--success);">开始注入</button>
+      <button class="btn-action danger hidden" id="btn-inject-undo" disabled>撤销本次配置</button>
+      <button class="btn-action" id="btn-inject-confirm" disabled style="background: var(--success-dim); color: var(--success); border-color: var(--success);">开始配置</button>
     </div>
   </div>
 </div>

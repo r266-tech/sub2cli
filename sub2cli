@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""sub2cli — Sub2API 系列网关订阅 → Codex CLI 注入控制台。
+"""sub2cli — Sub2API 系列网关订阅 → Codex CLI 配置控制台。
 
 把任意 Sub2API 兼容网关 (codex2api.com / 其他自部署实例 等) 里的 key+url，
-一条命令注入到本机 Codex CLI / Codex App 用。
+一条命令配置到本机 Codex CLI / Codex App 用。
 
 用法:
     sub2cli                # 进入 REPL
     sub2cli --help
 
 REPL 菜单:
-    刷新 / 中转 / url / 分组 / 名称 / 兑换历史 / 注入 codex / 退出
+    刷新 / 中转 / url / 分组 / 名称 / 兑换历史 / 配置 codex / 退出
 
 鉴权: 从 Edge CDP (127.0.0.1:9222) 实时读 localStorage.auth_token；
       也支持 SUB2CLI_TOKEN 环境变量覆盖。
@@ -95,6 +95,11 @@ def _normalize_domain(value: str) -> str:
     return value
 
 
+def _api_base_for_domain(domain: str) -> str:
+    """Preserve scheme, port, and optional path prefix for self-hosted relays."""
+    return _normalize_domain(domain).rstrip("/") + "/api/v1"
+
+
 class Sub2Context:
     """单个 relay 的运行时上下文 — domain / token / 路径 一对一封装。
 
@@ -112,10 +117,11 @@ class Sub2Context:
         cdp_port: int | None = None,
     ) -> None:
         domain = _normalize_domain(domain)
-        host = urlparse(domain).hostname or domain.replace("https://", "").replace("http://", "")
+        parsed = urlparse(domain)
+        host = parsed.netloc or domain.replace("https://", "").replace("http://", "")
         self.domain = domain
         self.site = host
-        self.api_base = f"https://{host}/api/v1"
+        self.api_base = _api_base_for_domain(domain)
         self._token = token
         self.config_path = config_path or default_config_path()
         self.cdp_host = cdp_host or DEFAULT_CDP_HOST
@@ -227,6 +233,20 @@ class Sub2Context:
             if r.status_code == 200:
                 return r.json().get("data", []) or []
         except requests.RequestException:
+            pass
+        return []
+
+    def fetch_subscriptions(self) -> list[dict]:
+        try:
+            r = self._session.get(
+                f"{self.api_base}/subscriptions", headers=self._headers(), timeout=8
+            )
+            if r.status_code == 200:
+                data = r.json().get("data") or []
+                if isinstance(data, list):
+                    return data
+                return data.get("items", []) or []
+        except (requests.RequestException, ValueError, AttributeError):
             pass
         return []
 
@@ -460,9 +480,10 @@ def collect_endpoints(settings: dict, fallback_site: str = "") -> list[dict]:
             "description": c.get("description", ""),
         })
     if not eps and fallback_site:
+        fallback = fallback_site if re.match(r"^https?://", fallback_site) else f"https://{fallback_site}"
         eps.append({
             "name": "默认",
-            "endpoint": normalize_v1(f"https://{fallback_site}"),
+            "endpoint": normalize_v1(fallback),
             "description": "域名 fallback",
         })
     return eps
@@ -506,7 +527,7 @@ def ensure_defaults(
                 print(color("    ✗ 自动创建 key 失败 (POST /keys 没成功)", C_YELLOW))
 
     settings = ctx.fetch_settings() or {}
-    eps = collect_endpoints(settings, fallback_site=ctx.site)
+    eps = collect_endpoints(settings, fallback_site=ctx.domain)
 
     dk_name = cfg.get("default_key_name", "")
     default_key = find_key_by_name(keys, dk_name) if dk_name else None
@@ -699,7 +720,7 @@ def print_banner(
             color("  名称:    ", C_DIM) + color(default_key.get("name", "?"), C_CYAN)
             + color(f"  ·  分组 {gname} ({rate_s})", C_DIM)
         )
-        print(color("  apikey:  ", C_DIM) + default_key.get("key", ""))
+        print(color("  apikey:  ", C_DIM) + mask_key(default_key.get("key", "")))
         if default_ep:
             ep_name = default_ep.get("name", "?")
             ep_suffix = f"  ({ep_name})" if ep_name and ep_name != "默认" else ""
@@ -759,7 +780,7 @@ def cmd_endpoints(ctx: Sub2Context, cfg: dict) -> dict:
     if not settings:
         print(color("  （无法读 settings/public）", C_RED))
         return cfg
-    eps = collect_endpoints(settings, fallback_site=ctx.site)
+    eps = collect_endpoints(settings, fallback_site=ctx.domain)
     if not eps:
         print(color("  （无端点配置）", C_YELLOW))
         return cfg
@@ -841,7 +862,7 @@ def cmd_groups(ctx: Sub2Context, cfg: dict) -> dict:
         if gid is not None:
             keys_by_group.setdefault(gid, []).append(k)
 
-    ep_url = cfg.get("default_endpoint_url") or f"https://{ctx.site}/v1"
+    ep_url = cfg.get("default_endpoint_url") or normalize_v1(ctx.domain)
     default_key_name = cfg.get("default_key_name", "")
     default_key = find_key_by_name(keys, default_key_name)
     if not default_key:
@@ -970,7 +991,7 @@ def cmd_key(ctx: Sub2Context, cfg: dict, arg: str | None) -> dict:
         print(color(f"  ✓ 默认 key → {match['name']}", C_GREEN))
         return cfg
 
-    ep_url = cfg.get("default_endpoint_url") or f"https://{ctx.site}/v1"
+    ep_url = cfg.get("default_endpoint_url") or normalize_v1(ctx.domain)
     print(color(f"测试每把 key (GET {ep_url}/models):", C_BOLD))
     cur_idx = 1
     results: list[tuple[dict, dict]] = []
@@ -1051,30 +1072,46 @@ def _resolve_inject_bin() -> str | None:
     return next((p for p in candidates if p and os.path.isfile(p) and os.access(p, os.X_OK)), None)
 
 
+def _inject_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    for key in list(env):
+        if key.startswith("_PYI_"):
+            env.pop(key, None)
+    return env
+
+
 def _run_inject(inject_bin: str, url: str, api_key: str, source_label: str) -> None:
-    print(color("注入 codex:", C_BOLD))
+    print(color("配置 codex:", C_BOLD))
     print(f"  url:     {url}")
-    print(f"  apikey:  {api_key}")
+    print(f"  apikey:  {mask_key(api_key)}")
     print(f"  来源:    {source_label}")
-    print(color(f"  调用:    {inject_bin} add-api <url> <key>", C_DIM))
+    print(color(f"  调用:    {inject_bin} add-api <url> --api-key-stdin", C_DIM))
     print()
     try:
-        rc = subprocess.call([sys.executable, inject_bin, "add-api", url, api_key])
-    except OSError as exc:
-        print(color(f"  调用注入器失败: {exc}", C_RED))
+        proc = subprocess.run(
+            [inject_bin, "add-api", url, "--api-key-stdin"],
+            input=api_key,
+            text=True,
+            env=_inject_subprocess_env(),
+            timeout=300,
+        )
+        rc = proc.returncode
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(color(f"  调用配置器失败: {exc}", C_RED))
         return
     if rc == 0:
-        print(color("  ✓ 注入完成", C_GREEN))
+        print(color("  ✓ 配置完成", C_GREEN))
     else:
-        print(color(f"  ✗ 注入器返回非零 (rc={rc})", C_RED))
+        print(color(f"  ✗ 配置器返回非零 (rc={rc})", C_RED))
 
 
 def cmd_inject_codex(ctx: Sub2Context, cfg: dict) -> None:
-    """注入到 Codex CLI / Codex App: 用当前配置 或 临时输入新的 url+apikey."""
+    """配置到 Codex CLI / Codex App: 用当前配置 或 临时输入新的 url+apikey."""
     inject_bin = _resolve_inject_bin()
     if not inject_bin:
         here = os.path.dirname(os.path.abspath(__file__))
-        print(color("  缺少注入器脚本 sub2cli-inject (应跟 sub2cli 同目录):", C_RED))
+        print(color("  缺少配置器脚本 sub2cli-inject (应跟 sub2cli 同目录):", C_RED))
         print(color(f"    预期位置: {os.path.join(here, 'sub2cli-inject')}", C_DIM))
         return
 
@@ -1088,10 +1125,10 @@ def cmd_inject_codex(ctx: Sub2Context, cfg: dict) -> None:
         _keys = ctx.fetch_keys()
         _k = find_key_by_name(_keys, cfg["default_key_name"])
         if _k and _k.get("key"):
-            cur_apikey = _k["key"]
+            cur_apikey = mask_key(_k["key"])
 
     def sub_banner() -> None:
-        print(color("注入 codex — 选择来源", C_BOLD + C_CYAN))
+        print(color("配置 codex — 选择来源", C_BOLD + C_CYAN))
         cur_url = cfg.get("default_endpoint_url") or "(空)"
         print(color(f"  当前 url:    {cur_url}", C_DIM))
         print(color(f"  当前 apikey: {cur_apikey}", C_DIM))
@@ -1338,7 +1375,7 @@ def run_wizard(
     print()
     print(color("[5/5] 选择默认端点", C_BOLD))
     settings = ctx.fetch_settings() or {}
-    eps = collect_endpoints(settings, fallback_site=ctx.site)
+    eps = collect_endpoints(settings, fallback_site=ctx.domain)
     if not eps:
         print(color("  ✗ 无端点配置", C_RED))
         sys.exit(1)
@@ -1414,7 +1451,7 @@ def main() -> int:
 
     def refresh_default_ep():
         s = state["ctx"].fetch_settings() or {}
-        eps = collect_endpoints(s, fallback_site=state["ctx"].site)
+        eps = collect_endpoints(s, fallback_site=state["ctx"].domain)
         state["default_ep"] = find_endpoint(eps, state["cfg"].get("default_endpoint_name", ""))
 
     options: list[tuple[str, str]] = [
@@ -1424,7 +1461,7 @@ def main() -> int:
         ("分组", "groups"),
         ("名称", "key"),
         ("兑换历史", "history"),
-        ("注入 codex", "inject"),
+        ("配置 codex", "inject"),
         ("退出", "quit"),
     ]
     last_idx = 0

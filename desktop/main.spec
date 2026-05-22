@@ -26,8 +26,6 @@ a = Analysis(
         # The sub2cli script (no .py extension) — loaded via SourceFileLoader.
         # Put in pyscripts/ subdir to avoid name collision with the 'sub2cli' EXE.
         (os.path.join(REPO_ROOT, 'sub2cli'), 'pyscripts'),
-        # Pre-PyInstaller'd sub2cli-inject binary (built separately by build.sh).
-        ('../spike/dist/sub2cli-inject-bundle', 'pyscripts'),
         # Frontend assets
         ('ui', 'ui'),
     ],
@@ -83,8 +81,8 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'sub2cli',
         'CFBundleDisplayName': 'sub2cli',
-        'CFBundleShortVersionString': '0.2.0',
-        'CFBundleVersion': '0.2.0',
+        'CFBundleShortVersionString': '0.2.2',
+        'CFBundleVersion': '0.2.2',
         'LSMinimumSystemVersion': '12.0',
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,

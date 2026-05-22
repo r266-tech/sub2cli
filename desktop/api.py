@@ -7,13 +7,20 @@ switching (P4) will replace `self.ctx` to point at a new domain.
 """
 from __future__ import annotations
 
+import glob
 import importlib.machinery
 import importlib.util
 import json
 import os
 import re
+import base64
+import errno
+import fcntl
+import select
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -23,6 +30,11 @@ from typing import Any
 import keyring
 import requests
 
+try:
+    import Security  # type: ignore[import-not-found]
+except Exception:  # noqa: BLE001 - optional outside the bundled macOS app env
+    Security = None  # type: ignore[assignment]
+
 
 KEYCHAIN_SERVICE = "sub2cli"
 KEYCHAIN_CREDS_SERVICE = "sub2cli:creds"
@@ -30,6 +42,134 @@ GITHUB_REPO = "r266-tech/sub2cli"
 INJECT_PLAN_TIMEOUT = 90
 INJECT_APPLY_TIMEOUT = 180
 INJECT_ROLLBACK_TIMEOUT = 90
+CODEX_LOGIN_TIMEOUT = 300
+CODEX_PROVIDER_HOME_PATH = Path(os.environ.get("CODEX_PROVIDER_HOME", str(Path.home()))).expanduser()
+CODEX_HOME_PATH = Path(os.environ.get("CODEX_HOME", str(CODEX_PROVIDER_HOME_PATH / ".codex"))).expanduser()
+PROVIDER_SLOTS_PATH = CODEX_HOME_PATH / "provider-slots.json"
+CODEX_APP_SUPPORT_PATH = CODEX_PROVIDER_HOME_PATH / "Library" / "Application Support"
+CODEXBAR_MANAGED_ACCOUNTS_PATH = (
+    CODEX_APP_SUPPORT_PATH / "CodexBar" / "managed-codex-accounts.json"
+)
+CODEX_LOCK_PATH = CODEX_HOME_PATH / ".sub2cli-inject.lock"
+UPDATE_CACHE_DIR = Path.home() / "Library" / "Caches" / "sub2cli" / "updates"
+UPDATE_LOG_PATH = Path.home() / "Library" / "Logs" / "sub2cli-updater.log"
+
+CODEX_CLI_FALLBACKS = (
+    "~/bin/codex",
+    "~/.local/bin/codex",
+    "~/.npm-global/bin/codex",
+    "~/.volta/bin/codex",
+    "~/.bun/bin/codex",
+    "~/Library/pnpm/codex",
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+)
+CODEX_CLI_FALLBACK_GLOBS = (
+    "~/.nvm/versions/node/*/bin/codex",
+    "~/.local/share/fnm/node-versions/*/installation/bin/codex",
+)
+CODEX_APP_BUNDLED_CLI = "/Applications/Codex.app/Contents/Resources/codex"
+
+
+class CodexStateLock:
+    """Shared advisory lock for mutations under CODEX_HOME."""
+
+    _depth = 0
+
+    def __init__(self, timeout: float = 10.0) -> None:
+        self.timeout = timeout
+        self._fd: int | None = None
+        self._nested = False
+
+    def __enter__(self) -> "CodexStateLock":
+        if CodexStateLock._depth > 0:
+            CodexStateLock._depth += 1
+            self._nested = True
+            return self
+        CODEX_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(str(CODEX_LOCK_PATH), os.O_CREAT | os.O_WRONLY, 0o600)
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.ftruncate(self._fd, 0)
+                os.write(self._fd, f"pid={os.getpid()} t={int(time.time())}\n".encode())
+                CodexStateLock._depth = 1
+                return self
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                    os.close(self._fd)
+                    self._fd = None
+                    raise
+                if time.time() >= deadline:
+                    os.close(self._fd)
+                    self._fd = None
+                    raise RuntimeError(f"Codex 配置正在被另一个 sub2cli 进程修改 ({CODEX_LOCK_PATH})")
+                time.sleep(0.1)
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._nested:
+            CodexStateLock._depth = max(0, CodexStateLock._depth - 1)
+            return
+        CodexStateLock._depth = 0
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+                self._fd = None
+
+
+def _is_executable_file(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _candidate_codex_paths() -> list[str]:
+    paths: list[str] = []
+    path_hit = shutil.which("codex")
+    if path_hit:
+        paths.append(path_hit)
+    paths.extend(os.path.expanduser(p) for p in CODEX_CLI_FALLBACKS)
+    for pattern in CODEX_CLI_FALLBACK_GLOBS:
+        paths.extend(sorted(glob.glob(os.path.expanduser(pattern))))
+    paths.append(CODEX_APP_BUNDLED_CLI)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        real = os.path.realpath(path)
+        if real not in seen:
+            deduped.append(path)
+            seen.add(real)
+    return deduped
+
+
+def _find_codex_cli() -> tuple[str | None, str]:
+    """Return (path, source), where source is path/common/app-bundled/missing."""
+    path_hit = shutil.which("codex")
+    if path_hit and _is_executable_file(path_hit):
+        return path_hit, "path"
+
+    for path in _candidate_codex_paths():
+        if path == path_hit or path == CODEX_APP_BUNDLED_CLI:
+            continue
+        if _is_executable_file(path):
+            return path, "common"
+
+    if _is_executable_file(CODEX_APP_BUNDLED_CLI):
+        return CODEX_APP_BUNDLED_CLI, "app-bundled"
+    return None, "missing"
+
+
+def _codex_version(codex_path: str) -> str:
+    try:
+        r = subprocess.run(
+            [codex_path, "--version"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return (r.stdout or r.stderr).strip().split("\n")[0] or "?"
+    except Exception:
+        return "?"
 
 
 def _read_app_version() -> str:
@@ -67,17 +207,142 @@ def _parse_semver(s: str) -> tuple[int, ...]:
     return tuple(parts[:3])
 
 
-def _kc_creds_set(domain: str, email: str, password: str) -> None:
-    keyring.set_password(KEYCHAIN_CREDS_SERVICE, f"{domain}|{email}", password)
+def _running_app_bundle_path() -> Path | None:
+    exe = Path(sys.executable).resolve()
+    if exe.parent.name == "MacOS" and exe.parent.parent.name == "Contents":
+        app_path = exe.parent.parent.parent
+        if app_path.suffix == ".app":
+            return app_path
+    return None
 
 
-def _kc_creds_get(domain: str, email: str) -> str | None:
-    return keyring.get_password(KEYCHAIN_CREDS_SERVICE, f"{domain}|{email}")
-
-
-def _kc_creds_delete(domain: str, email: str) -> None:
+def _fetch_latest_release(timeout: int = 6) -> tuple[dict | None, str | None]:
     try:
-        keyring.delete_password(KEYCHAIN_CREDS_SERVICE, f"{domain}|{email}")
+        r = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        return None, f"网络错误: {type(exc).__name__}"
+    if r.status_code == 404:
+        return None, "尚无 release"
+    if r.status_code != 200:
+        return None, f"GitHub HTTP {r.status_code}"
+    try:
+        return r.json(), None
+    except ValueError:
+        return None, "响应非 JSON"
+
+
+def _release_dmg_asset(release: dict | None) -> dict | None:
+    assets = (release or {}).get("assets") or []
+    candidates = [
+        a for a in assets
+        if isinstance(a, dict)
+        and str(a.get("name") or "").lower().endswith(".dmg")
+        and a.get("browser_download_url")
+    ]
+    if not candidates:
+        return None
+    preferred = [a for a in candidates if "sub2cli" in str(a.get("name") or "").lower()]
+    return (preferred or candidates)[0]
+
+
+def _kc_creds_set(domain: str, email: str, password: str, *, allow_prompt: bool = False) -> None:
+    username = f"{domain}|{email}"
+    if not allow_prompt:
+        _security_set_password(KEYCHAIN_CREDS_SERVICE, username, password)
+        return
+    keyring.set_password(KEYCHAIN_CREDS_SERVICE, username, password)
+
+
+def _security_status(result: Any) -> int:
+    if isinstance(result, tuple):
+        return int(result[0])
+    return int(result)
+
+
+def _security_get_password(service: str, username: str) -> str | None:
+    """Read a Keychain item without allowing macOS to present an auth dialog."""
+    if Security is None:
+        return None
+    query = {
+        Security.kSecClass: Security.kSecClassGenericPassword,
+        Security.kSecAttrService: service,
+        Security.kSecAttrAccount: username or "",
+        Security.kSecReturnData: True,
+        Security.kSecUseAuthenticationUI: Security.kSecUseAuthenticationUIFail,
+    }
+    try:
+        status, data = Security.SecItemCopyMatching(query, None)
+    except Exception:  # noqa: BLE001
+        return None
+    if int(status) != int(Security.errSecSuccess) or data is None:
+        return None
+    try:
+        return bytes(data).decode("utf-8")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _security_set_password(service: str, username: str, password: str) -> bool:
+    """Write/update a Keychain item without allowing macOS auth UI."""
+    if Security is None:
+        return False
+    query = {
+        Security.kSecClass: Security.kSecClassGenericPassword,
+        Security.kSecAttrService: service,
+        Security.kSecAttrAccount: username or "",
+        Security.kSecUseAuthenticationUI: Security.kSecUseAuthenticationUIFail,
+    }
+    try:
+        status = _security_status(
+            Security.SecItemUpdate(query, {Security.kSecValueData: password.encode("utf-8")})
+        )
+        if status == int(Security.errSecSuccess):
+            return True
+        if status != int(Security.errSecItemNotFound):
+            return False
+        add_query = dict(query)
+        add_query[Security.kSecValueData] = password.encode("utf-8")
+        status = _security_status(Security.SecItemAdd(add_query, None))
+        return status == int(Security.errSecSuccess)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _security_delete_password(service: str, username: str) -> bool:
+    """Delete a Keychain item without allowing macOS auth UI."""
+    if Security is None:
+        return False
+    query = {
+        Security.kSecClass: Security.kSecClassGenericPassword,
+        Security.kSecAttrService: service,
+        Security.kSecAttrAccount: username or "",
+        Security.kSecUseAuthenticationUI: Security.kSecUseAuthenticationUIFail,
+    }
+    try:
+        status = _security_status(Security.SecItemDelete(query))
+    except Exception:  # noqa: BLE001
+        return False
+    return status in (int(Security.errSecSuccess), int(Security.errSecItemNotFound))
+
+
+def _kc_creds_get(domain: str, email: str, *, allow_prompt: bool = False) -> str | None:
+    username = f"{domain}|{email}"
+    if not allow_prompt:
+        return _security_get_password(KEYCHAIN_CREDS_SERVICE, username)
+    return keyring.get_password(KEYCHAIN_CREDS_SERVICE, username)
+
+
+def _kc_creds_delete(domain: str, email: str, *, allow_prompt: bool = False) -> None:
+    try:
+        username = f"{domain}|{email}"
+        if not allow_prompt:
+            _security_delete_password(KEYCHAIN_CREDS_SERVICE, username)
+            return
+        keyring.delete_password(KEYCHAIN_CREDS_SERVICE, username)
     except Exception:
         pass
 
@@ -87,7 +352,7 @@ def _sub2_login(domain: str, email: str, password: str, timeout: int = 10) -> tu
 
     On success returns (token, ""). On failure returns (None, human msg).
     """
-    api_base = domain.rstrip("/") + "/api/v1"
+    api_base = sub2cli_lib._api_base_for_domain(domain)
     try:
         r = requests.post(
             f"{api_base}/auth/login",
@@ -131,6 +396,82 @@ def _mask_secret_text(text: Any, api_key: str | None = None) -> str:
     return re.sub(r"sk-[A-Za-z0-9._-]{12,}", lambda m: _mask_api_key(m.group(0)), masked)
 
 
+def _coerce_proc_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def _mask_result_texts(result: dict[str, Any] | None, api_key: str | None = None) -> dict[str, Any] | None:
+    if not result:
+        return result
+    masked = dict(result)
+    if "stdout" in masked:
+        masked["stdout"] = _mask_secret_text(masked.get("stdout"), api_key)
+    if "stderr" in masked:
+        masked["stderr"] = _mask_secret_text(masked.get("stderr"), api_key)
+    if "error" in masked and api_key:
+        masked["error"] = _mask_secret_text(masked.get("error"), api_key)
+    return masked
+
+
+def _extract_rollback_backup(stdout: str | None) -> str | None:
+    m = re.search(r"sub2cli-inject rollback ([^\s]+)", stdout or "")
+    return m.group(1).strip() if m else None
+
+
+def _inject_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    for key in list(env):
+        if key.startswith("_PYI_"):
+            env.pop(key, None)
+    return env
+
+
+def _rollback_inject_backup(inject_bin: str, backup_name: str | None) -> dict[str, Any] | None:
+    if not backup_name:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", backup_name):
+        return {
+            "ok": False,
+            "error": "备份名非法, 未自动回滚",
+            "backup_name": backup_name,
+        }
+    try:
+        proc = subprocess.run(
+            [inject_bin, "rollback", backup_name],
+            capture_output=True,
+            text=True,
+            env=_inject_subprocess_env(),
+            timeout=INJECT_ROLLBACK_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "error": f"自动回滚超过 {INJECT_ROLLBACK_TIMEOUT} 秒仍未完成",
+            "backup_name": backup_name,
+            "stdout": "",
+            "stderr": "",
+            "returncode": None,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"自动回滚失败: {type(exc).__name__}: {exc}",
+            "backup_name": backup_name,
+        }
+    return {
+        "ok": proc.returncode == 0,
+        "backup_name": backup_name,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "returncode": proc.returncode,
+    }
+
+
 def _home_path(path: str | Path | None) -> str:
     if path is None:
         return "(none)"
@@ -170,6 +511,64 @@ def _read_json_file(path: Path) -> dict:
         return json.loads(path.read_text())
     except Exception:
         return {}
+
+
+def _write_json_file(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _decode_jwt_claims(token: str | None) -> dict:
+    if not token or token.count(".") < 2:
+        return {}
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload.encode()))
+    except Exception:
+        return {}
+
+
+def _codex_auth_identity(auth_path: str | None) -> dict[str, Any]:
+    if not auth_path:
+        return {}
+    data = _read_json_file(Path(auth_path).expanduser())
+    tokens = data.get("tokens") if isinstance(data, dict) else {}
+    claims = _decode_jwt_claims((tokens or {}).get("id_token"))
+    auth_meta = claims.get("https://api.openai.com/auth") or {}
+    last_refresh = data.get("last_refresh") if isinstance(data, dict) else None
+    if not last_refresh and claims.get("iat"):
+        try:
+            last_refresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(claims["iat"])))
+        except Exception:
+            last_refresh = None
+    return {
+        "email": claims.get("email"),
+        "name": claims.get("name"),
+        "account_id": auth_meta.get("chatgpt_account_id") or claims.get("chatgpt_account_id"),
+        "plan_type": auth_meta.get("chatgpt_plan_type") or claims.get("plan_type"),
+        "last_refresh": last_refresh,
+        "issued_at": claims.get("iat"),
+        "expires_at": claims.get("exp"),
+        "auth_mode": data.get("auth_mode") if isinstance(data, dict) else None,
+    }
+
+
+def _format_plan_label(plan_type: str | None) -> str:
+    if not plan_type:
+        return "未知套餐"
+    mapping = {
+        "free": "Free",
+        "plus": "Plus",
+        "pro": "Pro",
+        "prolite": "Pro 5x",
+        "team": "Team",
+        "enterprise": "Enterprise",
+    }
+    return mapping.get(plan_type.lower(), plan_type)
 
 
 def _read_text_preview(path: str, api_key: str) -> str:
@@ -212,7 +611,7 @@ def _parse_inject_plan_changes(plan_text: str, api_key: str) -> list[dict[str, A
     slot = _extract_plan_field(plan_text, "slot")
     base_url = _extract_plan_field(plan_text, "base_url")
     model = _extract_plan_field(plan_text, "model")
-    slots_path = Path.home() / ".codex" / "provider-slots.json"
+    slots_path = PROVIDER_SLOTS_PATH
     slots_data = _read_json_file(slots_path)
 
     if slot:
@@ -389,6 +788,607 @@ def _parse_inject_plan_changes(plan_text: str, api_key: str) -> list[dict[str, A
     return changes
 
 
+def _parse_use_plan_changes(plan_text: str, slot: str) -> list[dict[str, Any]]:
+    """Parse the stable parts of `sub2cli-inject use <slot> --dry-run`."""
+    data = _read_json_file(PROVIDER_SLOTS_PATH)
+    slots = data.get("slots") or {}
+    target = slots.get(slot) or {}
+    rows = [
+        {
+            "label": "current",
+            "before": _missing_value(data.get("current")),
+            "after": slot,
+        },
+        {
+            "label": f"slots.{slot}.mode",
+            "before": _missing_value(target.get("mode")),
+            "after": "oauth",
+        },
+        {
+            "label": "auth.json",
+            "before": "当前 Codex 登录文件",
+            "after": _home_path(target.get("auth_file")),
+        },
+        {
+            "label": "App profile",
+            "before": "当前 Codex App profile",
+            "after": _home_path(target.get("app_profile_dir")),
+        },
+    ]
+    changes = [{
+        "path": "~/.codex/provider-slots.json",
+        "detail": "切换到已保存的官方 Codex 账号渠道",
+        "rows": rows,
+        "diff": _diff_rows_to_lines(rows),
+    }]
+    if "当前状态一致" in plan_text or "无需修改" in plan_text:
+        changes[0]["detail"] = "当前已是这个官方账号, 无需修改"
+    elif "Codex App" in plan_text or "launch" in plan_text:
+        changes.append({
+            "path": "Codex App",
+            "detail": "重新打开以加载官方账号配置",
+            "rows": [{"label": "Codex App", "before": "当前状态", "after": "restart / launch"}],
+            "diff": [{"kind": "plus", "text": "+ Codex App restart / launch"}],
+        })
+    return changes
+
+
+def _official_slot_name(data: dict) -> str | None:
+    slots = data.get("slots") or {}
+    preferred = (data.get("preferred_official_slot") or "").strip()
+    if preferred and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,30}", preferred):
+        if preferred not in slots or (slots.get(preferred) or {}).get("mode") == "oauth":
+            return preferred
+    current = data.get("current")
+    if current in slots and slots[current].get("mode") == "oauth":
+        return current
+    history = data.get("app_history_slot")
+    if history in slots and slots[history].get("mode") == "oauth":
+        return history
+    for name, cfg in slots.items():
+        if cfg.get("mode") == "oauth":
+            return name
+    return None
+
+
+def _serialize_codex_account(name: str, cfg: dict, *, current: str | None, official: str | None) -> dict:
+    auth_file = cfg.get("auth_file")
+    source_auth_file = cfg.get("_source_auth_file") or auth_file
+    ident = _codex_auth_identity(source_auth_file or auth_file)
+    email = ident.get("email") or ""
+    display = cfg.get("display_name") or f"Codex - {name}"
+    identity_key = (ident.get("account_id") or email or name or "").strip().lower()
+    return {
+        "slot": name,
+        "display_name": display,
+        "email": email or display.replace("Codex - ", ""),
+        "name": ident.get("name") or "",
+        "account_id": ident.get("account_id"),
+        "identity_key": identity_key,
+        "plan_type": ident.get("plan_type"),
+        "plan_label": _format_plan_label(ident.get("plan_type")),
+        "last_refresh": ident.get("last_refresh"),
+        "issued_at": ident.get("issued_at"),
+        "expires_at": ident.get("expires_at"),
+        "auth_mode": ident.get("auth_mode"),
+        "auth_file": _home_path(auth_file),
+        "target_auth_file": _home_path(auth_file),
+        "source_auth_file": _home_path(source_auth_file),
+        "app_profile_dir": _home_path(cfg.get("app_profile_dir")),
+        "source_label": cfg.get("_source_label") or "sub2cli slots",
+        "source_kind": cfg.get("_source_kind") or "slot",
+        "managed_home": _home_path(cfg.get("_managed_home")) if cfg.get("_managed_home") else "",
+        "is_registered": cfg.get("_is_registered", True),
+        "is_current_provider": name == current,
+        "is_current_official": name == official,
+    }
+
+
+def _codex_identity_key(account: dict) -> str:
+    key = (account.get("identity_key") or account.get("account_id") or account.get("email") or "").strip().lower()
+    return key or f"slot:{account.get('slot', '')}"
+
+
+def _identity_key_from_ident(ident: dict) -> str:
+    return (ident.get("account_id") or ident.get("email") or "").strip().lower()
+
+
+def _registered_slot_identity_key(slots: dict, slot: str) -> str:
+    cfg = slots.get(slot) or {}
+    if cfg.get("mode") != "oauth":
+        return ""
+    return _identity_key_from_ident(_codex_auth_identity(cfg.get("auth_file")))
+
+
+def _can_reuse_registered_slot(slots: dict, slot: str, identity_key: str) -> bool:
+    registered_key = _registered_slot_identity_key(slots, slot)
+    return not registered_key or not identity_key or registered_key == identity_key
+
+
+def _slot_from_auth_file(path: Path) -> str | None:
+    match = re.fullmatch(r"auth\.([A-Za-z0-9][A-Za-z0-9_-]{0,30})\.json", path.name)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def _safe_slot_slug(value: str | None, fallback: str = "account") -> str:
+    text = (value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9_-]+", "-", text).strip("-_")
+    if not text or not re.match(r"^[a-z0-9]", text):
+        text = fallback
+    return text[:31]
+
+
+def _slot_base_for_email(email: str | None, label: str | None = None) -> str:
+    normalized_label = (label or "").strip()
+    if normalized_label and normalized_label.lower() not in {"personal", "default"}:
+        return _safe_slot_slug(normalized_label)
+    if email and "@" in email:
+        domain = email.split("@", 1)[1].split(".", 1)[0]
+        if domain:
+            return _safe_slot_slug(domain)
+    if email:
+        return _safe_slot_slug(email.split("@", 1)[0])
+    return "account"
+
+
+def _unique_slot(base: str, used: set[str]) -> str:
+    slot = _safe_slot_slug(base)
+    if slot not in used:
+        used.add(slot)
+        return slot
+    for i in range(2, 100):
+        suffix = f"-{i}"
+        candidate = f"{slot[:31 - len(suffix)]}{suffix}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+    raise RuntimeError("too many duplicate Codex account slots")
+
+
+def _expanded_path(value: str | None) -> Path | None:
+    if not value or value == "(none)":
+        return None
+    return Path(str(value).replace("~", str(Path.home()), 1)).expanduser()
+
+
+def _source_is_newer(candidate: dict, existing: dict) -> bool:
+    return int(candidate.get("issued_at") or 0) > int(existing.get("issued_at") or 0)
+
+
+def _merge_codex_account(accounts_by_key: dict[str, dict], candidate: dict) -> None:
+    key = _codex_identity_key(candidate)
+    existing = accounts_by_key.get(key)
+    if not existing:
+        accounts_by_key[key] = candidate
+        return
+
+    source_labels = []
+    for label in (existing.get("source_label"), candidate.get("source_label")):
+        for part in str(label or "").split(" + "):
+            part = part.strip()
+            if part and part not in source_labels:
+                source_labels.append(part)
+
+    if candidate.get("is_registered") and not existing.get("is_registered"):
+        base, extra = candidate, existing
+    else:
+        base, extra = existing, candidate
+
+    if _source_is_newer(extra, base):
+        base["source_auth_file"] = extra.get("source_auth_file") or base.get("source_auth_file")
+        base["source_kind"] = extra.get("source_kind") or base.get("source_kind")
+        base["last_refresh"] = extra.get("last_refresh") or base.get("last_refresh")
+        base["issued_at"] = extra.get("issued_at") or base.get("issued_at")
+        base["expires_at"] = extra.get("expires_at") or base.get("expires_at")
+
+    base["source_label"] = " + ".join(source_labels) if source_labels else base.get("source_label", "")
+    base["is_current_provider"] = bool(base.get("is_current_provider") or extra.get("is_current_provider"))
+    base["is_current_official"] = bool(base.get("is_current_official") or extra.get("is_current_official"))
+    base["is_registered"] = bool(base.get("is_registered") or extra.get("is_registered"))
+    if not base.get("managed_home") and extra.get("managed_home"):
+        base["managed_home"] = extra["managed_home"]
+    accounts_by_key[key] = base
+
+
+def _raw_codex_auth_accounts(
+    *,
+    used_slots: set[str],
+    current: str | None,
+    official: str | None,
+    registered_slots: set[str],
+    slots: dict,
+) -> list[dict]:
+    accounts: list[dict] = []
+    for path in sorted(CODEX_HOME_PATH.glob("auth.*.json")):
+        slot = _slot_from_auth_file(path)
+        if not slot:
+            continue
+        ident = _codex_auth_identity(str(path))
+        if not ident.get("email"):
+            continue
+        identity_key = _identity_key_from_ident(ident)
+        if slot in registered_slots and _can_reuse_registered_slot(slots, slot, identity_key):
+            target_slot = slot
+        else:
+            target_slot = _unique_slot(slot, used_slots)
+        if target_slot not in used_slots:
+            used_slots.add(target_slot)
+        cfg = {
+            "display_name": f"Codex - {ident.get('email')}",
+            "mode": "oauth",
+            "auth_file": str(path),
+            "app_profile_dir": str(CODEX_APP_SUPPORT_PATH / f"Codex.{target_slot}"),
+            "_source_auth_file": str(path),
+            "_source_label": "~/.codex auth file",
+            "_source_kind": "auth-file",
+            "_is_registered": target_slot in registered_slots,
+        }
+        accounts.append(_serialize_codex_account(target_slot, cfg, current=current, official=official))
+    return accounts
+
+
+def _live_codex_auth_accounts(
+    *,
+    used_slots: set[str],
+    current: str | None,
+    official: str | None,
+    registered_slots: set[str],
+    slots: dict,
+) -> list[dict]:
+    """Discover the standard live ~/.codex/auth.json OAuth login.
+
+    A fresh Codex install normally has auth.json only, without any
+    auth.<slot>.json or provider-slots.json. Treat it as an importable official
+    account instead of requiring this machine's private pre-registration.
+    """
+    auth_path = CODEX_HOME_PATH / "auth.json"
+    if not auth_path.exists() or auth_path.is_symlink():
+        return []
+    ident = _codex_auth_identity(str(auth_path))
+    if not ident.get("email") or ident.get("auth_mode") == "apikey":
+        return []
+
+    preferred = (official or "").strip()
+    identity_key = _identity_key_from_ident(ident)
+    if preferred in registered_slots and _can_reuse_registered_slot(slots, preferred, identity_key):
+        target_slot = preferred
+    elif current in registered_slots and _can_reuse_registered_slot(slots, current or "", identity_key):
+        target_slot = current or ""
+    else:
+        if preferred and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,30}", preferred) and preferred not in slots:
+            target_slot = preferred
+            used_slots.add(target_slot)
+        else:
+            target_slot = _unique_slot(_slot_base_for_email(ident.get("email")), used_slots)
+    existing = (slots.get(target_slot) or {}) if target_slot in slots else {}
+    cfg = {
+        "display_name": existing.get("display_name") or f"Codex - {ident.get('email')}",
+        "mode": "oauth",
+        "auth_file": existing.get("auth_file") or str(CODEX_HOME_PATH / f"auth.{target_slot}.json"),
+        "app_profile_dir": existing.get("app_profile_dir") or str(CODEX_APP_SUPPORT_PATH / f"Codex.{target_slot}"),
+        "_source_auth_file": str(auth_path),
+        "_source_label": "~/.codex/auth.json",
+        "_source_kind": "live-auth",
+        "_is_registered": target_slot in registered_slots,
+    }
+    return [_serialize_codex_account(target_slot, cfg, current=current, official=official)]
+
+
+def _codexbar_managed_accounts(
+    *,
+    used_slots: set[str],
+    current: str | None,
+    official: str | None,
+) -> list[dict]:
+    data = _read_json_file(CODEXBAR_MANAGED_ACCOUNTS_PATH)
+    raw_accounts = data.get("accounts") if isinstance(data, dict) else []
+    accounts: list[dict] = []
+    for entry in raw_accounts or []:
+        managed_home = entry.get("managedHomePath")
+        auth_path = Path(managed_home or "").expanduser() / "auth.json"
+        if not managed_home or not auth_path.exists():
+            continue
+        ident = _codex_auth_identity(str(auth_path))
+        email = ident.get("email") or entry.get("email")
+        if not email:
+            continue
+        base = _slot_base_for_email(email, entry.get("workspaceLabel"))
+        target_slot = _unique_slot(base, used_slots)
+        display = f"Codex - {email}"
+        if entry.get("workspaceLabel"):
+            display = f"{entry['workspaceLabel']} · {email}"
+        cfg = {
+            "display_name": display,
+            "mode": "oauth",
+            "auth_file": str(CODEX_HOME_PATH / f"auth.{target_slot}.json"),
+            "app_profile_dir": str(CODEX_APP_SUPPORT_PATH / f"Codex.{target_slot}"),
+            "_source_auth_file": str(auth_path),
+            "_source_label": "CodexBar managed account",
+            "_source_kind": "codexbar-managed",
+            "_managed_home": managed_home,
+            "_is_registered": False,
+        }
+        accounts.append(_serialize_codex_account(target_slot, cfg, current=current, official=official))
+    return accounts
+
+
+def _discover_codex_accounts(data: dict | None = None, official_override: str | None = None) -> dict:
+    data = data or _read_json_file(PROVIDER_SLOTS_PATH)
+    slots = data.get("slots") or {}
+    current = data.get("current")
+    official = official_override or _official_slot_name(data)
+    registered_slots = {name for name, cfg in slots.items() if (cfg or {}).get("mode") == "oauth"}
+    used_slots = set(slots.keys())
+    accounts_by_key: dict[str, dict] = {}
+
+    for name, cfg in slots.items():
+        if (cfg or {}).get("mode") != "oauth":
+            continue
+        _merge_codex_account(
+            accounts_by_key,
+            _serialize_codex_account(name, cfg, current=current, official=official),
+        )
+
+    for account in _raw_codex_auth_accounts(
+        used_slots=used_slots,
+        current=current,
+        official=official,
+        registered_slots=registered_slots,
+        slots=slots,
+    ):
+        _merge_codex_account(accounts_by_key, account)
+
+    for account in _live_codex_auth_accounts(
+        used_slots=used_slots,
+        current=current,
+        official=official,
+        registered_slots=registered_slots,
+        slots=slots,
+    ):
+        _merge_codex_account(accounts_by_key, account)
+
+    for account in _codexbar_managed_accounts(
+        used_slots=used_slots,
+        current=current,
+        official=official,
+    ):
+        _merge_codex_account(accounts_by_key, account)
+
+    accounts = list(accounts_by_key.values())
+    if official and not any(account.get("slot") == official for account in accounts):
+        official = None
+    if not official and accounts:
+        official = accounts[0].get("slot")
+    for account in accounts:
+        account["is_current_official"] = account.get("slot") == official
+
+    current_provider = slots.get(current) or {}
+    return {
+        "ok": True,
+        "accounts": accounts,
+        "current": current,
+        "current_mode": current_provider.get("mode"),
+        "current_official": next((a for a in accounts if a.get("slot") == official), None),
+        "slots_path": _home_path(PROVIDER_SLOTS_PATH),
+        "codexbar_accounts_path": _home_path(CODEXBAR_MANAGED_ACCOUNTS_PATH),
+    }
+
+
+def _copy_auth_material(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = source.read_bytes()
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        finally:
+            pass
+        raise
+
+
+def _ensure_codex_account_slot(slot: str) -> tuple[dict | None, str | None]:
+    snapshot = _discover_codex_accounts(official_override=slot)
+    account = next((a for a in snapshot.get("accounts", []) if a.get("slot") == slot), None)
+    if not account:
+        return None, f"未找到官方账号: {slot}"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,30}", slot):
+        return None, "slot 非法"
+
+    source = _expanded_path(account.get("source_auth_file") or account.get("auth_file"))
+    target = _expanded_path(account.get("target_auth_file") or account.get("auth_file"))
+    if not source or not source.exists():
+        return None, f"账号 auth 文件不存在: {account.get('source_auth_file') or account.get('auth_file')}"
+    if not target:
+        target = CODEX_HOME_PATH / f"auth.{slot}.json"
+    try:
+        with CodexStateLock():
+            data = _read_json_file(PROVIDER_SLOTS_PATH)
+            data.setdefault("version", 1)
+            slots = data.setdefault("slots", {})
+            existing = slots.get(slot) or {}
+            if existing and existing.get("mode") != "oauth":
+                return None, f"slot {slot!r} 已存在但不是官方账号渠道"
+            if source.resolve(strict=False) != target.resolve(strict=False):
+                _copy_auth_material(source, target)
+            slots[slot] = {
+                "display_name": existing.get("display_name") or account.get("display_name") or f"Codex - {slot}",
+                "mode": "oauth",
+                "auth_file": str(target),
+                "app_profile_dir": existing.get("app_profile_dir") or str(CODEX_APP_SUPPORT_PATH / f"Codex.{slot}"),
+            }
+            data["preferred_official_slot"] = slot
+            _write_json_file(PROVIDER_SLOTS_PATH, data)
+    except Exception as exc:
+        return None, f"注册官方账号槽位失败: {type(exc).__name__}: {exc}"
+    refreshed = _discover_codex_accounts(official_override=slot)
+    return next((a for a in refreshed.get("accounts", []) if a.get("slot") == slot), account), None
+
+
+def _codex_account_import_plan_changes(data: dict, account: dict, target: str) -> list[dict[str, Any]]:
+    slots = data.get("slots") or {}
+    rows = [
+        {"label": "current", "before": _missing_value(data.get("current")), "after": target},
+        {"label": f"slots.{target}.mode", "before": _missing_value((slots.get(target) or {}).get("mode")), "after": "oauth"},
+        {"label": f"auth.{target}.json", "before": _missing_value((slots.get(target) or {}).get("auth_file")), "after": account.get("source_auth_file") or account.get("auth_file") or ""},
+        {"label": "auth.json", "before": "当前 Codex 登录文件", "after": account.get("target_auth_file") or account.get("auth_file") or ""},
+    ]
+    return [{
+        "path": "~/.codex/provider-slots.json",
+        "detail": "注册已发现的官方账号槽位, 然后切换到该账号",
+        "rows": rows,
+        "diff": _diff_rows_to_lines(rows),
+    }, {
+        "path": account.get("target_auth_file") or account.get("auth_file") or f"~/.codex/auth.{target}.json",
+        "detail": "同步官方账号 OAuth 登录文件",
+        "rows": [{"label": "source", "before": "(未同步)", "after": account.get("source_label") or "auth file"}],
+        "diff": [{"kind": "plus", "text": f"+ source: {account.get('source_label') or 'auth file'}"}],
+    }, {
+        "path": "Codex App",
+        "detail": "写入后按 sub2cli-inject 逻辑重启/打开 Codex App",
+        "rows": [{"label": "Codex App", "before": "当前状态", "after": "restart / launch"}],
+        "diff": [{"kind": "plus", "text": "+ Codex App restart / launch"}],
+    }]
+
+
+def _run_isolated_codex_login(slot: str) -> tuple[Path | None, dict | None, str, str | None]:
+    codex_path, _source = _find_codex_cli()
+    if not codex_path:
+        return None, None, "", "找不到 codex CLI, 无法启动登录"
+
+    login_home = CODEX_HOME_PATH / "sub2cli-account-homes" / slot
+    login_home.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(login_home)
+    env["PATH"] = os.environ.get(
+        "PATH",
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    )
+    try:
+        proc = subprocess.run(
+            [codex_path, "login"],
+            capture_output=True,
+            text=True,
+            timeout=CODEX_LOGIN_TIMEOUT,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = ((exc.stdout or "") + "\n" + (exc.stderr or "")).strip()
+        auth_path = login_home / "auth.json"
+        ident = _codex_auth_identity(str(auth_path)) if auth_path.exists() else {}
+        if ident.get("email"):
+            return auth_path, ident, output, None
+        return None, None, output, f"登录超过 {CODEX_LOGIN_TIMEOUT} 秒未完成"
+    except Exception as exc:
+        return None, None, "", f"启动 codex login 失败: {type(exc).__name__}: {exc}"
+
+    output = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
+    auth_path = login_home / "auth.json"
+    ident = _codex_auth_identity(str(auth_path)) if auth_path.exists() else {}
+    if proc.returncode != 0 and not ident.get("email"):
+        return None, None, output, f"codex login 返回 {proc.returncode}"
+    if not auth_path.exists() or not ident.get("email"):
+        return None, None, output, "codex login 完成, 但没有生成可识别的官方账号 auth.json"
+    return auth_path, ident, output, None
+
+
+def _codex_rpc_snapshot(auth_path: str | None = None, timeout: int = 8) -> dict[str, Any] | None:
+    codex_path, _source = _find_codex_cli()
+    if not codex_path:
+        return None
+    cmd = [codex_path, "-s", "read-only", "-a", "untrusted", "app-server"]
+    proc = None
+    temp_dir = None
+    try:
+        env = os.environ.copy()
+        if auth_path:
+            temp_dir = tempfile.TemporaryDirectory()
+            temp_home = Path(temp_dir.name)
+            src = Path(auth_path).expanduser()
+            if not src.exists():
+                return {"error": f"auth file missing: {_home_path(src)}", "account": {}, "rate_limits": {}}
+            shutil.copy2(src, temp_home / "auth.json")
+            env["CODEX_HOME"] = str(temp_home)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        requests = [
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "sub2cli",
+                        "title": "sub2cli",
+                        "version": _read_app_version(),
+                    },
+                },
+            },
+            {"method": "initialized"},
+            {"id": 2, "method": "account/read", "params": {"refreshToken": False}},
+            {"id": 3, "method": "account/rateLimits/read"},
+        ]
+        assert proc.stdin is not None
+        for msg in requests:
+            proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
+
+        responses: dict[int, dict] = {}
+        deadline = time.time() + timeout
+        assert proc.stdout is not None
+        while time.time() < deadline and not ({2, 3} <= set(responses)):
+            ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+            if not ready:
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload.get("id"), int):
+                responses[payload["id"]] = payload
+        missing = [str(i) for i in (2, 3) if i not in responses]
+        errors = [f"{i}: {responses[i].get('error')}" for i in (2, 3) if (responses.get(i) or {}).get("error")]
+        if missing or errors:
+            parts = []
+            if missing:
+                parts.append(f"missing response id(s): {', '.join(missing)}")
+            if errors:
+                parts.append("; ".join(errors))
+            return {"error": "; ".join(parts), "account": {}, "rate_limits": {}}
+        account = (responses.get(2) or {}).get("result") or {}
+        limits = (responses.get(3) or {}).get("result") or {}
+        return {"account": account, "rate_limits": limits}
+    except Exception:
+        return None
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if temp_dir:
+            temp_dir.cleanup()
+
+
 def _resource_dir() -> str | None:
     """Where bundled data lives. See desktop/main.py:_resource_dir for spec."""
     import sys as _sys
@@ -459,17 +1459,28 @@ def _kc_username(domain: str, email: str) -> str:
     return f"{domain}|{email}"
 
 
-def _kc_set(domain: str, email: str, token: str) -> None:
-    keyring.set_password(KEYCHAIN_SERVICE, _kc_username(domain, email), token)
+def _kc_set(domain: str, email: str, token: str, *, allow_prompt: bool = False) -> None:
+    username = _kc_username(domain, email)
+    if not allow_prompt:
+        _security_set_password(KEYCHAIN_SERVICE, username, token)
+        return
+    keyring.set_password(KEYCHAIN_SERVICE, username, token)
 
 
-def _kc_get(domain: str, email: str) -> str | None:
-    return keyring.get_password(KEYCHAIN_SERVICE, _kc_username(domain, email))
+def _kc_get(domain: str, email: str, *, allow_prompt: bool = False) -> str | None:
+    username = _kc_username(domain, email)
+    if not allow_prompt:
+        return _security_get_password(KEYCHAIN_SERVICE, username)
+    return keyring.get_password(KEYCHAIN_SERVICE, username)
 
 
-def _kc_delete(domain: str, email: str) -> None:
+def _kc_delete(domain: str, email: str, *, allow_prompt: bool = False) -> None:
     try:
-        keyring.delete_password(KEYCHAIN_SERVICE, _kc_username(domain, email))
+        username = _kc_username(domain, email)
+        if not allow_prompt:
+            _security_delete_password(KEYCHAIN_SERVICE, username)
+            return
+        keyring.delete_password(KEYCHAIN_SERVICE, username)
     except Exception:
         # keyring's PasswordDeleteError + macOS variants — swallow on best-effort
         pass
@@ -496,7 +1507,7 @@ def _try_relogin_with_saved_creds(ctx: Any, cfg: dict) -> bool:
             continue
         token, _err = _sub2_login(ctx.domain, email, pw)
         if token:
-            _kc_set(ctx.domain, email, token)
+            _kc_set(ctx.domain, email, token, allow_prompt=False)
             ctx.set_token(token)
             return True
     return False
@@ -595,6 +1606,27 @@ class JsApi:
             "description": g.get("description"),
         }
 
+    @staticmethod
+    def _serialize_subscription(s: dict) -> dict:
+        group = s.get("group") or {}
+        return {
+            "id": s.get("id"),
+            "status": s.get("status"),
+            "starts_at": s.get("starts_at"),
+            "expires_at": s.get("expires_at"),
+            "updated_at": s.get("updated_at"),
+            "group_id": s.get("group_id") or group.get("id"),
+            "group_name": group.get("name") or s.get("group_name") or "?",
+            "group_status": group.get("status"),
+            "rate_multiplier": group.get("rate_multiplier"),
+            "daily_usage_usd": s.get("daily_usage_usd"),
+            "weekly_usage_usd": s.get("weekly_usage_usd"),
+            "monthly_usage_usd": s.get("monthly_usage_usd"),
+            "daily_limit_usd": group.get("daily_limit_usd"),
+            "weekly_limit_usd": group.get("weekly_limit_usd"),
+            "monthly_limit_usd": group.get("monthly_limit_usd"),
+        }
+
     # ---- exposed bridge methods ----
 
     def hello(self) -> dict:
@@ -610,36 +1642,20 @@ class JsApi:
     def check_update(self) -> dict:
         """Check GitHub Releases for a newer version than the running .app.
 
-        Returns {ok, current, latest, has_update, html_url, error?}. Network
-        failures and missing releases return ok=True with has_update=False so
-        the frontend can silently swallow them.
+        Returns {ok, current, latest, has_update, html_url, download_url,
+        asset_name, error?}. Network failures and missing releases return
+        ok=True with has_update=False so the frontend can silently swallow them.
         """
         current = _read_app_version()
-        try:
-            r = requests.get(
-                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-                headers={"Accept": "application/vnd.github+json"},
-                timeout=6,
-            )
-        except requests.RequestException as exc:
+        body, error = _fetch_latest_release()
+        if error or not body:
             return {"ok": True, "current": current, "latest": None,
                     "has_update": False, "html_url": None,
-                    "error": f"网络错误: {type(exc).__name__}"}
-        if r.status_code == 404:
-            return {"ok": True, "current": current, "latest": None,
-                    "has_update": False, "html_url": None,
-                    "error": "尚无 release"}
-        if r.status_code != 200:
-            return {"ok": True, "current": current, "latest": None,
-                    "has_update": False, "html_url": None,
-                    "error": f"GitHub HTTP {r.status_code}"}
-        try:
-            body = r.json()
-        except ValueError:
-            return {"ok": True, "current": current, "latest": None,
-                    "has_update": False, "html_url": None, "error": "响应非 JSON"}
+                    "download_url": None, "asset_name": None,
+                    "error": error or "读取 release 失败"}
         tag = (body.get("tag_name") or "").lstrip("v")
         html_url = body.get("html_url")
+        asset = _release_dmg_asset(body)
         has_update = False
         if tag and current not in ("dev", "?"):
             try:
@@ -652,7 +1668,16 @@ class JsApi:
             "latest": tag or None,
             "has_update": has_update,
             "html_url": html_url,
+            "download_url": asset.get("browser_download_url") if asset else None,
+            "asset_name": asset.get("name") if asset else None,
             "release_name": body.get("name"),
+        }
+
+    def install_update(self) -> dict:
+        """Disabled for unsigned releases; the UI opens GitHub Releases instead."""
+        return {
+            "ok": False,
+            "error": "当前发布为 unsigned app，自动替换 .app 容易触发 Gatekeeper/权限问题；请从 release 页面手动下载并按 README 安装。",
         }
 
     def customize_chrome(self) -> dict:
@@ -951,8 +1976,9 @@ class JsApi:
 
             keys = ctx.fetch_keys()
             settings = ctx.fetch_settings() or {}
-            eps = sub2cli_lib.collect_endpoints(settings, fallback_site=ctx.site)
+            eps = sub2cli_lib.collect_endpoints(settings, fallback_site=ctx.domain)
             groups = ctx.fetch_groups()
+            subscriptions = ctx.fetch_subscriptions()
         return {
             "ok": True,
             "domain": cfg.get("domain"),
@@ -968,6 +1994,7 @@ class JsApi:
             "endpoints": [self._serialize_endpoint(e) for e in eps],
             "keys": [self._serialize_key(k) for k in keys],
             "groups": [self._serialize_group(g) for g in groups],
+            "subscriptions": [self._serialize_subscription(s) for s in subscriptions],
             "config_path": ctx.config_path,
         }
 
@@ -1016,7 +2043,7 @@ class JsApi:
             except RuntimeError as exc:
                 return {"ok": False, "error": str(exc)}
             settings = ctx.fetch_settings() or {}
-            eps = sub2cli_lib.collect_endpoints(settings, fallback_site=ctx.site)
+            eps = sub2cli_lib.collect_endpoints(settings, fallback_site=ctx.domain)
             chosen = sub2cli_lib.find_endpoint(eps, name)
             if not chosen:
                 return {"ok": False, "error": f"端点不存在: {name}"}
@@ -1044,19 +2071,40 @@ class JsApi:
             self._default_key = chosen
         return {"ok": True, "default_key": self._serialize_key(chosen)}
 
+    def set_default_group(self, group_id: int) -> dict:
+        """Move the configured default key to group_id without running probes."""
+        with self._lock:
+            try:
+                ctx, cfg = self._ensure_ctx()
+            except RuntimeError as exc:
+                return {"ok": False, "error": str(exc)}
+            keys = ctx.fetch_keys()
+            default_name = (cfg or {}).get("default_key_name", "")
+            default_key = sub2cli_lib.find_key_by_name(keys, default_name)
+            if not default_key:
+                return {"ok": False, "error": "未设置默认 key, 无法切换分组"}
+            try:
+                target_group_id = int(group_id)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"分组 id 无效: {group_id}"}
+            if default_key.get("group_id") != target_group_id:
+                ok, err = ctx.update_key_group(int(default_key["id"]), target_group_id)
+                if not ok:
+                    return {"ok": False, "error": f"切分组失败: {err}"}
+                keys = ctx.fetch_keys()
+                default_key = sub2cli_lib.find_key_by_name(keys, default_name)
+                if not default_key:
+                    return {"ok": False, "error": "切完分组后 key 丢失"}
+            self._default_key = default_key
+        return {"ok": True, "default_key": self._serialize_key(default_key)}
+
     def _resolve_inject_bin(self) -> str | None:
         """Find sub2cli-inject binary; checks .app resources, repo, PATH."""
         candidates: list[str | None] = []
         res = _resource_dir()
         if res:
-            try:
-                local_repo_root = Path(res).resolve().parents[4]
-                candidates.append(str(local_repo_root / "sub2cli-inject"))
-            except IndexError:
-                pass
-        candidates.append(os.path.join(REPO_ROOT, "sub2cli-inject"))
-        if res:
             candidates.append(os.path.join(res, "pyscripts", "sub2cli-inject-bundle"))
+        candidates.append(os.path.join(REPO_ROOT, "sub2cli-inject"))
         candidates.extend([
             os.path.expanduser("~/.local/bin/sub2cli-inject"),
             shutil.which("sub2cli-inject"),
@@ -1117,8 +2165,12 @@ class JsApi:
             }
         try:
             proc = subprocess.run(
-                [inject_bin, "add-api", url, api_key, "--skip-check", "--dry-run"],
-                capture_output=True, text=True, timeout=INJECT_PLAN_TIMEOUT,
+                [inject_bin, "add-api", url, "--api-key-stdin", "--skip-check", "--dry-run"],
+                input=api_key,
+                capture_output=True,
+                text=True,
+                env=_inject_subprocess_env(),
+                timeout=INJECT_PLAN_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
             return {
@@ -1144,14 +2196,14 @@ class JsApi:
             "ok": True,
             "plan_text": _mask_secret_text(proc.stdout, api_key),
             "label": label,
-            "command": f"sub2cli-inject add-api <url> <key> --skip-check (dry-run)",
+            "command": f"sub2cli-inject add-api <url> --api-key-stdin --skip-check (dry-run)",
             "changes": _parse_inject_plan_changes(proc.stdout, api_key),
         }
 
     def inject_apply(self) -> dict:
         """Real inject: call sub2cli-inject add-api <url> <key> for current default.
 
-        Caller must show inject_plan() output first. Returns {ok, stdout, stderr}.
+        Returns {ok, stdout, stderr, backup_name, auto_rollback}.
         """
         target = self._current_default_inject_target()
         if not target:
@@ -1162,25 +2214,34 @@ class JsApi:
             return {"ok": False, "error": "找不到 sub2cli-inject 二进制"}
         try:
             proc = subprocess.run(
-                [inject_bin, "add-api", url, api_key, "--skip-check"],
-                capture_output=True, text=True, timeout=INJECT_APPLY_TIMEOUT,
+                [inject_bin, "add-api", url, "--api-key-stdin", "--skip-check"],
+                input=api_key,
+                capture_output=True,
+                text=True,
+                env=_inject_subprocess_env(),
+                timeout=INJECT_APPLY_TIMEOUT,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            stdout = _coerce_proc_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
+            stderr = _coerce_proc_text(getattr(exc, "stderr", None))
+            backup_name = _extract_rollback_backup(stdout)
+            rollback_result = _rollback_inject_backup(inject_bin, backup_name) if backup_name else None
             return {
                 "ok": False,
-                "error": f"注入超过 {INJECT_APPLY_TIMEOUT} 秒仍未完成",
-                "stdout": "",
-                "stderr": "",
+                "error": f"配置超过 {INJECT_APPLY_TIMEOUT} 秒仍未完成",
+                "stdout": _mask_secret_text(stdout, api_key),
+                "stderr": _mask_secret_text(stderr, api_key),
                 "returncode": None,
-                "backup_name": None,
-                "rollback_command": None,
+                "backup_name": backup_name,
+                "rollback_command": f"sub2cli-inject rollback {backup_name}" if backup_name else None,
+                "auto_rollback": _mask_result_texts(rollback_result, api_key),
             }
         except Exception as exc:
             return {"ok": False, "error": _mask_secret_text(f"{type(exc).__name__}: {exc}", api_key)}
-        backup_name = None
-        m = re.search(r"sub2cli-inject rollback ([^\s]+)", proc.stdout or "")
-        if m:
-            backup_name = m.group(1).strip()
+        backup_name = _extract_rollback_backup(proc.stdout)
+        rollback_result = None
+        if proc.returncode != 0 and backup_name:
+            rollback_result = _rollback_inject_backup(inject_bin, backup_name)
         return {
             "ok": proc.returncode == 0,
             "stdout": _mask_secret_text(proc.stdout, api_key),
@@ -1188,6 +2249,7 @@ class JsApi:
             "returncode": proc.returncode,
             "backup_name": backup_name,
             "rollback_command": f"sub2cli-inject rollback {backup_name}" if backup_name else None,
+            "auto_rollback": _mask_result_texts(rollback_result, api_key),
         }
 
     def inject_rollback(self, backup_name: str) -> dict:
@@ -1203,7 +2265,10 @@ class JsApi:
         try:
             proc = subprocess.run(
                 [inject_bin, "rollback", backup_name],
-                capture_output=True, text=True, timeout=INJECT_ROLLBACK_TIMEOUT,
+                capture_output=True,
+                text=True,
+                env=_inject_subprocess_env(),
+                timeout=INJECT_ROLLBACK_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
             return {
@@ -1646,6 +2711,206 @@ class JsApi:
             })
         return {"ok": True, "relays": items, "current": current}
 
+    def list_codex_accounts(self) -> dict:
+        """Return official Codex accounts from sub2cli slots and known auth stores."""
+        data = _read_json_file(PROVIDER_SLOTS_PATH)
+        return _discover_codex_accounts(data)
+
+    def select_codex_account(self, slot: str) -> dict:
+        """Select the official account used as the app history / official target.
+        """
+        slot = (slot or "").strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,30}", slot):
+            return {"ok": False, "error": "slot 非法"}
+        try:
+            with CodexStateLock():
+                data = _read_json_file(PROVIDER_SLOTS_PATH)
+                accounts = _discover_codex_accounts(data, official_override=slot)
+                account = next((a for a in accounts.get("accounts", []) if a.get("slot") == slot), None)
+                if not account:
+                    return {"ok": False, "error": f"不是已保存的官方账号: {slot}"}
+                data.setdefault("version", 1)
+                data.setdefault("slots", data.get("slots") or {})
+                data["preferred_official_slot"] = slot
+                _write_json_file(PROVIDER_SLOTS_PATH, data)
+        except Exception as exc:
+            return {"ok": False, "error": f"保存官方账号选择失败: {type(exc).__name__}: {exc}"}
+        return _discover_codex_accounts(official_override=slot)
+
+    def add_codex_account(self, slot: str, display: str = "") -> dict:
+        """Login an isolated official Codex account and add it as a switchable slot."""
+        slot = (slot or "").strip().lower()
+        display = (display or "").strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,30}", slot):
+            return {"ok": False, "error": "slot 需为小写字母/数字/_/-, 最长 31 位"}
+
+        login_auth, ident, output, error = _run_isolated_codex_login(slot)
+        if error:
+            return {"ok": False, "error": error, "stdout": output}
+        assert login_auth is not None
+        assert ident is not None
+
+        try:
+            with CodexStateLock():
+                data = _read_json_file(PROVIDER_SLOTS_PATH)
+                data.setdefault("version", 1)
+                slots = data.setdefault("slots", {})
+                existing = slots.get(slot) or {}
+                if existing and existing.get("mode") != "oauth":
+                    return {"ok": False, "error": f"slot {slot!r} 已存在但不是官方账号渠道"}
+                if existing:
+                    existing_ident = _codex_auth_identity(existing.get("auth_file"))
+                    existing_key = (existing_ident.get("account_id") or existing_ident.get("email") or "").strip().lower()
+                    new_key = (ident.get("account_id") or ident.get("email") or "").strip().lower()
+                    if existing_key and new_key and existing_key != new_key:
+                        return {
+                            "ok": False,
+                            "error": f"slot {slot!r} 已属于 {existing_ident.get('email') or existing_key}, 请换一个账号标识",
+                        }
+
+                target_auth = CODEX_HOME_PATH / f"auth.{slot}.json"
+                _copy_auth_material(login_auth, target_auth)
+                slots[slot] = {
+                    "display_name": display or existing.get("display_name") or f"Codex - {ident.get('email') or slot}",
+                    "mode": "oauth",
+                    "auth_file": str(target_auth),
+                    "app_profile_dir": existing.get("app_profile_dir") or str(CODEX_APP_SUPPORT_PATH / f"Codex.{slot}"),
+                }
+                data["app_history_slot"] = slot
+                data["preferred_official_slot"] = slot
+                _write_json_file(PROVIDER_SLOTS_PATH, data)
+        except Exception as exc:
+            return {"ok": False, "error": f"保存登录文件失败: {type(exc).__name__}: {exc}"}
+        data = _read_json_file(PROVIDER_SLOTS_PATH)
+        accounts = _discover_codex_accounts(data, official_override=slot)
+        accounts["stdout"] = output
+        accounts["login_home"] = _home_path(login_auth.parent)
+        return accounts
+
+    def codex_account_usage(self, slot: str = "") -> dict:
+        """Return local account identity and live Codex usage when this slot is active."""
+        accounts = self.list_codex_accounts()
+        if not accounts.get("ok"):
+            return accounts
+        target = (slot or "").strip() or ((accounts.get("current_official") or {}).get("slot") or "")
+        account = next((a for a in accounts.get("accounts", []) if a.get("slot") == target), None)
+        if not account:
+            return {"ok": False, "error": "未找到官方账号"}
+        auth_path = account.get("source_auth_file") or account.get("auth_file")
+        snapshot = _codex_rpc_snapshot(None if account.get("is_current_provider") else (auth_path or "").replace("~", str(Path.home()), 1))
+        return {"ok": True, "account": account, "snapshot": snapshot}
+
+    def codex_account_config_plan(self, slot: str = "") -> dict:
+        """Dry-run official Codex account switch via sub2cli-inject use <slot>."""
+        accounts = self.list_codex_accounts()
+        target = (slot or "").strip() or ((accounts.get("current_official") or {}).get("slot") or "")
+        if not target:
+            return {"ok": False, "error": "没有已保存的官方账号"}
+        account = next((a for a in accounts.get("accounts", []) if a.get("slot") == target), None)
+        if not account:
+            return {"ok": False, "error": f"未保存的官方账号: {target}"}
+        if not account.get("is_registered"):
+            data = _read_json_file(PROVIDER_SLOTS_PATH)
+            return {
+                "ok": True,
+                "plan_text": "DRY-RUN: 将注册已发现的官方账号槽位并切换到该账号\n",
+                "label": f"{account.get('email') or account.get('display_name') or target} · {account.get('plan_label') or 'Codex'}",
+                "command": f"sub2cli-inject use {target} (auto-register + dry-run)",
+                "slot": target,
+                "changes": _codex_account_import_plan_changes(data, account, target),
+            }
+        inject_bin = self._resolve_inject_bin()
+        if not inject_bin:
+            return {"ok": False, "error": "找不到 sub2cli-inject 二进制"}
+        try:
+            proc = subprocess.run(
+                [inject_bin, "use", target, "--dry-run"],
+                capture_output=True,
+                text=True,
+                env=_inject_subprocess_env(),
+                timeout=INJECT_PLAN_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "error": f"dry-run 超过 {INJECT_PLAN_TIMEOUT} 秒仍未完成; 未写入任何 Codex 配置。",
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"调用 use --dry-run 失败: {type(exc).__name__}: {exc}"}
+        if proc.returncode != 0:
+            return {
+                "ok": False,
+                "error": f"use --dry-run 返回 {proc.returncode}",
+                "stderr": proc.stderr,
+                "stdout": proc.stdout,
+            }
+        return {
+            "ok": True,
+            "plan_text": proc.stdout,
+            "label": f"{account.get('email') or account.get('display_name') or target} · {account.get('plan_label') or 'Codex'}",
+            "command": f"sub2cli-inject use {target} (dry-run)",
+            "slot": target,
+            "changes": _parse_use_plan_changes(proc.stdout, target),
+        }
+
+    def codex_account_config_apply(self, slot: str = "") -> dict:
+        """Switch Codex to a saved official OAuth slot."""
+        accounts = self.list_codex_accounts()
+        target = (slot or "").strip() or ((accounts.get("current_official") or {}).get("slot") or "")
+        if not target:
+            return {"ok": False, "error": "没有已保存的官方账号"}
+        account = next((a for a in accounts.get("accounts", []) if a.get("slot") == target), None)
+        if not account:
+            return {"ok": False, "error": f"未保存的官方账号: {target}"}
+        inject_bin = self._resolve_inject_bin()
+        if not inject_bin:
+            return {"ok": False, "error": "找不到 sub2cli-inject 二进制"}
+        source = _expanded_path(account.get("source_auth_file") or account.get("auth_file"))
+        if not source or not source.exists():
+            return {"ok": False, "error": f"账号 auth 文件不存在: {account.get('source_auth_file') or account.get('auth_file')}"}
+        cmd = [inject_bin, "add-account", target, "--auth-file", str(source)]
+        display = (account.get("display_name") or "").strip()
+        if display:
+            cmd.extend(["--display", display])
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=_inject_subprocess_env(),
+                timeout=INJECT_APPLY_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = _coerce_proc_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
+            stderr = _coerce_proc_text(getattr(exc, "stderr", None))
+            backup_name = _extract_rollback_backup(stdout)
+            rollback_result = _rollback_inject_backup(inject_bin, backup_name) if backup_name else None
+            return {
+                "ok": False,
+                "error": f"配置超过 {INJECT_APPLY_TIMEOUT} 秒仍未完成",
+                "stdout": stdout,
+                "stderr": stderr,
+                "returncode": None,
+                "backup_name": backup_name,
+                "rollback_command": f"sub2cli-inject rollback {backup_name}" if backup_name else None,
+                "auto_rollback": rollback_result,
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        backup_name = _extract_rollback_backup(proc.stdout)
+        rollback_result = None
+        if proc.returncode != 0 and backup_name:
+            rollback_result = _rollback_inject_backup(inject_bin, backup_name)
+        return {
+            "ok": proc.returncode == 0,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "returncode": proc.returncode,
+            "backup_name": backup_name,
+            "rollback_command": f"sub2cli-inject rollback {backup_name}" if backup_name else None,
+            "auto_rollback": rollback_result,
+        }
+
     def check_health(self) -> dict:
         """5 environment + state checks for the 一键检测 panel.
 
@@ -1681,32 +2946,37 @@ class JsApi:
                 "fix_hint": "从 https://codex.io 下载安装; 若装在非默认位置可忽略",
             })
 
-        # 2. codex CLI in PATH?
-        codex_path = shutil.which("codex")
+        # 2. codex CLI. Finder-launched macOS apps often do not inherit the
+        # user's shell PATH, so check common install locations before warning.
+        codex_path, codex_source = _find_codex_cli()
         if codex_path:
-            cli_version = "?"
-            try:
-                r = subprocess.run(
-                    [codex_path, "--version"],
-                    capture_output=True, text=True, timeout=3,
-                )
-                cli_version = (r.stdout or r.stderr).strip().split("\n")[0] or "?"
-            except Exception:
-                pass
+            cli_version = _codex_version(codex_path)
+            if codex_source == "path":
+                severity = "ok"
+                message = f"PATH 可用: {codex_path} ({cli_version})"
+                fix_hint = None
+            elif codex_source == "common":
+                severity = "warn"
+                message = f"已安装但不在当前 GUI PATH: {codex_path} ({cli_version})"
+                fix_hint = "桌面配置 Codex App 不受影响；若要在终端用 codex，请检查 shell PATH"
+            else:
+                severity = "warn"
+                message = f"Codex App 自带 runtime 可用: {codex_path} ({cli_version})"
+                fix_hint = "未找到独立终端 codex 命令；只用桌面配置 Codex App 可忽略"
             checks.append({
                 "name": "codex CLI",
                 "ok": True,
-                "severity": "ok",
-                "message": f"{codex_path} ({cli_version})",
-                "fix_hint": None,
+                "severity": severity,
+                "message": message,
+                "fix_hint": fix_hint,
             })
         else:
             checks.append({
                 "name": "codex CLI",
                 "ok": False,
-                "severity": "err",
-                "message": "在 PATH 找不到 codex 命令",
-                "fix_hint": "npm i -g @openai/codex 或检查当前 shell 的 PATH",
+                "severity": "warn",
+                "message": "未找到独立终端 codex 命令",
+                "fix_hint": "桌面配置 Codex App 不受影响；需要终端 CLI 时再安装或检查 shell PATH",
             })
 
         # 3. Edge CDP 9222 + 当前 relay 的登录 tab
@@ -1835,7 +3105,7 @@ class JsApi:
             default_key = sub2cli_lib.find_key_by_name(keys, default_name)
             if not default_key:
                 return {"ok": False, "error": "未设置默认 key, 无法测试"}
-            ep_url = (cfg or {}).get("default_endpoint_url") or f"https://{ctx.site}/v1"
+            ep_url = (cfg or {}).get("default_endpoint_url") or sub2cli_lib.normalize_v1(ctx.domain)
 
             if default_key.get("group_id") != group_id:
                 ok, err = ctx.update_key_group(int(default_key["id"]), int(group_id))
