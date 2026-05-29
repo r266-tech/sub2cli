@@ -7,12 +7,18 @@ const state = {
   bootstrapped: false,
   endpoints: [],
   groups: [],
+  keys: [],
   subscriptions: [],
   defaultKey: null,
+  codexKey: null,
   defaultEndpoint: null,
   pingResults: {}, // url → {ok, latency_ms, summary} | {running:true}
-  groupResults: {}, // group_id → {chat:{...}, image:{...}}
+  groupResults: {}, // group_id → {modelName:{...}}
   groupSelected: {}, // group_id → boolean (checkbox state for batch test)
+  models: [],
+  groupModels: {}, // group_id -> model names returned while the test key is in that group
+  modelError: null,
+  groupModelColumns: [], // model names selected for group test columns
   lastDomain: null,  // current relay domain, for modal hints
   currentEmail: null,
   viewMode: 'relay',
@@ -20,9 +26,11 @@ const state = {
   currentCodexAccount: null,
   currentInjectTarget: 'relay',
   configTargetRunning: false,
+  retryRelayDomain: null,
   dragSorting: false,
   lastInjectBackup: null,
   lastInjectChanges: null,
+  keySecret: null,
 };
 
 const PROJECT_URL = 'https://github.com/r266-tech/sub2cli';
@@ -46,6 +54,11 @@ function showError(title, msg) {
   $('#error-title').textContent = title;
   $('#error-msg').textContent = msg || '(空)';
   showScreen('error');
+}
+
+function showLoginError(domain, fallbackMsg = '') {
+  state.retryRelayDomain = domain || state.lastDomain || null;
+  showError('请重新登录', fallbackMsg || `请先在浏览器登录 ${state.retryRelayDomain || '当前 relay'}`);
 }
 
 function openProjectPage() {
@@ -146,7 +159,7 @@ function buildTag(result) {
   }
   if (result.ok) {
     span.classList.add('ok');
-    span.textContent = `[OK] ${fmtLatency(result.latency_ms)}`;
+    span.textContent = fmtLatency(result.latency_ms);
     return span;
   }
   span.classList.add('err');
@@ -159,9 +172,74 @@ function el(tag, opts = {}) {
   if (opts.className) e.className = opts.className;
   if (opts.text != null) e.textContent = String(opts.text);
   if (opts.children) for (const c of opts.children) if (c) e.appendChild(c);
-  if (opts.attrs) for (const [k, v] of Object.entries(opts.attrs)) e.setAttribute(k, v);
+  if (opts.attrs) {
+    for (const [k, v] of Object.entries(opts.attrs)) {
+      if (v == null || v === false) continue;
+      e.setAttribute(k, v === true ? '' : v);
+    }
+  }
   if (opts.onClick) e.addEventListener('click', opts.onClick);
   return e;
+}
+
+function uniqueModels(items) {
+  const result = [];
+  const seen = new Set();
+  for (const item of items || []) {
+    const model = String(item || '').trim();
+    if (!model || seen.has(model)) continue;
+    result.push(model);
+    seen.add(model);
+  }
+  return result;
+}
+
+function normalizeGroupModelColumns(columns, models) {
+  const result = uniqueModels(columns);
+  if (result.length) return result;
+  const available = uniqueModels(models);
+  return available.slice(0, 2);
+}
+
+function modelOptionsForColumn(currentModel, columnIndex = -1) {
+  const groupOptionLists = Object.values(state.groupModels || {});
+  const opts = uniqueModels([...state.models, ...groupOptionLists.flat()]);
+  const current = String(currentModel || '').trim();
+  if (current && !opts.includes(current)) opts.unshift(current);
+  const selectedElsewhere = new Set(
+    state.groupModelColumns.filter((_, idx) => idx !== columnIndex)
+  );
+  return opts.filter((model) => model === current || !selectedElsewhere.has(model));
+}
+
+function setGroupModelColumns(columns, { persist = true } = {}) {
+  state.groupModelColumns = uniqueModels(columns);
+  for (const gid of Object.keys(state.groupResults)) {
+    const row = state.groupResults[gid] || {};
+    for (const model of Object.keys(row)) {
+      if (!state.groupModelColumns.includes(model)) delete row[model];
+    }
+  }
+  renderGroups(state.groups, [], state.defaultKey);
+  if (persist) persistGroupModelColumns();
+}
+
+async function persistGroupModelColumns() {
+  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.save_group_model_columns) return;
+  try {
+    const r = await window.pywebview.api.save_group_model_columns(state.groupModelColumns);
+    if (r && r.ok) {
+      state.models = uniqueModels(r.models || state.models);
+      state.groupModels = r.group_models || state.groupModels || {};
+      state.modelError = r.model_error || null;
+      state.groupModelColumns = normalizeGroupModelColumns(r.group_model_columns || state.groupModelColumns, state.models);
+      renderGroups(state.groups, [], state.defaultKey);
+    } else if (r && r.error) {
+      setStatus(r.error, 'err');
+    }
+  } catch (err) {
+    setStatus(err && err.message ? err.message : String(err), 'err');
+  }
 }
 
 // ---- one-mode UI ----
@@ -176,7 +254,6 @@ function clearModeState() {
 async function bootstrap(autoRecovered = false) {
   showScreen('loading');
   setStatus('连接中…');
-  refreshSidebar();
   try {
     const data = await window.pywebview.api.bootstrap();
     if (!data.ok) {
@@ -192,10 +269,12 @@ async function bootstrap(autoRecovered = false) {
         } catch (_) {}
       }
       if (data.needs_login) {
-        showError('请重新登录', `请先在浏览器登录 ${data.domain || '当前 relay'}`);
+        showLoginError(data.domain, `请先在浏览器登录 ${data.domain || '当前 relay'}`);
       } else if (data.needs_setup) {
+        state.retryRelayDomain = null;
         showError('尚未配置', data.error || '未知错误');
       } else {
+        state.retryRelayDomain = null;
         showError('错误', data.error || '未知错误');
       }
       setStatus('未就绪', 'err');
@@ -217,8 +296,9 @@ async function refresh() {
     if (!data.ok) {
       setStatus('刷新失败', 'err');
       if (data.needs_login) {
-        showError('请重新登录', `请先在浏览器登录 ${data.domain || '当前 relay'}`);
+        showLoginError(data.domain, `请先在浏览器登录 ${data.domain || '当前 relay'}`);
       } else {
+        state.retryRelayDomain = null;
         showError('错误', data.error);
       }
       return;
@@ -233,18 +313,77 @@ async function refresh() {
   }
 }
 
+async function ensureCodexAppEnhanced() {
+  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.ensure_codex_app) return;
+  if (state.configTargetRunning) return;
+  state.configTargetRunning = true;
+  state.currentInjectTarget = 'relay';
+  setConfigTargetBusy('relay', '注入中…');
+  setStatus('正在注入 Codex App 增强…', 'warn');
+  renderConfigTargetResult(
+    'running',
+    '正在注入 Codex App 增强',
+    '正在重启 Codex 并加载 fast / 模型列表 / 插件入口。'
+  );
+  try {
+    const r = await window.pywebview.api.ensure_codex_app();
+    const log = planLog([
+      r && r.ok ? '[READY] Codex App enhance injected.' : '[ERR] Codex App enhance failed.',
+      r && r.error ? `[ERR] reason: ${r.error}` : null,
+      r && r.returncode !== undefined ? `[INFO] returncode: ${r.returncode ?? 'timeout'}` : null,
+      r && r.restarted !== undefined ? `[INFO] restarted: ${r.restarted ? 'yes' : 'no'}` : null,
+      r && r.stdout ? `[INFO] stdout:\n${r.stdout}` : null,
+      r && r.stderr ? `[INFO] stderr:\n${r.stderr}` : null,
+    ]);
+    if (r && r.ok) {
+      renderConfigTargetResult(
+        'ok',
+        '注入完成',
+        r.restarted ? 'Codex 已重启并加载增强。' : 'Codex 增强已确认。下次手动重启后需要再次注入。',
+        { log }
+      );
+      setStatus(r.restarted ? '✓ Codex App 增强已重启注入' : '✓ Codex App 增强已注入', 'ok');
+      return;
+    }
+    renderConfigTargetResult(
+      'err',
+      '注入失败',
+      (r && (r.error || r.stderr)) || 'Codex App 增强未就绪。',
+      { tag: '[ERR]', log }
+    );
+    setStatus('✗ 注入失败', 'err');
+  } catch (err) {
+    renderConfigTargetResult(
+      'err',
+      '注入调用失败',
+      err && err.message ? err.message : String(err),
+      { log: planLog([`[ERR] exception: ${err && err.stack ? err.stack : String(err)}`]) }
+    );
+    setStatus('注入失败', 'err');
+  } finally {
+    state.configTargetRunning = false;
+    resetConfigTargetButtons();
+  }
+}
+
 function applyBootstrap(data) {
   state.bootstrapped = true;
   state.lastDomain = data.domain || data.site || null;
   state.endpoints = data.endpoints || [];
   state.groups = data.groups || [];
+  state.keys = data.keys || [];
   state.subscriptions = data.subscriptions || [];
   state.defaultKey = data.default_key;
+  state.codexKey = data.codex_key || null;
   state.defaultEndpoint = data.default_endpoint;
+  state.models = uniqueModels(data.models || []);
+  state.groupModels = data.group_models || {};
+  state.modelError = data.model_error || null;
+  state.groupModelColumns = normalizeGroupModelColumns(data.group_model_columns || [], state.models);
   setBrandSubtitle(data.site || data.domain || '');
   renderAccount(data);
   renderSubscriptions(state.subscriptions);
-  renderDefaultKey(data);
+  renderKeys(state.keys, state.groups, data.default_key, state.codexKey);
   renderEndpoints(data.endpoints || [], data.default_endpoint);
   renderGroups(data.groups || [], data.keys || [], data.default_key);
   refreshSidebar();  // sidebar is independent of bootstrap data
@@ -284,9 +423,9 @@ function updateContextLabels() {
   if (choiceRelay) choiceRelay.textContent = relay;
   if (choiceCodex) choiceCodex.textContent = codex;
   if (choiceRelayMeta) {
-    const key = state.defaultKey && state.defaultKey.name ? state.defaultKey.name : '默认 key';
+    const key = state.codexKey && state.codexKey.name ? state.codexKey.name : '未选 key';
     const ep = state.defaultEndpoint && state.defaultEndpoint.name ? state.defaultEndpoint.name : '默认端点';
-    choiceRelayMeta.textContent = `${key} · ${ep}`;
+    choiceRelayMeta.textContent = `Codex key: ${key} · 端点: ${ep}`;
   }
   if (choiceCodexMeta) {
     choiceCodexMeta.textContent = state.currentCodexAccount
@@ -575,8 +714,9 @@ async function switchRelay(domain) {
     const data = await window.pywebview.api.switch_relay(domain);
     if (!data.ok) {
       if (data.needs_login) {
-        showError('请重新登录', `请先在浏览器登录 ${data.domain || domain}`);
+        showLoginError(data.domain || domain, `请先在浏览器登录 ${data.domain || domain}`);
       } else {
+        state.retryRelayDomain = null;
         showError('切 relay 失败', data.error);
       }
       setStatus('未就绪', 'err');
@@ -585,6 +725,7 @@ async function switchRelay(domain) {
     state.pingResults = {};
     state.groupResults = {};
     state.viewMode = 'relay';
+    state.retryRelayDomain = null;
     applyBootstrap(data);
     renderMainMode();
     showScreen('dashboard');
@@ -830,8 +971,30 @@ function closeConfigTargetModal() {
   $('#config-target-modal').classList.add('hidden');
 }
 
-function startRelayConfig() {
+async function startRelayConfig() {
   state.currentInjectTarget = 'relay';
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.relay_config_status) {
+    try {
+      const r = await window.pywebview.api.relay_config_status();
+      if (r && r.ok && r.already_current) {
+        const shouldEnhance = window.confirm('已经是该渠道，是否需要重新注入增强扩展？');
+        if (shouldEnhance) {
+          ensureCodexAppEnhanced();
+        } else {
+          renderConfigTargetResult(
+            'ok',
+            '已经是该渠道',
+            `${r.label || configTargetDetail('relay')}。未重新配置。`,
+            { tag: '[READY]' }
+          );
+          setStatus('✓ 已经是该渠道', 'ok');
+        }
+        return;
+      }
+    } catch (_err) {
+      // Fall back to the normal configure path; inject_apply still has rollback.
+    }
+  }
   applyConfigTarget('relay');
 }
 
@@ -897,9 +1060,9 @@ function configTargetDetail(target) {
     const acc = state.currentCodexAccount;
     return acc ? `${acc.email || acc.display_name || acc.slot} · ${acc.plan_label || 'Codex'}` : '未选择官方账号';
   }
-  const key = state.defaultKey && state.defaultKey.name ? state.defaultKey.name : '默认 key';
+  const key = state.codexKey && state.codexKey.name ? state.codexKey.name : '未选 key';
   const ep = state.defaultEndpoint && state.defaultEndpoint.name ? state.defaultEndpoint.name : '默认端点';
-  return `${currentRelayLabel()} · ${key} · ${ep}`;
+  return `${currentRelayLabel()} · Codex key ${key} · ${ep}`;
 }
 
 function buildApplyLog(r, targetLabel) {
@@ -1216,7 +1379,7 @@ async function applyInject() {
   setStatus('配置中…', 'warn');
   const isOfficial = state.currentInjectTarget === 'official';
   renderInjectState('正在配置 Codex', [
-    { state: 'ok', title: `读取${isOfficial ? '官方账号' : '当前中转'}`, detail: isOfficial ? '使用已选择的官方账号作为配置目标' : '使用当前默认 key 和端点作为配置目标' },
+    { state: 'ok', title: `读取${isOfficial ? '官方账号' : '当前中转'}`, detail: isOfficial ? '使用已选择的官方账号作为配置目标' : '使用 API Keys 中选用的 Codex key 和端点作为配置目标' },
     { state: 'running', title: '写入 Codex 配置', detail: isOfficial ? '导入账号 auth、切换 auth.json、更新 config.toml 为 OAuth 模式' : '保存 API 渠道、切换 auth.json、更新 config.toml' },
     { state: 'pending', title: '刷新 Codex App', detail: '写入成功后会按 sub2cli-inject 逻辑重启/打开 Codex' },
     { state: 'pending', title: '准备撤销点', detail: '成功后会显示撤销本次配置按钮' },
@@ -1496,25 +1659,95 @@ function renderSubscriptions(subscriptions) {
   list.replaceChildren(frag);
 }
 
-function renderDefaultKey(data) {
-  const k = data.default_key;
-  if (!k) {
-    $('#key-name').textContent = '—';
-    $('#key-group').textContent = '—';
-    $('#key-value').textContent = '—';
-    $('#ep-current').textContent = '—';
-    $('#btn-reveal').disabled = true;
-    return;
+function buildGroupSelect(currentGroupId, options = {}) {
+  const select = el('select', {
+    className: options.className || 'key-group-select',
+    attrs: {
+      title: options.title || '选择分组',
+      'aria-label': options.ariaLabel || '选择分组',
+      disabled: options.disabled ? 'true' : null,
+    },
+  });
+  for (const group of state.groups) {
+    const option = el('option', {
+      text: `${group.name || '?'} (${fmtRate(group.rate_multiplier)})`,
+      attrs: { value: group.id },
+    });
+    if (String(group.id) === String(currentGroupId)) option.selected = true;
+    select.appendChild(option);
   }
-  $('#key-name').textContent = k.name || '—';
-  $('#key-group').textContent = `${k.group_name || '?'} (${fmtRate(k.group_rate)})`;
-  $('#key-value').textContent = k.key_masked || '—';
-  const revealBtn = $('#btn-reveal');
-  revealBtn.disabled = false;
-  revealBtn.textContent = '显示';
-  revealBtn.dataset.revealed = '0';
-  const ep = data.default_endpoint;
-  $('#ep-current').textContent = ep ? ep.endpoint : '—';
+  return select;
+}
+
+function buildKeyActions(k, isCodexKey) {
+  const actions = el('div', { className: 'key-actions' });
+  actions.appendChild(el('button', {
+    className: 'link sm key-action-btn',
+    text: 'key',
+    attrs: { type: 'button', title: `显示 ${k.name || 'key'} 的完整 key` },
+    onClick: () => openKeySecret(k),
+  }));
+  actions.appendChild(el('button', {
+    className: 'link sm key-action-btn' + (isCodexKey ? ' active' : ''),
+    text: isCodexKey ? '已选' : '选用',
+    attrs: {
+      type: 'button',
+      title: isCodexKey ? '配置 Codex 时已使用此 key' : '配置 Codex 时使用此 key',
+      disabled: isCodexKey ? 'true' : null,
+    },
+    onClick: () => selectCodexKey(k.id),
+  }));
+  return actions;
+}
+
+function buildKeyRow(k, defaultKey, codexKey) {
+  const tr = document.createElement('tr');
+  const isTestKey = !!(k.is_test_key || (defaultKey && String(defaultKey.id) === String(k.id)));
+  const isCodexKey = !!(k.is_codex_key || (codexKey && String(codexKey.id) === String(k.id)));
+  if (isTestKey) tr.classList.add('test-key');
+  if (isCodexKey) tr.classList.add('codex-key');
+  tr.appendChild(el('td', {
+    children: [
+      el('span', { className: 'key-row-name', text: k.name || '?' }),
+      isTestKey ? el('span', { className: 'tag dim key-row-badge', text: '测试' }) : null,
+      isCodexKey ? el('span', { className: 'tag running key-row-badge', text: 'Codex' }) : null,
+    ],
+  }));
+  tr.appendChild(el('td', { className: 'mono', text: k.key_masked || '—' }));
+  tr.appendChild(el('td', {
+    children: [el('span', { className: `tag ${k.status === 'active' ? 'ok' : 'dim'}`, text: k.status || '?' })],
+  }));
+  const groupTd = el('td');
+  if (isTestKey) {
+    groupTd.appendChild(el('span', { className: 'key-test-auto', text: '测试时自动切换' }));
+  } else {
+    const select = buildGroupSelect(k.group_id, {
+      title: `选择 ${k.name || 'key'} 的分组`,
+      ariaLabel: `选择 ${k.name || 'key'} 的分组`,
+    });
+    select.addEventListener('change', () => updateKeyGroup(k.id, select.value));
+    groupTd.appendChild(select);
+  }
+  tr.appendChild(groupTd);
+  tr.appendChild(el('td', {
+    className: 'right',
+    children: [buildKeyActions(k, isCodexKey)],
+  }));
+  return tr;
+}
+
+function renderKeys(keys, _groups, defaultKey, codexKey = state.codexKey) {
+  const tbody = $('#t-keys-body');
+  if (!tbody) return;
+  const frag = document.createDocumentFragment();
+  if (!keys.length) {
+    frag.appendChild(el('tr', {
+      children: [el('td', { text: '暂无 key', attrs: { colspan: '5' } })],
+    }));
+  } else {
+    for (const k of keys) frag.appendChild(buildKeyRow(k, defaultKey, codexKey));
+  }
+  tbody.replaceChildren(frag);
 }
 
 function buildEndpointRow(ep, isCurrent, pingResult) {
@@ -1554,9 +1787,107 @@ function renderEndpoints(endpoints, defaultEp) {
   tbody.replaceChildren(frag);
 }
 
+function buildGroupHeader() {
+  const thead = $('#t-groups-head');
+  if (!thead) return;
+  const tr = document.createElement('tr');
+  const total = state.groups.length;
+  const selected = getSelectedGroupIds().length;
+  const allSelected = total > 0 && selected === total;
+  const checkboxTh = el('th', { className: 'checkbox-col', attrs: { 'aria-label': '选择' } });
+  const selectAll = el('button', {
+    className: 'group-select-mark group-select-all' + (allSelected ? ' active' : ''),
+    attrs: {
+      type: 'button',
+      title: allSelected ? '清空已选分组' : '全选分组用于批量测速',
+      'aria-label': allSelected ? '清空已选分组' : '全选分组用于批量测速',
+      'aria-pressed': allSelected ? 'true' : 'false',
+      disabled: total === 0 ? 'true' : null,
+    },
+    onClick: toggleAllGroups,
+  });
+  checkboxTh.appendChild(selectAll);
+  tr.appendChild(checkboxTh);
+  tr.appendChild(el('th', { text: '倍率' }));
+  tr.appendChild(el('th', { text: '名称' }));
+
+  const hasUnusedModel = hasUnusedGroupModelCandidate();
+  state.groupModelColumns.forEach((model, idx) => {
+    const th = el('th', { className: 'right group-model-col' });
+    const wrap = el('div', { className: 'group-model-head' });
+    const select = el('select', {
+      className: 'group-model-select',
+      attrs: { title: model || '选择模型', 'aria-label': '模型' },
+    });
+    for (const optModel of modelOptionsForColumn(model, idx)) {
+      const option = el('option', { text: optModel, attrs: { value: optModel } });
+      if (optModel === model) option.selected = true;
+      select.appendChild(option);
+    }
+    select.value = model;
+    select.addEventListener('change', () => {
+      const next = [...state.groupModelColumns];
+      next[idx] = select.value;
+      setGroupModelColumns(next);
+    });
+    wrap.appendChild(select);
+    if (state.groupModelColumns.length > 1) {
+      wrap.appendChild(el('button', {
+        className: 'group-model-remove',
+        text: '×',
+        attrs: { type: 'button', title: `移除模型${idx + 1}`, 'aria-label': `移除模型${idx + 1}` },
+        onClick: () => {
+          const next = state.groupModelColumns.filter((_, i) => i !== idx);
+          setGroupModelColumns(next);
+        },
+      }));
+    }
+    if (idx === state.groupModelColumns.length - 1) {
+      const addBtn = el('button', {
+        className: 'group-model-add',
+        text: '+',
+        attrs: {
+          type: 'button',
+          title: hasUnusedModel ? '添加模型列' : '没有更多可添加的模型',
+          'aria-label': hasUnusedModel ? '添加模型列' : '没有更多可添加的模型',
+          disabled: !hasUnusedModel ? 'true' : null,
+        },
+        onClick: addGroupModelColumn,
+      });
+      wrap.appendChild(addBtn);
+    }
+    th.appendChild(wrap);
+    tr.appendChild(th);
+  });
+
+  thead.replaceChildren(tr);
+}
+
+function hasUnusedGroupModelCandidate() {
+  const existing = new Set(state.groupModelColumns);
+  const groupOptionLists = Object.values(state.groupModels || {});
+  const candidates = uniqueModels([...state.models, ...groupOptionLists.flat()]);
+  return candidates.some((model) => !existing.has(model));
+}
+
+function addGroupModelColumn() {
+  const existing = new Set(state.groupModelColumns);
+  const groupOptionLists = Object.values(state.groupModels || {});
+  const candidates = uniqueModels([...state.models, ...groupOptionLists.flat()]);
+  if (!candidates.length) {
+    setStatus(state.modelError || '模型列表为空', 'warn');
+    return;
+  }
+  const nextModel = candidates.find((m) => !existing.has(m));
+  if (!nextModel) {
+    setStatus('所有已读取模型都在表格中', 'warn');
+    return;
+  }
+  setGroupModelColumns([...state.groupModelColumns, nextModel]);
+}
+
 function buildGroupRow(g, isDefaultHere, groupResult) {
   const tr = document.createElement('tr');
-  if (isDefaultHere) tr.classList.add('current');
   const selectedForTest = !!state.groupSelected[g.id];
   if (selectedForTest) tr.classList.add('selected-for-test');
 
@@ -1578,7 +1909,7 @@ function buildGroupRow(g, isDefaultHere, groupResult) {
       selectBtn.title = next ? '取消选择此分组' : '选择此分组用于批量测速';
       tr.classList.toggle('selected-for-test', next);
       updateBatchTestButton();
-      updateToggleAllButton();
+      buildGroupHeader();
     },
   });
   checkboxTd.appendChild(selectBtn);
@@ -1591,30 +1922,17 @@ function buildGroupRow(g, isDefaultHere, groupResult) {
   tr.appendChild(el('td', { text: fmtRate(g.rate_multiplier) }));
   tr.appendChild(el('td', { text: g.name || '?' }));
 
-  const chatTd = el('td', { className: 'right' });
-  chatTd.appendChild(buildTag(groupResult && groupResult.chat));
-  tr.appendChild(chatTd);
-
-  const imgTd = el('td', { className: 'right' });
-  imgTd.appendChild(buildTag(groupResult && groupResult.image));
-  tr.appendChild(imgTd);
-
-  const actionsTd = el('td', { className: 'right' });
-  if (isDefaultHere) {
-    actionsTd.appendChild(el('span', { className: 'switch-action inactive', text: '当前选用' }));
-  } else {
-    actionsTd.appendChild(el('button', {
-      className: 'link sm',
-      text: '选用',
-      onClick: () => setDefaultGroup(g.id),
-    }));
+  for (const model of state.groupModelColumns) {
+    const modelTd = el('td', { className: 'right group-model-cell' });
+    modelTd.appendChild(buildTag(groupResult && groupResult[model]));
+    tr.appendChild(modelTd);
   }
-  tr.appendChild(actionsTd);
 
   return tr;
 }
 
 function renderGroups(groups, _keys, defaultKey) {
+  buildGroupHeader();
   const tbody = $('#t-groups-body');
   const sorted = [...groups].sort((a, b) => (a.rate_multiplier ?? 99999) - (b.rate_multiplier ?? 99999));
   const frag = document.createDocumentFragment();
@@ -1625,7 +1943,6 @@ function renderGroups(groups, _keys, defaultKey) {
   }
   tbody.replaceChildren(frag);
   updateBatchTestButton();
-  updateToggleAllButton();
 }
 
 // ---- batch group test (selection rail + serial probe) ----
@@ -1636,26 +1953,12 @@ function getSelectedGroupIds() {
 
 function updateBatchTestButton() {
   const btn = $('#btn-test-selected-groups');
-  const summary = $('#group-selection-summary');
   const n = getSelectedGroupIds().length;
+  const hasModels = state.groupModelColumns.length > 0 && state.groupModelColumns.every(Boolean);
   if (btn) {
-    btn.disabled = n === 0;
+    btn.disabled = n === 0 || !hasModels;
     btn.textContent = n > 0 ? `测试 ${n}` : '测试';
   }
-  if (summary) {
-    summary.textContent = `已选 ${n}`;
-    summary.classList.toggle('active', n > 0);
-  }
-}
-
-function updateToggleAllButton() {
-  const btn = $('#btn-toggle-all-groups');
-  if (!btn) return;
-  const total = state.groups.length;
-  const sel = getSelectedGroupIds().length;
-  btn.disabled = total === 0;
-  btn.textContent = (total > 0 && sel === total) ? '清空' : '全选';
-  btn.title = (total > 0 && sel === total) ? '清空已选分组' : '全选分组用于批量测速';
 }
 
 function toggleAllGroups() {
@@ -1671,36 +1974,38 @@ function toggleAllGroups() {
 
 async function testSelectedGroups() {
   const ids = getSelectedGroupIds();
-  if (!ids.length) return;
+  const columns = uniqueModels(state.groupModelColumns);
+  if (!ids.length || !columns.length) return;
   // SERIAL: server-side "current default group" is per-account state;
   // parallel calls would all race on the switch and end up hitting whichever
   // group landed last. Must do switch → send → await → next, one at a time.
   for (const id of ids) {
-    state.groupResults[id] = { chat: { running: true }, image: { running: true } };
+    state.groupResults[id] = Object.fromEntries(columns.map((model) => [model, { running: true }]));
   }
   renderGroups(state.groups, [], state.defaultKey);
   let done = 0;
   for (const id of ids) {
     setStatus(`串行测试 ${done + 1}/${ids.length}…`, 'warn');
     try {
-      const r = await window.pywebview.api.test_group(id);
+      const r = await window.pywebview.api.test_group(id, columns);
       if (!r.ok) {
-        state.groupResults[id] = {
-          chat: { ok: false, status: 'err', summary: r.error },
-          image: { ok: false, status: 'err', summary: r.error },
-        };
+        state.groupResults[id] = Object.fromEntries(
+          columns.map((model) => [model, { ok: false, status: 'err', summary: r.error }])
+        );
       } else {
-        state.groupResults[id] = { chat: r.chat, image: r.image };
+        state.groupResults[id] = r.results || {};
         if (r.default_key) state.defaultKey = r.default_key;
+        if (r.codex_key) state.codexKey = r.codex_key;
+        if (r.keys) state.keys = r.keys;
       }
     } catch (err) {
-      state.groupResults[id] = {
-        chat: { ok: false, status: 'err', summary: String(err) },
-        image: { ok: false, status: 'err', summary: String(err) },
-      };
+      state.groupResults[id] = Object.fromEntries(
+        columns.map((model) => [model, { ok: false, status: 'err', summary: String(err) }])
+      );
     }
     done++;
     renderGroups(state.groups, [], state.defaultKey);  // 每个完成立刻刷
+    renderKeys(state.keys, state.groups, state.defaultKey, state.codexKey);
   }
   setStatus(`✓ 完成 ${done}/${ids.length} 个分组`, 'ok');
 }
@@ -1740,52 +2045,91 @@ async function setDefaultEndpoint(name) {
       return;
     }
     state.defaultEndpoint = r.default_endpoint;
-    $('#ep-current').textContent = r.default_endpoint.endpoint;
     renderEndpoints(state.endpoints, state.defaultEndpoint);
+    updateContextLabels();
     setStatus('✓ 已切端点', 'ok');
   } catch (err) {
     setStatus('错误', 'err');
   }
 }
 
-async function setDefaultGroup(groupId) {
-  setStatus('切分组中…', 'warn');
+async function selectCodexKey(keyId) {
+  setStatus('切 Codex key 中…', 'warn');
   try {
-    const r = await window.pywebview.api.set_default_group(groupId);
+    const r = await window.pywebview.api.set_codex_key(keyId);
+    if (!r.ok) {
+      setStatus(r.error || '切 Codex key 失败', 'err');
+      return;
+    }
+    state.codexKey = r.codex_key || null;
+    if (r.keys) state.keys = r.keys;
+    renderKeys(state.keys, state.groups, state.defaultKey, state.codexKey);
+    updateContextLabels();
+    setStatus('✓ 已切 Codex key', 'ok');
+  } catch (err) {
+    setStatus('错误', 'err');
+  }
+}
+
+async function updateKeyGroup(keyId, groupId) {
+  setStatus('切 key 分组中…', 'warn');
+  try {
+    const r = await window.pywebview.api.update_key_group(keyId, groupId);
     if (!r.ok) {
       setStatus(r.error || '切分组失败', 'err');
     } else {
-      state.defaultKey = r.default_key;
-      renderDefaultKey({ default_key: state.defaultKey, default_endpoint: state.defaultEndpoint });
+      state.keys = r.keys || state.keys.map((k) => String(k.id) === String(r.key.id) ? r.key : k);
+      if (r.codex_key) state.codexKey = r.codex_key;
+      if (state.defaultKey && String(state.defaultKey.id) === String(r.key.id)) state.defaultKey = r.key;
+      renderKeys(state.keys, state.groups, state.defaultKey, state.codexKey);
+      renderGroups(state.groups, [], state.defaultKey);
       updateContextLabels();
-      setStatus('✓ 已切分组', 'ok');
+      setStatus('✓ 已更新 key 分组', 'ok');
     }
   } catch (err) {
     setStatus('错误', 'err');
   }
-  renderGroups(state.groups, [], state.defaultKey);
 }
 
-async function revealKey() {
-  const btn = $('#btn-reveal');
-  const keyEl = $('#key-value');
-  if (btn.dataset.revealed === '1') {
-    keyEl.textContent = (state.defaultKey && state.defaultKey.key_masked) || '—';
-    btn.textContent = '显示';
-    btn.dataset.revealed = '0';
-    return;
-  }
+async function openKeySecret(k) {
+  if (!k || k.id === undefined || k.id === null) return;
+  const modal = $('#key-secret-modal');
+  const nameEl = $('#key-secret-name');
+  const valueEl = $('#key-secret-value');
+  state.keySecret = null;
+  nameEl.textContent = k.name || 'API Key';
+  valueEl.textContent = '读取中...';
+  modal.classList.remove('hidden');
   try {
-    const r = await window.pywebview.api.reveal_default_key();
+    const r = await window.pywebview.api.reveal_key(k.id);
     if (!r.ok) {
-      setStatus(r.error, 'err');
+      valueEl.textContent = r.error || '读取失败';
+      setStatus(r.error || '读取 key 失败', 'err');
       return;
     }
-    keyEl.textContent = r.key;
-    btn.textContent = '隐藏';
-    btn.dataset.revealed = '1';
+    state.keySecret = r.key || '';
+    nameEl.textContent = r.name || k.name || 'API Key';
+    valueEl.textContent = state.keySecret || '—';
   } catch (err) {
+    valueEl.textContent = err && err.message ? err.message : String(err);
     setStatus('错误', 'err');
+  }
+}
+
+function closeKeySecret() {
+  $('#key-secret-modal').classList.add('hidden');
+  state.keySecret = null;
+  $('#key-secret-value').textContent = '—';
+}
+
+async function copyKeySecret() {
+  const text = state.keySecret || $('#key-secret-value').textContent || '';
+  if (!text || text === '—' || text === '读取中...') return;
+  try {
+    await navigator.clipboard.writeText(text);
+    setStatus('✓ key 已复制', 'ok');
+  } catch (_err) {
+    setStatus('复制失败', 'err');
   }
 }
 
@@ -1873,9 +2217,9 @@ window.addEventListener('pywebviewready', () => {
     window.pywebview.api.customize_chrome().catch(() => {});
   }
   installHeaderDrag();
-  refreshCodexAccounts();
-  bootstrap();
-  initVersionChip();
+  bootstrap().finally(() => {
+    initVersionChip();
+  });
 });
 
 // ---- header drag (WKWebView doesn't honor -webkit-app-region; bridge to AppKit) ----
@@ -1982,6 +2326,7 @@ $('#btn-refresh').addEventListener('click', () => {
   if (!state.bootstrapped) bootstrap();
   else refresh();
 });
+
 $('#btn-github').addEventListener('click', openProjectPage);
 $('#btn-update').addEventListener('click', installAppUpdate);
 $('#brand-link').addEventListener('click', openProjectPage);
@@ -1993,12 +2338,19 @@ $('#brand-link').addEventListener('keydown', (e) => {
 });
 
 $('#btn-retry').addEventListener('click', () => {
-  bootstrap();
+  if (state.retryRelayDomain) {
+    switchRelay(state.retryRelayDomain);
+  } else {
+    bootstrap();
+  }
 });
 
-$('#btn-reveal').addEventListener('click', revealKey);
-
 $('#btn-ping-all').addEventListener('click', pingAll);
+$('#btn-key-secret-close').addEventListener('click', closeKeySecret);
+$('#btn-key-secret-copy').addEventListener('click', copyKeySecret);
+$('#key-secret-modal').addEventListener('click', (e) => {
+  if (e.target === $('#key-secret-modal')) closeKeySecret();
+});
 
 $('#btn-health').addEventListener('click', openHealthModal);
 $('#btn-health-close').addEventListener('click', closeHealthModal);
@@ -2079,7 +2431,6 @@ document.addEventListener('keydown', (e) => {
 clearModeState();
 
 $('#btn-test-selected-groups').addEventListener('click', testSelectedGroups);
-$('#btn-toggle-all-groups').addEventListener('click', toggleAllGroups);
 $('#btn-save-config').addEventListener('click', () => setStatus('✓ 配置已保存', 'ok'));
 $('#btn-use-official').addEventListener('click', chooseOfficialAccount);
 

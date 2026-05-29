@@ -11,15 +11,19 @@ import argparse
 import base64
 import errno
 import fcntl
+import glob
 import getpass
 import json
 import os
 import re
 import select
 import shutil
+import signal
+import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 import tty
@@ -53,6 +57,23 @@ RELAY_PROVIDER = "OpenAI"
 THREAD_PROVIDERS = (OAUTH_PROVIDER, RELAY_PROVIDER)
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
+CODEX_APP_BUNDLE = Path(os.environ.get("SUB2CLI_CODEX_APP", "/Applications/Codex.app")).expanduser()
+CODEX_APP_BUNDLED_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
+CODEX_APP_SERVER_CONTROL_SOCKET = CODEX_HOME / "app-server-control" / "app-server-control.sock"
+PREFERRED_CODEX_DEBUG_PORT = int(os.environ.get("SUB2CLI_CODEX_DEBUG_PORT", "9229"))
+CODEX_AUTH_REFRESH_TIMEOUT = int(os.environ.get("SUB2CLI_CODEX_AUTH_REFRESH_TIMEOUT", "25"))
+ENHANCEMENTS_ENABLED = os.environ.get("SUB2CLI_CODEX_ENHANCEMENTS", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+FORCE_QUIT_CODEX = os.environ.get("SUB2CLI_CODEX_FORCE_QUIT", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 APP_VERSION = "0.1.0"
 APP_URL = os.environ.get("CODEX_PROVIDER_URL", "https://github.com/r266-tech/codex-provider-macos")
 APP_BANNER = r"""
@@ -62,6 +83,21 @@ APP_BANNER = r"""
 | |__| (_) | (_| |  __/>  <|  __/| | | (_) \ V /| | (_| |  __/ |
  \____\___/ \__,_|\___/_/\_\_|   |_|  \___/ \_/ |_|\__,_|\___|_|
 """.strip("\n")
+
+CODEX_CLI_FALLBACKS = (
+    "~/bin/codex",
+    "~/.local/bin/codex",
+    "~/.npm-global/bin/codex",
+    "~/.volta/bin/codex",
+    "~/.bun/bin/codex",
+    "~/Library/pnpm/codex",
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+)
+CODEX_CLI_FALLBACK_GLOBS = (
+    "~/.nvm/versions/node/*/bin/codex",
+    "~/.local/share/fnm/node-versions/*/installation/bin/codex",
+)
 
 
 class ChineseHelpFormatter(argparse.HelpFormatter):
@@ -386,8 +422,185 @@ def save_slots(data: dict) -> None:
     atomic_write_json(SLOTS_FILE, data)
 
 
+def _parse_pid_lines(text: str) -> list[int]:
+    pids: list[int] = []
+    for line in text.splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        try:
+            pids.append(int(value))
+        except ValueError:
+            continue
+    return pids
+
+
+def codex_main_pids() -> list[int]:
+    proc = subprocess.run(["pgrep", "-x", "Codex"], capture_output=True, text=True)
+    return _parse_pid_lines(proc.stdout)
+
+
+def codex_app_main_pids() -> list[int]:
+    """Find the visible Codex.app main process even when pgrep -x misses it."""
+    markers = {
+        str(CODEX_APP_BUNDLE / "Contents" / "MacOS" / "Codex"),
+        str((CODEX_APP_BUNDLE / "Contents" / "MacOS" / "Codex").resolve(strict=False)),
+    }
+    proc = subprocess.run(["ps", "axo", "pid=,command="], capture_output=True, text=True)
+    pids: set[int] = set()
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        raw_pid, command = parts
+        if not any(marker in command for marker in markers):
+            continue
+        try:
+            pids.add(int(raw_pid))
+        except ValueError:
+            continue
+    return sorted(pid for pid in pids if pid != os.getpid())
+
+
+def codex_bundle_pids() -> list[int]:
+    """Return target Codex.app process ids without using helper residue as liveness."""
+    pids: set[int] = set(codex_main_pids())
+    marker_raw = str(CODEX_APP_BUNDLE / "Contents")
+    marker_resolved = str((CODEX_APP_BUNDLE / "Contents").resolve(strict=False))
+    proc = subprocess.run(["ps", "axo", "pid=,command="], capture_output=True, text=True)
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        raw_pid, command = parts
+        if marker_raw not in command and marker_resolved not in command:
+            continue
+        try:
+            pids.add(int(raw_pid))
+        except ValueError:
+            continue
+    return sorted(pid for pid in pids if pid != os.getpid())
+
+
 def codex_running() -> bool:
-    return subprocess.run(["pgrep", "-x", "Codex"], capture_output=True).returncode == 0
+    return bool(codex_main_pids() or codex_app_main_pids())
+
+
+def wait_codex_exit(timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not codex_running():
+            return True
+        time.sleep(0.25)
+    return not codex_running()
+
+
+def signal_pids(pids: list[int], sig: signal.Signals) -> None:
+    for pid in sorted(set(pids)):
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def codex_cli_app_server_control_pids() -> list[int]:
+    """Find the persistent CLI app-server that owns app-server-control.sock.
+
+    Codex App has its own stdio app-server processes. Those should not be
+    touched here; the control socket is used by Terminal/SSH Codex sessions and
+    can cache the pre-switch auth mode until restarted.
+    """
+    pids: set[int] = set()
+    if CODEX_APP_SERVER_CONTROL_SOCKET.exists():
+        try:
+            proc = subprocess.run(
+                ["lsof", "-t", "-nP", str(CODEX_APP_SERVER_CONTROL_SOCKET)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            pids.update(_parse_pid_lines(proc.stdout))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if pids:
+        return sorted(pid for pid in pids if pid != os.getpid())
+
+    proc = subprocess.run(["ps", "axo", "pid=,command="], capture_output=True, text=True)
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        raw_pid, command = parts
+        if " app-server " not in f" {command} ":
+            continue
+        if "--listen unix://" not in command:
+            continue
+        if "app-server-broker" in command:
+            continue
+        try:
+            pids.add(int(raw_pid))
+        except ValueError:
+            continue
+    return sorted(pid for pid in pids if pid != os.getpid())
+
+
+def wait_cli_app_server_exit(pids: list[int], timeout: float) -> bool:
+    deadline = time.time() + timeout
+    targets = set(pids)
+    while time.time() < deadline:
+        holders = set(codex_cli_app_server_control_pids())
+        alive = {pid for pid in targets if pid_alive(pid)}
+        if not holders and not alive:
+            return True
+        time.sleep(0.2)
+    holders = set(codex_cli_app_server_control_pids())
+    alive = {pid for pid in targets if pid_alive(pid)}
+    return not holders and not alive
+
+
+def stop_codex_cli_app_server(timeout: float = 4.0) -> bool:
+    pids = codex_cli_app_server_control_pids()
+    if not pids:
+        if CODEX_APP_SERVER_CONTROL_SOCKET.exists():
+            try:
+                CODEX_APP_SERVER_CONTROL_SOCKET.unlink()
+            except OSError:
+                pass
+        return False
+    signal_pids(pids, signal.SIGTERM)
+    stopped = wait_cli_app_server_exit(pids, timeout)
+    if not stopped:
+        signal_pids(pids, signal.SIGKILL)
+        stopped = wait_cli_app_server_exit(pids, 2.0)
+    if stopped and CODEX_APP_SERVER_CONTROL_SOCKET.exists():
+        try:
+            CODEX_APP_SERVER_CONTROL_SOCKET.unlink()
+        except OSError:
+            pass
+    return stopped
 
 
 def quit_codex(timeout: float = 8.0) -> bool:
@@ -397,23 +610,1245 @@ def quit_codex(timeout: float = 8.0) -> bool:
         subprocess.run(
             ["osascript", "-e", 'tell application id "com.openai.codex" to quit'],
             check=False,
-            timeout=timeout,
+            timeout=min(timeout, 4.0),
             capture_output=True,
             text=True,
         )
     except subprocess.TimeoutExpired:
+        pass
+    if wait_codex_exit(timeout):
         return True
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not codex_running():
+    if FORCE_QUIT_CODEX:
+        print("  Codex.app 退出超时，正在强制结束后继续…", file=sys.stderr)
+        signal_pids(codex_bundle_pids(), signal.SIGTERM)
+        if wait_codex_exit(3.0):
             return True
-        time.sleep(0.25)
+        signal_pids(codex_bundle_pids(), signal.SIGKILL)
+        if wait_codex_exit(3.0):
+            return True
     fail("Codex.app 退出超时。请手动退出 Codex App 后重试。")
     return True
 
 
-def launch_codex() -> None:
+def wait_port(host: str, port: int, timeout: float = 8.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.25)
+    return False
+
+
+def _read_devtools_targets_from_port(port: int) -> list[dict]:
+    try:
+        with urlrequest.urlopen(f"http://127.0.0.1:{port}/json", timeout=1.0) as resp:
+            payload = json.loads(resp.read(2 * 1024 * 1024))
+    except Exception:
+        return []
+    return payload if isinstance(payload, list) else []
+
+
+def devtools_active_port_paths() -> list[Path]:
+    paths = [APP_PROFILE / "DevToolsActivePort"]
+    try:
+        data = load_slots(required=False)
+        for cfg in (data.get("slots") or {}).values():
+            raw = str((cfg or {}).get("app_profile_dir") or "").strip()
+            if raw:
+                paths.append(Path(raw).expanduser() / "DevToolsActivePort")
+    except Exception:
+        pass
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def remove_stale_devtools_active_port_files() -> None:
+    for path in devtools_active_port_paths():
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def devtools_active_port_candidates() -> list[int]:
+    ports: list[int] = []
+    for path in devtools_active_port_paths():
+        try:
+            first = path.read_text(errors="replace").splitlines()[0].strip()
+            port = int(first)
+        except Exception:
+            continue
+        if 0 < port < 65536 and port not in ports:
+            ports.append(port)
+    return ports
+
+
+def codex_debug_port_candidates() -> list[int]:
+    ports = [PREFERRED_CODEX_DEBUG_PORT, *devtools_active_port_candidates()]
+    result: list[int] = []
+    for port in ports:
+        if 0 < int(port) < 65536 and int(port) not in result:
+            result.append(int(port))
+    return result
+
+
+def choose_codex_debug_port() -> int:
+    preferred = PREFERRED_CODEX_DEBUG_PORT
+    if 0 < preferred < 65536:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("127.0.0.1", preferred))
+                return preferred
+        except OSError:
+            pass
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def wait_devtools_targets(port: int | None = None, timeout: float = 10.0) -> list[dict]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        targets = read_devtools_targets(port)
+        if targets:
+            return targets
+        time.sleep(0.25)
+    return []
+
+
+def launch_codex() -> bool:
+    if ENHANCEMENTS_ENABLED and CODEX_APP_BUNDLE.exists():
+        debug_port = choose_codex_debug_port()
+        remove_stale_devtools_active_port_files()
+        args = [
+            f"--remote-debugging-port={debug_port}",
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-allow-origins=http://127.0.0.1:{debug_port}",
+        ]
+        commands: list[list[str]] = [
+            ["open", "-W", "-a", str(CODEX_APP_BUNDLE), "--args", *args],
+        ]
+        for command in commands:
+            try:
+                subprocess.Popen(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                continue
+            if wait_devtools_targets(debug_port, timeout=12.0):
+                inject_codex_app_enhancements(debug_port=debug_port)
+                return True
+            quit_codex(timeout=4.0)
+            remove_stale_devtools_active_port_files()
+        print(f"  ⚠️  Codex App 已启动，但调试端口 {debug_port} 未就绪", file=sys.stderr)
+        return False
     subprocess.Popen(["open", "-a", "Codex"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return False
+
+
+def find_codex_cli() -> str | None:
+    candidates: list[str] = []
+    path_hit = shutil.which("codex")
+    if path_hit:
+        candidates.append(path_hit)
+    candidates.extend(os.path.expanduser(p) for p in CODEX_CLI_FALLBACKS)
+    for pattern in CODEX_CLI_FALLBACK_GLOBS:
+        candidates.extend(sorted(glob.glob(os.path.expanduser(pattern))))
+    candidates.append(str(CODEX_APP_BUNDLED_CLI))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if real in seen:
+            continue
+        seen.add(real)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def launch_codex_native() -> bool:
+    if codex_running():
+        quit_codex()
+    remove_stale_devtools_active_port_files()
+    command = ["open", str(CODEX_APP_BUNDLE)] if CODEX_APP_BUNDLE.exists() else ["open", "-a", "Codex"]
+    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return True
+
+
+def current_slot_config() -> dict | None:
+    try:
+        data = load_slots(required=False)
+    except SystemExit:
+        return None
+    current = data.get("current")
+    slots = data.get("slots") or {}
+    if current in slots:
+        return slots[current]
+    return None
+
+
+def current_model_catalog(*, refresh: bool = True) -> dict:
+    try:
+        data = load_slots(required=False)
+    except SystemExit:
+        data = {"slots": {}}
+    current = data.get("current")
+    slots = data.get("slots") or {}
+    cfg = slots.get(current, {}) if current else {}
+    catalog = relay_model_catalog_for_slot(cfg, refresh=refresh)
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if current and cfg.get("mode") == "relay" and isinstance(models, list) and models:
+        next_cfg = dict(cfg)
+        changed = False
+        if next_cfg.get("models") != models:
+            next_cfg["models"] = models
+            changed = True
+        default_model = str(catalog.get("default_model") or catalog.get("model") or "").strip()
+        if default_model and next_cfg.get("model_source") != "manual" and next_cfg.get("model") != default_model:
+            next_cfg["model"] = default_model
+            next_cfg["model_source"] = "auto"
+            changed = True
+        if changed:
+            slots[current] = next_cfg
+            data["slots"] = slots
+            try:
+                save_slots(data)
+            except Exception:
+                pass
+    return catalog
+
+
+def codex_app_enhancement_script(catalog: dict) -> str:
+    catalog_json = json.dumps(catalog, ensure_ascii=False)
+    return f"""
+(() => {{
+  const VERSION = "sub2cli-codex-enhance-10";
+  window.__SUB2CLI_CODEX_ENHANCE_VERSION__ = VERSION;
+  window.__SUB2CLI_MODEL_CATALOG__ = {catalog_json};
+  const catalog = window.__SUB2CLI_MODEL_CATALOG__ || {{}};
+  const relayMode = catalog.mode === "relay";
+  const modelKey = "sub2cli.codex.selectedModel";
+  const tierKey = "sub2cli.codex.serviceTier";
+  const styleId = "sub2cli-codex-enhance-style";
+  const tierBadgeVersion = "4";
+  const responseJsonPatchVersion = "2";
+  const messagePatchVersion = "3";
+  const appServerPatchVersion = "3";
+  if (window.__sub2cliCodexEnhanceInterval) {{
+    clearInterval(window.__sub2cliCodexEnhanceInterval);
+    window.__sub2cliCodexEnhanceInterval = null;
+  }}
+  if (window.__sub2cliCodexEnhanceObserver) {{
+    try {{ window.__sub2cliCodexEnhanceObserver.disconnect(); }} catch (_) {{}}
+    window.__sub2cliCodexEnhanceObserver = null;
+  }}
+  const unique = (items) => Array.from(new Set((items || []).map((item) => String(item || "").trim()).filter(Boolean)));
+  const models = () => relayMode ? unique([catalog.default_model, catalog.model, ...(Array.isArray(catalog.models) ? catalog.models : [])]) : [];
+  const selectedModel = () => {{
+    const available = models();
+    return catalog.default_model || catalog.model || available[0] || "";
+  }};
+  const fastEnabled = () => relayMode && localStorage.getItem(tierKey) === "priority";
+  const serviceTierOverrideValue = () => {{
+    if (!relayMode) return undefined;
+    const value = localStorage.getItem(tierKey);
+    if (value === "priority") return "priority";
+    if (value === "standard") return null;
+    return undefined;
+  }};
+  const setFastEnabled = (enabled) => {{
+    if (!relayMode) return;
+    localStorage.setItem(tierKey, enabled ? "priority" : "standard");
+    refreshSub2cliTierBadges();
+  }};
+  function installStyle() {{
+    const existing = document.getElementById(styleId);
+    if (existing?.dataset.version === VERSION) return;
+    existing?.remove();
+    const style = document.createElement("style");
+    style.id = styleId;
+    style.dataset.version = VERSION;
+    style.textContent = `
+      .sub2cli-tier-submenu {{
+        position: fixed;
+        z-index: 2147482102;
+        width: min(312px, calc(100vw - 16px));
+        padding: var(--sub2cli-menu-padding, 6px);
+        box-sizing: border-box;
+        border: var(--sub2cli-menu-border, 1px solid var(--border-default, rgba(0,0,0,.12)));
+        border-radius: var(--sub2cli-menu-radius, 18px);
+        background: var(--sub2cli-menu-bg, var(--bg-token-dropdown-background, Canvas));
+        color: var(--sub2cli-menu-fg, var(--text-primary, CanvasText));
+        box-shadow: var(--sub2cli-menu-shadow, 0 18px 50px rgba(0,0,0,.18));
+        font-family: var(--sub2cli-menu-font-family, system-ui, -apple-system, BlinkMacSystemFont, sans-serif);
+        font-size: var(--sub2cli-menu-font-size, 14px);
+        line-height: 1.35;
+        opacity: var(--sub2cli-menu-opacity, 1);
+        backdrop-filter: var(--sub2cli-menu-backdrop-filter, none);
+        -webkit-backdrop-filter: var(--sub2cli-menu-backdrop-filter, none);
+      }}
+      .sub2cli-tier-submenu-title {{
+        color: var(--sub2cli-menu-muted, var(--text-tertiary, #8a8a8a));
+        min-height: 24px;
+        display: flex;
+        align-items: center;
+        padding: 4px 10px;
+        font-weight: 650;
+      }}
+      .sub2cli-tier-submenu-option {{
+        display: grid;
+        grid-template-columns: 1fr auto;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        min-height: 52px;
+        border: 0;
+        border-radius: 10px;
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+        text-align: left;
+        padding: 7px 10px;
+      }}
+      .sub2cli-tier-submenu-option:hover,
+      .sub2cli-tier-submenu-option[data-highlighted="true"] {{
+        background: var(--sub2cli-menu-hover, rgba(0,0,0,.06));
+      }}
+      .sub2cli-tier-submenu-main {{ font-size: 16px; font-weight: 650; }}
+      .sub2cli-tier-submenu-detail {{ display: block; color: var(--sub2cli-menu-muted, var(--text-tertiary, #8a8a8a)); font-size: 14px; margin-top: 2px; }}
+      .sub2cli-tier-submenu-check {{ color: var(--sub2cli-menu-check, currentColor); font-size: 18px; }}
+    `;
+    document.documentElement.appendChild(style);
+  }}
+  function removeSub2cliControls() {{
+    document.querySelector("[data-sub2cli-codex-bar]")?.remove();
+    document.querySelectorAll("[data-sub2cli-tier-badge='true']").forEach((badge) => badge.remove());
+    document.querySelector("[data-sub2cli-tier-menu='true']")?.remove();
+    document.querySelector("[data-sub2cli-tier-submenu='true']")?.remove();
+    document.querySelectorAll("[data-sub2cli-tier-menu-row='true']").forEach((row) => row.remove());
+  }}
+  function disableSub2cliRelayOverrides() {{
+    localStorage.removeItem(modelKey);
+    localStorage.removeItem(tierKey);
+    removeSub2cliControls();
+    if (window.__sub2cliCodexEnhanceInterval) {{
+      clearInterval(window.__sub2cliCodexEnhanceInterval);
+      window.__sub2cliCodexEnhanceInterval = null;
+    }}
+    if (window.__sub2cliCodexEnhanceObserver) {{
+      try {{ window.__sub2cliCodexEnhanceObserver.disconnect(); }} catch (_) {{}}
+      window.__sub2cliCodexEnhanceObserver = null;
+    }}
+  }}
+  function visibleElement(element) {{
+    if (!(element instanceof HTMLElement) || !element.isConnected) return false;
+    const style = getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }}
+  function nodeText(element) {{
+    return String(element?.textContent || "").replace(/\\s+/g, " ").trim();
+  }}
+  function refreshSub2cliTierBadges() {{
+    document.querySelectorAll("[data-sub2cli-tier-badge='true']").forEach((badge) => badge.remove());
+    document.querySelectorAll("[data-sub2cli-tier-choice]").forEach((button) => {{
+      const mode = button.getAttribute("data-sub2cli-tier-choice");
+      const active = mode === "fast" ? fastEnabled() : !fastEnabled();
+      button.querySelector("[data-sub2cli-tier-check]")?.replaceChildren(document.createTextNode(active ? "✓" : ""));
+    }});
+  }}
+  function displayModelName(name) {{
+    return String(name || "").split("-").map((part) => {{
+      const value = part.trim();
+      if (!value) return value;
+      if (/^gpt$/i.test(value)) return "GPT";
+      if (/^api$/i.test(value)) return "API";
+      if (/^codex$/i.test(value)) return "Codex";
+      if (/^image$/i.test(value)) return "Image";
+      return value.slice(0, 1).toUpperCase() + value.slice(1);
+    }}).join("-");
+  }}
+  function modelMenuItemMatches(item) {{
+    const text = nodeText(item).toLowerCase();
+    if (!text) return false;
+    return models().some((name) => {{
+      const raw = String(name || "").toLowerCase();
+      return text === raw || text === displayModelName(name).toLowerCase();
+    }});
+  }}
+  function nativeModelMenus() {{
+    return Array.from(document.querySelectorAll("[role='menu'], [data-radix-menu-content]"))
+      .filter(visibleElement)
+      .filter((menu) => {{
+        const text = nodeText(menu);
+        return /智能/.test(text) && /超高/.test(text) && Array.from(menu.querySelectorAll("[role='menuitem'], [data-radix-collection-item]")).some(modelMenuItemMatches);
+      }});
+  }}
+  function clearHiddenNativeSubmenus() {{
+    document.querySelectorAll("[data-sub2cli-hidden-native-submenu='true']").forEach((node) => {{
+      if (!(node instanceof HTMLElement)) return;
+      node.style.visibility = node.dataset.sub2cliOriginalVisibility || "";
+      node.style.pointerEvents = node.dataset.sub2cliOriginalPointerEvents || "";
+      delete node.dataset.sub2cliHiddenNativeSubmenu;
+      delete node.dataset.sub2cliOriginalVisibility;
+      delete node.dataset.sub2cliOriginalPointerEvents;
+    }});
+  }}
+  function hideOverlappingNativeSubmenus(anchor) {{
+    const rootMenu = anchor?.closest?.("[role='menu'], [data-radix-menu-content]");
+    const rootRect = rootMenu?.getBoundingClientRect?.();
+    document.querySelectorAll("[role='menu'], [data-radix-menu-content]").forEach((node) => {{
+      if (!(node instanceof HTMLElement) || node === rootMenu || !visibleElement(node)) return;
+      const text = nodeText(node);
+      if (!/模型/.test(text) || /智能/.test(text)) return;
+      const rect = node.getBoundingClientRect();
+      const looksAdjacent = rootRect
+        ? rect.left >= rootRect.right - 4 || rect.right <= rootRect.left + 4
+        : true;
+      if (!looksAdjacent) return;
+      node.dataset.sub2cliHiddenNativeSubmenu = "true";
+      node.dataset.sub2cliOriginalVisibility = node.style.visibility || "";
+      node.dataset.sub2cliOriginalPointerEvents = node.style.pointerEvents || "";
+      node.style.visibility = "hidden";
+      node.style.pointerEvents = "none";
+    }});
+  }}
+  function menuColorModeFrom(color) {{
+    const match = String(color || "").match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/i);
+    if (!match) return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
+    const r = Number(match[1]);
+    const g = Number(match[2]);
+    const b = Number(match[3]);
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128 ? "dark" : "light";
+  }}
+  function usableBackgroundColor(color) {{
+    const value = String(color || "").trim();
+    if (!value || value === "transparent") return "";
+    const rgba = value.match(/rgba?\\(([^)]+)\\)/i);
+    if (rgba) {{
+      const parts = rgba[1].split(",").map((part) => part.trim());
+      if (parts.length >= 4 && Number(parts[3]) === 0) return "";
+    }}
+    return value;
+  }}
+  function effectiveMenuBackground(source) {{
+    for (let node = source; node instanceof HTMLElement; node = node.parentElement) {{
+      const color = usableBackgroundColor(getComputedStyle(node).backgroundColor);
+      if (color) return color;
+    }}
+    return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "rgb(47,47,47)" : "rgb(255,255,255)";
+  }}
+  function copyNativeMenuStyle(source, target) {{
+    if (!(source instanceof HTMLElement) || !(target instanceof HTMLElement)) return;
+    const computed = getComputedStyle(source);
+    const bg = effectiveMenuBackground(source);
+    const mode = menuColorModeFrom(bg);
+    target.style.setProperty("--sub2cli-menu-bg", bg);
+    target.style.setProperty("--sub2cli-menu-fg", computed.color || (mode === "dark" ? "rgb(244,244,245)" : "rgb(32,33,35)"));
+    target.style.setProperty("--sub2cli-menu-border", `${{computed.borderTopWidth || "1px"}} ${{computed.borderTopStyle || "solid"}} ${{computed.borderTopColor || (mode === "dark" ? "rgba(255,255,255,.12)" : "rgba(0,0,0,.12)")}}`);
+    target.style.setProperty("--sub2cli-menu-radius", computed.borderTopLeftRadius || "18px");
+    target.style.setProperty("--sub2cli-menu-shadow", computed.boxShadow && computed.boxShadow !== "none" ? computed.boxShadow : (mode === "dark" ? "0 18px 50px rgba(0,0,0,.28)" : "0 18px 50px rgba(0,0,0,.12)"));
+    target.style.setProperty("--sub2cli-menu-font-family", computed.fontFamily);
+    target.style.setProperty("--sub2cli-menu-font-size", computed.fontSize);
+    target.style.setProperty("--sub2cli-menu-opacity", computed.opacity || "1");
+    target.style.setProperty("--sub2cli-menu-padding", computed.padding || "6px");
+    target.style.setProperty("--sub2cli-menu-backdrop-filter", computed.backdropFilter || computed.webkitBackdropFilter || "none");
+    target.style.setProperty("--sub2cli-menu-muted", mode === "dark" ? "rgba(255,255,255,.55)" : "rgba(0,0,0,.48)");
+    target.style.setProperty("--sub2cli-menu-hover", mode === "dark" ? "rgba(255,255,255,.08)" : "rgba(0,0,0,.055)");
+    target.style.setProperty("--sub2cli-menu-check", mode === "dark" ? "rgba(255,255,255,.82)" : "rgba(0,0,0,.66)");
+  }}
+  function closeSub2cliTierSubmenu() {{
+    if (window.__sub2cliTierSubmenuCloseTimer) {{
+      clearTimeout(window.__sub2cliTierSubmenuCloseTimer);
+      window.__sub2cliTierSubmenuCloseTimer = null;
+    }}
+    document.querySelector("[data-sub2cli-tier-submenu='true']")?.remove();
+    clearHiddenNativeSubmenus();
+  }}
+  function cancelSub2cliTierSubmenuClose() {{
+    if (!window.__sub2cliTierSubmenuCloseTimer) return;
+    clearTimeout(window.__sub2cliTierSubmenuCloseTimer);
+    window.__sub2cliTierSubmenuCloseTimer = null;
+  }}
+  function scheduleSub2cliTierSubmenuClose(delay = 120) {{
+    cancelSub2cliTierSubmenuClose();
+    window.__sub2cliTierSubmenuCloseTimer = setTimeout(() => {{
+      const row = document.querySelector("[data-sub2cli-tier-menu-row='true']:hover");
+      const menu = document.querySelector("[data-sub2cli-tier-submenu='true']:hover");
+      if (!row && !menu) closeSub2cliTierSubmenu();
+      else scheduleSub2cliTierSubmenuClose(delay);
+    }}, delay);
+  }}
+  function nativeModelMenuOpen() {{
+    return nativeModelMenus().length > 0;
+  }}
+  function closeSub2cliTierSubmenuIfNativeMenuGone() {{
+    if (!document.querySelector("[data-sub2cli-tier-submenu='true']")) return;
+    if (!nativeModelMenuOpen()) closeSub2cliTierSubmenu();
+  }}
+  function tierSubmenuOption(mode, title, detail) {{
+    const active = mode === "fast" ? fastEnabled() : !fastEnabled();
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "sub2cli-tier-submenu-option";
+    button.dataset.sub2cliTierChoice = mode;
+    button.innerHTML = `
+      <span>
+        <span class="sub2cli-tier-submenu-main">${{title}}</span>
+        <span class="sub2cli-tier-submenu-detail">${{detail}}</span>
+      </span>
+      <span class="sub2cli-tier-submenu-check" data-sub2cli-tier-check>${{active ? "✓" : ""}}</span>
+    `;
+    button.addEventListener("click", (event) => {{
+      event.preventDefault();
+      event.stopPropagation();
+      setFastEnabled(mode === "fast");
+      closeSub2cliTierSubmenu();
+    }});
+    return button;
+  }}
+  function openSub2cliTierSubmenu(anchor) {{
+    if (!relayMode || !anchor?.isConnected) return;
+    closeSub2cliTierSubmenu();
+    const sourceMenu = anchor.closest?.("[role='menu'], [data-radix-menu-content]");
+    hideOverlappingNativeSubmenus(anchor);
+    const menu = document.createElement("div");
+    menu.className = "sub2cli-tier-submenu";
+    menu.dataset.sub2cliTierSubmenu = "true";
+    menu.setAttribute("role", "menu");
+    copyNativeMenuStyle(sourceMenu, menu);
+    const title = document.createElement("div");
+    title.className = "sub2cli-tier-submenu-title";
+    title.textContent = "速度";
+    menu.appendChild(title);
+    menu.appendChild(tierSubmenuOption("standard", "标准", "默认速度"));
+    menu.appendChild(tierSubmenuOption("fast", "快速", "1.5x speed, increased usage"));
+    menu.addEventListener("mouseenter", cancelSub2cliTierSubmenuClose);
+    menu.addEventListener("mouseleave", () => scheduleSub2cliTierSubmenuClose());
+    document.documentElement.appendChild(menu);
+    const rect = anchor.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const rightLeft = rect.right + 6;
+    const rootRect = sourceMenu?.getBoundingClientRect?.();
+    const leftBoundary = rootRect ? rootRect.left : 8;
+    const left = rightLeft + menuRect.width <= window.innerWidth - 8
+      ? rightLeft
+      : Math.max(8, Math.min(leftBoundary, rect.left - menuRect.width - 6));
+    const top = Math.max(8, Math.min(window.innerHeight - menuRect.height - 8, rect.top));
+    menu.style.left = `${{left}}px`;
+    menu.style.top = `${{top}}px`;
+  }}
+  function nativeTierRowLabel(row) {{
+    row.replaceChildren();
+    const inner = document.createElement("div");
+    inner.className = "flex w-full items-center gap-1.5";
+    const label = document.createElement("span");
+    label.textContent = "速度";
+    const spacer = document.createElement("span");
+    spacer.style.flex = "1 1 auto";
+    const chevron = document.createElement("span");
+    chevron.textContent = "›";
+    chevron.style.opacity = ".72";
+    chevron.style.fontSize = "22px";
+    chevron.style.lineHeight = "16px";
+    inner.append(label, spacer, chevron);
+    row.appendChild(inner);
+  }}
+  function wireNativeTierRow(row) {{
+    if (row.dataset.sub2cliTierRowWired === tierBadgeVersion) return;
+    row.dataset.sub2cliTierRowWired = tierBadgeVersion;
+    const open = (event) => {{
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      openSub2cliTierSubmenu(row);
+    }};
+    row.addEventListener("mouseenter", open);
+    row.addEventListener("mouseleave", () => scheduleSub2cliTierSubmenuClose());
+    row.addEventListener("focus", open);
+    row.addEventListener("blur", () => scheduleSub2cliTierSubmenuClose());
+    row.addEventListener("click", open);
+    row.addEventListener("keydown", (event) => {{
+      if (event.key !== "Enter" && event.key !== " " && event.key !== "ArrowRight") return;
+      open(event);
+    }});
+  }}
+  function installSub2cliNativeTierMenu() {{
+    if (!relayMode) return;
+    for (const menu of nativeModelMenus()) {{
+      if (menu.querySelector("[data-sub2cli-tier-menu-row='true']")) continue;
+      const items = Array.from(menu.querySelectorAll("[role='menuitem'], [data-radix-collection-item]")).filter(visibleElement);
+      const modelItem = items.find(modelMenuItemMatches);
+      if (!modelItem || !modelItem.parentElement) continue;
+      const row = document.createElement("div");
+      row.className = modelItem.className || "text-token-foreground outline-hidden rounded-lg px-[var(--padding-row-x)] py-[var(--padding-row-y)] text-sm flex w-full items-center";
+      row.setAttribute("role", "menuitem");
+      row.setAttribute("tabindex", "-1");
+      row.dataset.orientation = modelItem.dataset.orientation || "vertical";
+      row.dataset.radixCollectionItem = "";
+      row.dataset.state = "closed";
+      row.dataset.sub2cliTierMenuRow = "true";
+      nativeTierRowLabel(row);
+      wireNativeTierRow(row);
+      modelItem.insertAdjacentElement("afterend", row);
+    }}
+  }}
+  function reactFiberKeys(element) {{
+    return Object.keys(element || {{}}).filter((key) => key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance") || key.startsWith("__reactProps"));
+  }}
+  function reactFiberFrom(element) {{
+    const key = Object.keys(element || {{}}).find((item) => item.startsWith("__reactFiber"));
+    return key ? element[key] : null;
+  }}
+  function authContextValueFrom(element) {{
+    for (let fiber = reactFiberFrom(element); fiber; fiber = fiber.return) {{
+      for (const value of [fiber.memoizedProps?.value, fiber.pendingProps?.value]) {{
+        if (value && typeof value === "object" && typeof value.setAuthMethod === "function" && "authMethod" in value) return value;
+      }}
+    }}
+    return null;
+  }}
+  function spoofChatGPTAuthMethod(element) {{
+    const auth = authContextValueFrom(element);
+    if (!auth || auth.authMethod === "chatgpt") return false;
+    auth.setAuthMethod("chatgpt");
+    return true;
+  }}
+  function spoofAnyChatGPTAuthMethod() {{
+    const candidates = Array.from(new Set([
+      document.activeElement,
+      document.body,
+      document.documentElement,
+      ...document.querySelectorAll("main, nav, form, button, textarea, [role='button'], [role='textbox'], [role='navigation'], [role='dialog'], [contenteditable='true']")
+    ].filter(Boolean)));
+    for (const node of candidates.slice(0, 400)) {{
+      if (spoofChatGPTAuthMethod(node)) return true;
+    }}
+    return false;
+  }}
+  function pluginEntryButton() {{
+    const byKnownIcon = document.querySelector('nav[role="navigation"] button.h-token-nav-row.w-full svg path[d^="M7.94562 14.0277"]')?.closest("button");
+    if (byKnownIcon) return byKnownIcon;
+    return Array.from(document.querySelectorAll('nav[role="navigation"] button, button'))
+      .find((button) => /^(插件|Plugins)(\\s+-\\s+.*)?$/i.test((button.textContent || "").trim())) || null;
+  }}
+  function enablePluginEntry() {{
+    spoofAnyChatGPTAuthMethod();
+    const button = pluginEntryButton();
+    if (!button) return;
+    spoofChatGPTAuthMethod(button);
+    button.disabled = false;
+    button.removeAttribute("disabled");
+    button.removeAttribute("aria-disabled");
+    button.style.display = "";
+    const key = Object.keys(button).find((item) => item.startsWith("__reactProps"));
+    if (key && button[key]) button[key].disabled = false;
+    if (button.dataset.sub2cliPluginUnlocked !== "true") {{
+      button.dataset.sub2cliPluginUnlocked = "true";
+      button.addEventListener("click", () => {{
+        spoofChatGPTAuthMethod(button);
+        spoofAnyChatGPTAuthMethod();
+      }}, true);
+    }}
+  }}
+  function modelReasoningEfforts() {{
+    return ["minimal", "low", "medium", "high", "xhigh"].map((reasoningEffort) => ({{ reasoningEffort, description: `${{reasoningEffort}} effort` }}));
+  }}
+  function modelDescriptor(name) {{
+    return {{ model: name, id: name, slug: name, name, displayName: name, description: catalog.provider_name || catalog.model_provider || "sub2cli relay model", hidden: false, isDefault: selectedModel() === name, defaultReasoningEffort: "medium", supportedReasoningEfforts: modelReasoningEfforts() }};
+  }}
+  function patchModelNameArray(array) {{
+    if (!Array.isArray(array) || !array.every((item) => typeof item === "string")) return false;
+    let changed = false;
+    for (const name of models()) if (!array.includes(name)) {{ array.push(name); changed = true; }}
+    return changed;
+  }}
+  function patchModelArray(array, allowEmpty = false) {{
+    if (!Array.isArray(array) || (!allowEmpty && array.length === 0)) return false;
+    if (!allowEmpty && !array.every((item) => item && typeof item === "object" && typeof item.model === "string")) return false;
+    const names = models();
+    if (!names.length) return false;
+    const existing = new Map(array.filter((item) => item && typeof item === "object").map((item) => [item.model || item.id || item.slug || item.name, item]));
+    let changed = false;
+    for (const item of array) {{
+      if (item && typeof item === "object" && names.includes(item.model) && item.hidden !== false) {{ item.hidden = false; changed = true; }}
+    }}
+    for (const name of names) if (!existing.has(name)) {{ array.push(modelDescriptor(name)); changed = true; }}
+    return changed;
+  }}
+  function patchModelContainer(value) {{
+    if (!relayMode) return false;
+    if (!value || typeof value !== "object") return false;
+    let changed = false;
+    if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value)) changed = true;
+    if (patchModelNameArray(value.models)) changed = true;
+    if (patchModelArray(value.data)) changed = true;
+    if (patchModelArray(value.result)) changed = true;
+    if (patchModelArray(value.pages?.[0]?.data)) changed = true;
+    if (patchModelArray(value.result?.data)) changed = true;
+    if (patchModelArray(value.result?.models)) changed = true;
+    if (patchModelArray(value.message?.result?.data)) changed = true;
+    if (patchModelArray(value.message?.result?.models)) changed = true;
+    for (const key of ["availableModels", "available_models"]) {{
+      if (value[key] instanceof Set) for (const name of models()) if (!value[key].has(name)) {{ value[key].add(name); changed = true; }}
+      if (Array.isArray(value[key])) for (const name of models()) if (!value[key].includes(name)) {{ value[key].push(name); changed = true; }}
+    }}
+    for (const key of ["hiddenModels", "hidden_models"]) {{
+      if (Array.isArray(value[key])) {{
+        const before = value[key].length;
+        value[key] = value[key].filter((name) => !models().includes(name));
+        if (value[key].length !== before) changed = true;
+      }}
+    }}
+    if (value.defaultModel == null && models().length) {{ value.defaultModel = modelDescriptor(selectedModel() || models()[0]); changed = true; }}
+    return changed;
+  }}
+  function patchModelResult(value) {{
+    if (!relayMode) return value;
+    try {{
+      if (Array.isArray(value)) {{
+        if (!patchModelNameArray(value)) patchModelArray(value, true);
+      }}
+      if (Array.isArray(value?.data)) {{
+        if (!patchModelNameArray(value.data)) patchModelArray(value.data, true);
+      }}
+      if (Array.isArray(value?.models)) {{
+        if (!patchModelNameArray(value.models)) patchModelArray(value.models, true);
+      }}
+      patchModelContainer(value);
+      patchObjectGraph(value);
+    }} catch (error) {{
+      window.__sub2cliModelPatchFailures = window.__sub2cliModelPatchFailures || [];
+      window.__sub2cliModelPatchFailures.push(String(error?.stack || error));
+    }}
+    return value;
+  }}
+  function patchObjectGraph(root, visited = new WeakSet(), depth = 0) {{
+    if (!relayMode) return false;
+    if (!root || typeof root !== "object" || visited.has(root) || depth > 5) return false;
+    visited.add(root);
+    let changed = patchModelContainer(root);
+    if (root instanceof Element || root === window || root === document || root === document.body || root === document.documentElement) return changed;
+    for (const key of Object.keys(root)) {{
+      if (["ownerDocument", "parentElement", "parentNode", "children", "childNodes"].includes(key)) continue;
+      try {{
+        const value = root[key];
+        if (value && typeof value === "object" && patchObjectGraph(value, visited, depth + 1)) changed = true;
+      }} catch (_) {{}}
+    }}
+    return changed;
+  }}
+  async function patchJsonPayload(payload) {{
+    if (!relayMode) return payload;
+    return patchModelResult(payload);
+  }}
+  function installResponseJsonPatch() {{
+    if (Response.prototype.json.__sub2cliPatchedVersion === responseJsonPatchVersion) return;
+    const original = Response.prototype.json.__sub2cliOriginal || Response.prototype.json;
+    Response.prototype.json = async function sub2cliPatchedJson(...args) {{
+      const payload = await original.apply(this, args);
+      return patchJsonPayload(payload);
+    }};
+    Response.prototype.json.__sub2cliOriginal = original;
+    Response.prototype.json.__sub2cliPatchedVersion = responseJsonPatchVersion;
+  }}
+  function patchStatsigConfig(config) {{
+    const names = models();
+    const value = config?.value;
+    if (!names.length || !value || typeof value !== "object") return config;
+    const availableModels = Array.isArray(value.available_models) ? [...value.available_models] : [];
+    let changed = false;
+    for (const name of names) if (!availableModels.includes(name)) {{ availableModels.push(name); changed = true; }}
+    const nextValue = {{ ...value, available_models: availableModels, default_model: selectedModel() || names[0] || value.default_model }};
+    if (!changed && nextValue.default_model === value.default_model) return config;
+    try {{ config.value = nextValue; return config; }} catch (_) {{ return {{ ...config, value: nextValue }}; }}
+  }}
+  function patchStatsig() {{
+    if (!relayMode) return;
+    const root = window.__STATSIG__ || globalThis.__STATSIG__;
+    const clients = [root?.firstInstance, typeof root?.instance === "function" ? root.instance() : null, ...(root?.instances ? Object.values(root.instances) : [])]
+      .filter((client, index, array) => client && typeof client === "object" && array.indexOf(client) === index);
+    for (const client of clients) {{
+      if (typeof client.getDynamicConfig !== "function") continue;
+      if (client.__sub2cliModelPatchedVersion !== responseJsonPatchVersion) {{
+        const original = client.__sub2cliOriginalGetDynamicConfig || client.getDynamicConfig.bind(client);
+        client.__sub2cliOriginalGetDynamicConfig = original;
+        client.getDynamicConfig = (name, options) => patchStatsigConfig(original(name, options));
+        client.__sub2cliModelPatchedVersion = responseJsonPatchVersion;
+      }}
+      try {{ patchStatsigConfig(client.getDynamicConfig("107580212", {{ disableExposureLog: true }})); }} catch (_) {{}}
+    }}
+  }}
+  function patchReactModelState() {{
+    if (!relayMode) return;
+    const visited = new WeakSet();
+    const nodes = [document.body, ...document.querySelectorAll("button, [role='menu'], [role='dialog'], [data-radix-popper-content-wrapper]")].filter(Boolean);
+    for (const node of nodes.slice(0, 250)) for (const key of reactFiberKeys(node)) patchObjectGraph(node[key], visited);
+    patchStatsig();
+  }}
+  function startMethods() {{
+    return new Set(["thread/start", "thread/resume", "turn/start", "list-models-for-host"]);
+  }}
+  function patchRequestParams(method, params) {{
+    if (!relayMode) return params;
+    const methodName = String(method || "");
+    if (!startMethods().has(methodName)) return params;
+    const next = {{ ...(params || {{}}) }};
+    const tier = serviceTierOverrideValue();
+    if (methodName !== "list-models-for-host" && tier !== undefined) next.serviceTier = tier;
+    window.__sub2cliLastRequestPatch = {{
+      method: methodName,
+      hasServiceTier: Object.prototype.hasOwnProperty.call(next, "serviceTier"),
+      serviceTier: Object.prototype.hasOwnProperty.call(next, "serviceTier") ? next.serviceTier : undefined,
+      at: Date.now(),
+    }};
+    return next;
+  }}
+  function serviceTierSummary(value) {{
+    const object = value && typeof value === "object" ? value : {{}};
+    const nested = object.params && typeof object.params === "object" ? object.params : {{}};
+    const requestParams = object.request?.params && typeof object.request.params === "object" ? object.request.params : {{}};
+    return {{
+      hasServiceTier: Object.prototype.hasOwnProperty.call(object, "serviceTier"),
+      serviceTier: Object.prototype.hasOwnProperty.call(object, "serviceTier") ? object.serviceTier : undefined,
+      nestedHasServiceTier: Object.prototype.hasOwnProperty.call(nested, "serviceTier"),
+      nestedServiceTier: Object.prototype.hasOwnProperty.call(nested, "serviceTier") ? nested.serviceTier : undefined,
+      requestHasServiceTier: Object.prototype.hasOwnProperty.call(requestParams, "serviceTier"),
+      requestServiceTier: Object.prototype.hasOwnProperty.call(requestParams, "serviceTier") ? requestParams.serviceTier : undefined,
+    }};
+  }}
+  function installDebugHooks() {{
+    window.__SUB2CLI_CODEX_ENHANCE_DEBUG__ = {{
+      version: VERSION,
+      relayMode,
+      models: models(),
+      serviceTierOverrideValue,
+      patchRequestParams: (method, params = {{}}) => patchRequestParams(method, params),
+      patchMessage: (message) => patchMessage(message),
+      patchAppServerRequestParams: (method, params = {{}}) => patchAppServerRequestParams(method, params),
+      lastRequestPatch: () => window.__sub2cliLastRequestPatch || null,
+      lastAppServerRequestPatch: () => window.__sub2cliLastAppServerRequestPatch || null,
+      lastDispatchPatch: () => window.__sub2cliLastDispatchPatch || null,
+    }};
+  }}
+  function patchMessage(message) {{
+    if (!relayMode) return message;
+    if (!message || typeof message !== "object") return message;
+    if (message.type === "send-cli-request-for-host") {{
+      const params = patchRequestParams(message.method, message.params);
+      return params === message.params ? message : {{ ...message, params }};
+    }}
+    if ((message.type === "mcp-request" || message.type === "worker-request") && message.request) {{
+      const params = patchRequestParams(message.request.method, message.request.params);
+      return params === message.request.params ? message : {{ ...message, request: {{ ...message.request, params }} }};
+    }}
+    if (message.type === "thread-prewarm-start" && message.request) {{
+      const params = patchRequestParams("thread/start", message.request.params);
+      return params === message.request.params ? message : {{ ...message, request: {{ ...message.request, params }} }};
+    }}
+    if (message.type === "start-conversation") {{
+      const tier = serviceTierOverrideValue();
+      return tier !== undefined ? {{ ...message, serviceTier: tier }} : message;
+    }}
+    if (message.type === "prewarm-thread-start-for-host" && message.params) return {{ ...message, params: patchRequestParams("thread/start", message.params) }};
+    if (message.type === "start-thread-for-host") return patchRequestParams("thread/start", message);
+    if (message.type === "start-turn-for-host" && message.params) return {{ ...message, params: patchRequestParams("turn/start", message.params) }};
+    return message;
+  }}
+  function appServerHostMessageTypes() {{
+    return new Set([
+      "send-cli-request-for-host",
+      "mcp-request",
+      "worker-request",
+      "thread-prewarm-start",
+      "start-conversation",
+      "prewarm-thread-start-for-host",
+      "start-thread-for-host",
+      "start-turn-for-host",
+    ]);
+  }}
+  function patchAppServerRequestParams(method, params) {{
+    if (!relayMode) return params;
+    const methodName = String(method || "");
+    let nextParams = params;
+    if (appServerHostMessageTypes().has(methodName) && params && typeof params === "object") {{
+      const message = patchMessage({{ ...params, type: methodName }});
+      if (message && typeof message === "object") {{
+        const {{ type: _type, ...payload }} = message;
+        nextParams = payload;
+      }}
+    }} else {{
+      nextParams = patchRequestParams(methodName, params);
+    }}
+    window.__sub2cliLastAppServerRequestPatch = {{
+      method: methodName,
+      effectiveMethod: methodName === "send-cli-request-for-host" && params?.method ? String(params.method) : methodName,
+      ...serviceTierSummary(nextParams),
+      at: Date.now(),
+    }};
+    return nextParams;
+  }}
+  function patchMcpModelResponseData(data) {{
+    if (!relayMode) return false;
+    if (data?.type !== "mcp-response") return false;
+    patchModelResult(data);
+    patchModelResult(data.message);
+    patchModelResult(data.response);
+    patchModelResult(data.message?.result);
+    patchModelResult(data.response?.result);
+    patchModelResult(data.message?.result?.data);
+    patchModelResult(data.response?.result?.data);
+    return true;
+  }}
+  function installMessagePatch() {{
+    if (window.__sub2cliMessagePatchInstalled === messagePatchVersion) return;
+    const originalDispatchEvent = window.__sub2cliOriginalDispatchEvent || window.dispatchEvent;
+    window.__sub2cliOriginalDispatchEvent = originalDispatchEvent;
+    window.dispatchEvent = function sub2cliPatchedDispatchEvent(event) {{
+      try {{
+        const detail = event?.detail;
+        if (event?.type === "codex-message-from-view" && detail && typeof detail === "object") {{
+          const patched = patchMessage(detail);
+          if (patched !== detail) Object.assign(detail, patched);
+          if (detail.type === "mcp-request" && detail.request?.method === "model/list") {{
+            detail.request.params = {{ ...(detail.request.params || {{}}), includeHidden: true }};
+          }}
+        }}
+        if (event?.type === "message") patchMcpModelResponseData(event.data);
+      }} catch (_) {{}}
+      return originalDispatchEvent.call(this, event);
+    }};
+    if (!window.__sub2cliMessageListenerInstalled) {{
+      window.addEventListener("message", (event) => {{ try {{ patchMcpModelResponseData(event.data); }} catch (_) {{}} }}, true);
+      window.__sub2cliMessageListenerInstalled = true;
+    }}
+    window.__sub2cliMessagePatchInstalled = messagePatchVersion;
+  }}
+  function appAssetUrl(part) {{
+    return [
+      ...Array.from(document.scripts || []).map((script) => script.src),
+      ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
+      ...performance.getEntriesByType("resource").map((entry) => entry.name),
+    ].filter(Boolean).find((url) => url.includes("/assets/") && url.includes(part) && url.split("?")[0].endsWith(".js")) || "";
+  }}
+  async function installAppServerPatch() {{
+    if (!relayMode) return;
+    if (window.__sub2cliAppServerPatchInstalled === appServerPatchVersion) return;
+    const url = appAssetUrl("app-server-manager-signals-") || appAssetUrl("setting-storage-");
+    if (!url) return;
+    let patchedCount = 0;
+    try {{
+      const module = await import(url);
+      const candidates = Object.values(module).filter((value) => value && typeof value === "object");
+      for (const candidate of candidates) {{
+        const objects = [candidate];
+        if (typeof candidate.get === "function") {{ try {{ objects.push(candidate.get()); }} catch (_) {{}} }}
+        for (const object of objects) {{
+          if (object && typeof object.sendRequest === "function" && object.__sub2cliSendRequestPatchedVersion !== appServerPatchVersion) {{
+            const original = object.__sub2cliOriginalSendRequest || object.sendRequest.bind(object);
+            object.__sub2cliOriginalSendRequest = original;
+            object.sendRequest = async function sub2cliPatchedSendRequest(method, params, options) {{
+              const patchedParams = patchAppServerRequestParams(method, params);
+              const result = await original(method, patchedParams, options);
+              const effectiveMethod = String(method || "") === "send-cli-request-for-host" && patchedParams?.method ? String(patchedParams.method) : String(method || "");
+              if (effectiveMethod === "list-models-for-host") return patchModelResult(result);
+              return result;
+            }};
+            object.__sub2cliSendRequestPatchedVersion = appServerPatchVersion;
+            patchedCount += 1;
+          }}
+        }}
+      }}
+      const dispatcherClass = typeof module.v === "function" && String(module.v).includes("dispatchMessage") ? module.v : null;
+      const dispatcher = dispatcherClass?.getInstance?.();
+      if (dispatcher && typeof dispatcher.dispatchMessage === "function" && dispatcher.__sub2cliDispatchPatchedVersion !== appServerPatchVersion) {{
+        const original = dispatcher.__sub2cliOriginalDispatchMessage || dispatcher.dispatchMessage.bind(dispatcher);
+        dispatcher.__sub2cliOriginalDispatchMessage = original;
+        dispatcher.dispatchMessage = (type, payload) => {{
+          const message = patchMessage({{ ...(payload || {{}}), type }});
+          const nextType = message?.type || type;
+          const {{ type: _type, ...nextPayload }} = message || {{}};
+          window.__sub2cliLastDispatchPatch = {{
+            type: String(type || ""),
+            nextType: String(nextType || ""),
+            ...serviceTierSummary(nextPayload),
+            at: Date.now(),
+          }};
+          return original(nextType, nextPayload);
+        }};
+        dispatcher.__sub2cliDispatchPatchedVersion = appServerPatchVersion;
+        patchedCount += 1;
+      }}
+      if (patchedCount > 0) window.__sub2cliAppServerPatchInstalled = appServerPatchVersion;
+    }} catch (_) {{}}
+  }}
+  function boot() {{
+    if (!relayMode) {{
+      disableSub2cliRelayOverrides();
+      return;
+    }}
+    installStyle();
+    closeSub2cliTierSubmenu();
+    document.querySelectorAll("[data-sub2cli-tier-menu-row='true']").forEach((row) => row.remove());
+    document.querySelectorAll("[data-sub2cli-tier-badge='true']").forEach((badge) => badge.remove());
+    localStorage.removeItem(modelKey);
+    installSub2cliNativeTierMenu();
+    installResponseJsonPatch();
+    installMessagePatch();
+    installDebugHooks();
+    enablePluginEntry();
+    patchReactModelState();
+    void installAppServerPatch();
+  }}
+  boot();
+  if (relayMode && !window.__sub2cliCodexEnhanceInterval) {{
+    window.__sub2cliCodexEnhanceInterval = setInterval(() => {{
+      document.querySelectorAll("[data-sub2cli-tier-badge='true']").forEach((badge) => badge.remove());
+      installSub2cliNativeTierMenu();
+      closeSub2cliTierSubmenuIfNativeMenuGone();
+      installDebugHooks();
+      enablePluginEntry();
+      patchReactModelState();
+      void installAppServerPatch();
+    }}, 1200);
+  }}
+  if (relayMode && !window.__sub2cliCodexEnhanceObserver) {{
+    window.__sub2cliCodexEnhanceObserver = new MutationObserver(() => {{
+      installSub2cliNativeTierMenu();
+      closeSub2cliTierSubmenuIfNativeMenuGone();
+      enablePluginEntry();
+      patchReactModelState();
+    }});
+    window.__sub2cliCodexEnhanceObserver.observe(document.documentElement, {{ childList: true, subtree: true }});
+  }}
+}})();
+"""
+
+
+def read_devtools_targets(port: int | None = None) -> list[dict]:
+    if port is not None:
+        return _read_devtools_targets_from_port(int(port))
+    for candidate in codex_debug_port_candidates():
+        targets = _read_devtools_targets_from_port(candidate)
+        if targets:
+            return targets
+    return []
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise OSError("websocket closed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+class DevToolsWebSocket:
+    def __init__(self, ws_url: str, *, timeout: float = 3.0) -> None:
+        parsed = urlparse.urlparse(ws_url)
+        self.host = parsed.hostname or "127.0.0.1"
+        self.port = parsed.port or 80
+        self.path = parsed.path or "/"
+        if parsed.query:
+            self.path += f"?{parsed.query}"
+        self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        self.sock.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {self.path} HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        self.sock.sendall(request.encode("ascii"))
+        response = b""
+        while b"\r\n\r\n" not in response:
+            response += self.sock.recv(4096)
+            if len(response) > 65536:
+                raise OSError("websocket handshake too large")
+        if b" 101 " not in response.split(b"\r\n", 1)[0]:
+            raise OSError("websocket handshake failed")
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def send_text(self, text: str) -> None:
+        payload = text.encode("utf-8")
+        header = bytearray([0x81])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.extend([0x80 | 126, (length >> 8) & 0xFF, length & 0xFF])
+        else:
+            header.append(0x80 | 127)
+            header.extend(length.to_bytes(8, "big"))
+        mask = os.urandom(4)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(bytes(header) + mask + masked)
+
+    def recv_text(self) -> str:
+        while True:
+            first, second = _recv_exact(self.sock, 2)
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+            if length == 126:
+                length = int.from_bytes(_recv_exact(self.sock, 2), "big")
+            elif length == 127:
+                length = int.from_bytes(_recv_exact(self.sock, 8), "big")
+            mask = _recv_exact(self.sock, 4) if masked else b""
+            payload = _recv_exact(self.sock, length) if length else b""
+            if masked:
+                payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+            if opcode == 1:
+                return payload.decode("utf-8", errors="replace")
+            if opcode == 8:
+                raise OSError("websocket closed")
+            if opcode == 9:
+                self._send_control(0xA, payload)
+
+    def _send_control(self, opcode: int, payload: bytes) -> None:
+        header = bytearray([0x80 | opcode, 0x80 | len(payload)])
+        mask = os.urandom(4)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(bytes(header) + mask + masked)
+
+
+def evaluate_devtools_script(ws_url: str, script: str) -> bool:
+    ws = DevToolsWebSocket(ws_url, timeout=4.0)
+    try:
+        ws.send_text(json.dumps({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": script,
+                "awaitPromise": False,
+                "returnByValue": True,
+                "userGesture": True,
+            },
+        }))
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            payload = json.loads(ws.recv_text())
+            if payload.get("id") == 1:
+                result = payload.get("result") or {}
+                return "exceptionDetails" not in result
+    finally:
+        ws.close()
+    return False
+
+
+def inject_codex_app_enhancements(debug_port: int | None = None) -> bool:
+    if not ENHANCEMENTS_ENABLED:
+        return False
+    script = codex_app_enhancement_script(current_model_catalog(refresh=True))
+    for _attempt in range(20):
+        targets = read_devtools_targets(debug_port)
+        candidates = [
+            target for target in targets
+            if target.get("webSocketDebuggerUrl")
+            and target.get("type") in {"page", "webview", "iframe"}
+        ]
+        injected = 0
+        for target in candidates:
+            try:
+                if evaluate_devtools_script(str(target["webSocketDebuggerUrl"]), script):
+                    injected += 1
+            except Exception:
+                continue
+        if injected:
+            print(f"  Codex App 增强已注入 ({injected} target)")
+            return True
+        time.sleep(0.5)
+    print("  ⚠️  Codex App 已启动，但未能注入 sub2cli 页面增强", file=sys.stderr)
+    return False
+
+
+def refresh_codex_app_enhancements(*, restart_if_needed: bool = True) -> bool:
+    if not ENHANCEMENTS_ENABLED or not CODEX_APP_BUNDLE.exists():
+        return False
+    if read_devtools_targets():
+        return inject_codex_app_enhancements()
+    if not restart_if_needed:
+        return False
+    if codex_running():
+        print("  Codex App 未开启增强注入端口，正在重新打开…")
+        quit_codex()
+    return launch_codex()
+
+
+def cmd_ensure_app(*, no_restart: bool = False) -> int:
+    """Ensure the current Codex App process has sub2cli renderer enhancements.
+
+    This intentionally avoids creating a backup or rewriting ~/.codex when the
+    selected slot is already clean. It is used by the desktop wrapper as a
+    lightweight watchdog after a user manually reopens Codex.app.
+    """
+    try:
+        lock_ctx = Sub2cliLock(timeout=0.0)
+        lock_ctx.__enter__()
+    except LockBusy as exc:
+        fail(str(exc), code=4)
+        return 4
+    try:
+        ensure_initialized()
+        data = load_slots()
+        slots = data.get("slots", {})
+        current = data.get("current")
+        if not current or current not in slots:
+            fail("当前未选择 Codex 渠道")
+        if not slot_is_clean(data, current):
+            return cmd_switch(str(current), no_restart=no_restart)
+        cfg = slots[current]
+        print(f"当前已是：{cfg.get('display_name', current)} ({current}) [{cfg.get('mode', 'oauth')}]")
+        if cfg.get("mode") != "relay":
+            print("  当前为官方账号，无需 sub2cli App 增强")
+            return 0
+        if no_restart:
+            ok = inject_codex_app_enhancements()
+        else:
+            ok = refresh_codex_app_enhancements(restart_if_needed=True)
+        if ok:
+            print("  Codex App 增强已就绪")
+            return 0
+        print("  ⚠️  Codex App 增强未就绪", file=sys.stderr)
+        return 2
+    finally:
+        lock_ctx.__exit__(None, None, None)
+
+
+def cmd_restore_app() -> int:
+    """Restart Codex App without sub2cli runtime enhancements."""
+    launch_codex_native()
+    print("Codex App 已按原生方式重新打开")
+    return 0
 
 
 def decode_auth_email(auth_file: Path) -> str | None:
@@ -427,6 +1862,133 @@ def decode_auth_email(auth_file: Path) -> str | None:
         return json.loads(base64.urlsafe_b64decode(payload)).get("email")
     except Exception:
         return None
+
+
+def mask_auth_error(text: str) -> str:
+    text = str(text or "")
+    text = re.sub(r"sk-[A-Za-z0-9._-]{12,}", lambda m: m.group(0)[:8] + "..." + m.group(0)[-4:], text)
+    return re.sub(
+        r"(?i)(access|refresh|id)_token[^,}\n]*",
+        lambda m: f"{m.group(1)}_token:<redacted>",
+        text,
+    )
+
+
+def read_available_pipe_text(pipe, limit: int = 4000) -> str:
+    try:
+        fd = pipe.fileno()
+        old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
+    except Exception:
+        return ""
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while total < limit:
+            try:
+                data = os.read(fd, min(4096, limit - total))
+            except BlockingIOError:
+                break
+            if not data:
+                break
+            chunks.append(data)
+            total += len(data)
+    except Exception:
+        return b"".join(chunks).decode(errors="replace")
+    finally:
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
+        except Exception:
+            pass
+    return b"".join(chunks).decode(errors="replace")
+
+
+def refresh_oauth_auth_file(auth_file: Path) -> tuple[bool, str]:
+    """Validate an OAuth auth.json using Codex CLI and persist refreshed tokens.
+
+    Official slots can look usable to Codex App because the Electron profile is
+    still logged in, while the CLI auth JSON contains a one-time refresh token
+    that has already been consumed. Refresh before switching so CLI and App do
+    not diverge.
+    """
+    if not auth_file.exists():
+        return False, f"auth file not found: {auth_file}"
+    codex_cli = find_codex_cli()
+    if not codex_cli:
+        return False, "找不到 codex CLI，无法校验官方账号登录态"
+    try:
+        with tempfile.TemporaryDirectory(prefix="sub2cli-auth-refresh.") as tmp:
+            tmp_home = Path(tmp)
+            shutil.copy2(auth_file, tmp_home / "auth.json")
+            env = os.environ.copy()
+            env["CODEX_HOME"] = str(tmp_home)
+            env.setdefault("TERM", "xterm-256color")
+            proc = subprocess.Popen(
+                [codex_cli, "-s", "read-only", "-a", "untrusted", "app-server"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+            requests = [
+                {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "sub2cli", "title": "sub2cli", "version": APP_VERSION}}},
+                {"method": "initialized"},
+                {"id": 2, "method": "account/read", "params": {"refreshToken": True}},
+            ]
+            assert proc.stdin is not None
+            for msg in requests:
+                proc.stdin.write(json.dumps(msg) + "\n")
+                proc.stdin.flush()
+            response = None
+            deadline = time.time() + CODEX_AUTH_REFRESH_TIMEOUT
+            assert proc.stdout is not None
+            while time.time() < deadline and response is None:
+                ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+                if not ready:
+                    continue
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("id") == 2:
+                    response = payload
+            stderr = read_available_pipe_text(proc.stderr) if proc.stderr is not None else ""
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            if response is None:
+                return False, "Codex CLI 校验官方账号超时"
+            if response.get("error"):
+                return False, mask_auth_error(json.dumps(response.get("error"), ensure_ascii=False))
+            result = response.get("result") or {}
+            account = result.get("account") or {}
+            refreshed_auth = tmp_home / "auth.json"
+            if not account.get("email"):
+                detail = (
+                    mask_auth_error(stderr.strip())
+                    if stderr
+                    else "Codex CLI 未返回有效官方账号，refresh token 可能已失效"
+                )
+                return False, detail
+            tmp_out = auth_file.with_name(f"{auth_file.name}.{os.getpid()}.{time.time_ns()}.tmp")
+            tmp_out.write_bytes(refreshed_auth.read_bytes())
+            os.chmod(tmp_out, 0o600)
+            os.replace(tmp_out, auth_file)
+            return True, ""
+    except FileNotFoundError:
+        return False, "找不到 codex CLI，无法校验官方账号登录态"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {mask_auth_error(str(exc))}"
 
 
 def _migrate_legacy_auth_symlink(*, quiet: bool = False) -> bool:
@@ -575,6 +2137,183 @@ def probe_relay(base_url: str, api_key: str, timeout: float = 12.0) -> tuple[boo
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def models_endpoint(base_url: str) -> str:
+    cleaned = base_url.strip().rstrip("/")
+    if not cleaned:
+        return ""
+    if cleaned.endswith("/models"):
+        return cleaned
+    if cleaned.endswith("/v1"):
+        return f"{cleaned}/models"
+    return f"{cleaned}/v1/models"
+
+
+def fetch_relay_models(base_url: str, api_key: str, timeout: float = 12.0) -> tuple[list[str], str | None]:
+    endpoint = models_endpoint(base_url)
+    if not endpoint:
+        return [], "missing base_url"
+    req = urlrequest.Request(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "User-Agent": "sub2cli/0.1",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read(2 * 1024 * 1024))
+    except urlerror.HTTPError as exc:
+        return [], f"HTTP {exc.code} {exc.reason}"
+    except urlerror.URLError as exc:
+        return [], f"network error: {exc.reason}"
+    except TimeoutError:
+        return [], f"{timeout:.0f}s timeout"
+    except Exception as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+    return parse_models_payload(payload), None
+
+
+def parse_models_payload(payload: object) -> list[str]:
+    values: list[str] = []
+
+    def walk(value: object) -> None:
+        if isinstance(value, str):
+            if value.strip():
+                values.append(value.strip())
+            return
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if isinstance(value, dict):
+            for key in ("id", "model", "name"):
+                raw = value.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    values.append(raw.strip())
+                    return
+            for key in ("data", "models", "items"):
+                nested = value.get(key)
+                if isinstance(nested, (list, dict)):
+                    walk(nested)
+                    return
+
+    walk(payload)
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value not in seen:
+            result.append(value)
+            seen.add(value)
+    return result
+
+
+def model_is_image(model: str) -> bool:
+    return bool(re.search(r"(^|[-_/])image($|[-_/])|(^|[-_/])imagen($|[-_/])", model or "", re.I))
+
+
+MODEL_NON_TEXT_HINTS_RE = re.compile(
+    r"(image|imagen|audio|embedding|moderation|tts|whisper|dall[-_]?e|transcribe|realtime)",
+    re.I,
+)
+MODEL_SMALL_HINTS_RE = re.compile(r"(^|[-_/])(mini|nano|small|lite|spark)($|[-_/])", re.I)
+
+
+def model_version_key(model: str) -> tuple:
+    nums = [int(n) for n in re.findall(r"\d+", model or "")]
+    padded = nums[:5] + [0] * max(0, 5 - len(nums))
+    text = (model or "").lower()
+    small_penalty = 1 if MODEL_SMALL_HINTS_RE.search(text) else 0
+    non_text_penalty = 1 if MODEL_NON_TEXT_HINTS_RE.search(text) else 0
+    codex_bonus = 1 if re.search(r"(^|[-_/])(codex|code)($|[-_/])", text) else 0
+    return (-non_text_penalty, *padded, -small_penalty, codex_bonus, -len(text), text)
+
+
+def best_default_model(models: list[str], fallback: str = DEFAULT_MODEL) -> str:
+    usable = [model for model in models if isinstance(model, str) and model.strip()]
+    if not usable:
+        return fallback
+    return sorted(usable, key=model_version_key, reverse=True)[0]
+
+
+def merge_model_lists(*lists: list[str] | None) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for items in lists:
+        for item in items or []:
+            model = str(item or "").strip()
+            if model and model not in seen:
+                result.append(model)
+                seen.add(model)
+    return result
+
+
+def load_models_json(path: str | None) -> list[str]:
+    if not path:
+        return []
+    try:
+        payload = json.loads(Path(path).read_text())
+    except (OSError, ValueError, TypeError) as exc:
+        fail(f"--models-json 读取失败: {exc}")
+    models = parse_models_payload(payload)
+    if not models:
+        fail("--models-json 未包含可用模型")
+    return models
+
+
+def relay_model_catalog_for_slot(cfg: dict, *, refresh: bool = False) -> dict:
+    mode = cfg.get("mode", "oauth")
+    raw_model = str(cfg.get("model") or "").strip()
+    if mode != "relay":
+        configured_model = raw_model or DEFAULT_MODEL
+        return {
+            "mode": "oauth",
+            "status": "oauth",
+            "model": configured_model,
+            "default_model": configured_model,
+            "model_provider": OAUTH_PROVIDER,
+            "provider_name": "OpenAI",
+            "base_url": "",
+            "models": [configured_model],
+            "message": "official Codex account",
+        }
+    base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
+    api_key = str(cfg.get("api_key") or "").strip()
+    stored_models = [m for m in cfg.get("models", []) if isinstance(m, str) and m.strip()]
+    models = []
+    error: str | None = None
+    if refresh or not stored_models:
+        models, error = fetch_relay_models(base_url, api_key)
+    models = merge_model_lists(stored_models, models)
+    if not models:
+        models = stored_models
+    manual_model = bool(raw_model and cfg.get("model_source") == "manual")
+    configured_model = raw_model if manual_model else best_default_model(models, raw_model or DEFAULT_MODEL)
+    if manual_model and raw_model not in models:
+        models.insert(0, raw_model)
+    return {
+        "mode": "relay",
+        "status": "ok" if models else "failed",
+        "model": configured_model,
+        "default_model": configured_model if configured_model in models else best_default_model(models, configured_model),
+        "model_provider": RELAY_PROVIDER,
+        "provider_name": cfg.get("display_name") or RELAY_PROVIDER,
+        "base_url": base_url,
+        "models": models,
+        "message": error or "",
+    }
+
+
+def slot_config_model(cfg: dict, *, refresh: bool = False) -> str:
+    raw_model = str(cfg.get("model") or "").strip()
+    if cfg.get("mode") != "relay":
+        return raw_model or DEFAULT_MODEL
+    if raw_model and cfg.get("model_source") == "manual":
+        return raw_model
+    catalog = relay_model_catalog_for_slot(cfg, refresh=refresh)
+    return str(catalog.get("default_model") or catalog.get("model") or raw_model or DEFAULT_MODEL)
+
+
 def write_apikey_auth(path: Path, api_key: str) -> bool:
     desired = {"OPENAI_API_KEY": api_key, "auth_mode": "apikey"}
     if path.exists():
@@ -594,12 +2333,24 @@ def split_toml_head(text: str) -> tuple[str, str]:
     return text[: match.start()], text[match.start() :]
 
 
-def set_top_level_config(text: str, updates: dict[str, str]) -> str:
+def set_top_level_config(text: str, updates: dict[str, str | bool | None]) -> str:
     head, tail = split_toml_head(text)
     keys = "|".join(re.escape(key) for key in updates)
     if keys:
         head = re.sub(rf'(?m)^\s*({keys})\s*=.*(?:\n)?', "", head)
-    block = "".join(f'{key} = "{toml_quote(value)}"\n' for key, value in updates.items())
+
+    def render_value(value: str | bool | None) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return f'"{toml_quote(value)}"'
+
+    block = "".join(
+        f"{key} = {rendered}\n"
+        for key, value in updates.items()
+        if (rendered := render_value(value)) is not None
+    )
     return block + head.lstrip("\n") + tail
 
 
@@ -621,6 +2372,7 @@ def patch_config(*, mode: str, model: str, relay_base_url: str | None = None) ->
             "model": model,
             "model_provider": provider,
             "api_base_url": DEFAULT_API_BASE_URL,
+            "disable_response_storage": True if mode == "relay" else None,
         },
     )
     new_text = strip_relay_provider_block(new_text)
@@ -647,6 +2399,14 @@ def top_level_value(text: str, key: str) -> str | None:
     return match.group(1) if match else None
 
 
+def top_level_bool_value(text: str, key: str) -> bool | None:
+    head, _ = split_toml_head(text)
+    match = re.search(rf'(?m)^\s*{re.escape(key)}\s*=\s*(true|false)\s*$', head, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).lower() == "true"
+
+
 def relay_block_base_url(text: str) -> str | None:
     match = re.search(
         rf"(?ms)^\s*\[model_providers\.{re.escape(RELAY_PROVIDER)}\]\s*\n(.*?)(?=^\s*\[|\Z)",
@@ -667,7 +2427,7 @@ def config_clean_for_slot(cfg: dict) -> bool:
         return False
     mode = cfg.get("mode", "oauth")
     expected_provider = RELAY_PROVIDER if mode == "relay" else OAUTH_PROVIDER
-    expected_model = cfg.get("model", DEFAULT_MODEL)
+    expected_model = slot_config_model(cfg, refresh=False)
     if top_level_value(text, "model_provider") != expected_provider:
         return False
     if top_level_value(text, "model") != expected_model:
@@ -676,7 +2436,10 @@ def config_clean_for_slot(cfg: dict) -> bool:
         return False
     relay_url = relay_block_base_url(text)
     if mode == "relay":
-        return relay_url == str(cfg.get("base_url", "")).rstrip("/")
+        return (
+            relay_url == str(cfg.get("base_url", "")).rstrip("/")
+            and top_level_bool_value(text, "disable_response_storage") is True
+        )
     return relay_url is None
 
 
@@ -1138,14 +2901,14 @@ def compute_switch_plan(data: dict, target_slot: str) -> dict:
             "path": str(CONFIG_TOML),
             "section": f"[model_providers.{RELAY_PROVIDER}]",
             "base_url": cfg.get("base_url"),
-            "model": cfg.get("model", DEFAULT_MODEL),
+            "model": slot_config_model(cfg, refresh=False),
         })
     else:
         plan["actions"].append({
             "type": "patch_toml",
             "path": str(CONFIG_TOML),
             "section": "(remove relay block; oauth mode)",
-            "model": cfg.get("model", DEFAULT_MODEL),
+            "model": slot_config_model(cfg, refresh=False),
         })
 
     if sessions_need_normalize(target_provider):
@@ -1282,6 +3045,7 @@ def restore_from_backup(backup_dir: Path) -> int:
     if schema not in (1, 2, 3):
         fail(f"unknown snapshot schema {schema!r} in {snap_path} (expected 1, 2 or 3)")
     quit_codex()
+    stop_codex_cli_app_server()
     restored: list[str] = []
     warnings: list[str] = []
     try:
@@ -1510,7 +3274,14 @@ def cmd_switch(
 
         if slot_is_clean(data, target_slot):
             print(f"当前已是：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
-            print("  无需修改；Codex App 未重启")
+            if stop_codex_cli_app_server():
+                print("  Codex CLI 后台服务已刷新")
+            if no_restart:
+                print("  无需修改；Codex App 未重启")
+            elif refresh_codex_app_enhancements(restart_if_needed=True):
+                print("  Codex App 增强已刷新")
+            else:
+                print("  无需修改；Codex App 未重启")
             return 0
 
         printed_rollback = False
@@ -1522,6 +3293,7 @@ def cmd_switch(
 
         if not no_restart:
             quit_codex()
+        stop_codex_cli_app_server()
 
         auth_target = Path(cfg["auth_file"]).expanduser()
         profile_target = history_profile_target(data, target_slot)
@@ -1548,10 +3320,15 @@ def cmd_switch(
             base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
             if not api_key or not base_url:
                 fail(f"relay slot {target_slot!r} is missing api_key/base_url")
+            selected_model = slot_config_model(cfg, refresh=True)
+            if cfg.get("model") != selected_model or cfg.get("model_source") == "auto":
+                cfg["model"] = selected_model
+                cfg["model_source"] = "auto"
+                slots[target_slot] = cfg
             write_apikey_auth(auth_target, api_key)
-            patch_config(mode="relay", model=cfg.get("model", DEFAULT_MODEL), relay_base_url=base_url)
+            patch_config(mode="relay", model=selected_model, relay_base_url=base_url)
         else:
-            patch_config(mode="oauth", model=cfg.get("model", DEFAULT_MODEL))
+            patch_config(mode="oauth", model=slot_config_model(cfg, refresh=False))
 
         # Install target slot's auth as the live AUTH_JSON (real file).
         # Cases:
@@ -1597,10 +3374,12 @@ def cmd_switch(
         print(f"  App profile -> {profile_target}（历史保留）")
         if mode == "relay":
             print(f"  base_url    -> {cfg.get('base_url')}")
-            print(f"  model       -> {cfg.get('model', DEFAULT_MODEL)}")
+            print(f"  model       -> {slot_config_model(cfg, refresh=False)}")
         elif not auth_target.exists() or auth_target.stat().st_size < 10:
             print(f"  尚未登录：请运行 `codex login` 写入 {auth_target}")
         print_session_summary(session_stats)
+        if stop_codex_cli_app_server():
+            print("  Codex CLI 后台服务已刷新")
         if not no_restart:
             launch_codex()
             print("  Codex App 已重新打开")
@@ -1621,7 +3400,8 @@ def cmd_relay(
     api_key: str,
     *,
     slot: str | None = None,
-    model: str = DEFAULT_MODEL,
+    model: str | None = None,
+    models_json: str | None = None,
     display: str | None = None,
     skip_probe: bool = False,
     no_switch: bool = False,
@@ -1641,6 +3421,15 @@ def cmd_relay(
             print("渠道未保存。请换正确的 URL/key 后重试，或加 --skip-check 跳过检查。", file=sys.stderr)
             return 3
         print(f"检查通过：{message}")
+    supplied_models = load_models_json(models_json)
+    fetched_models, models_error = fetch_relay_models(base_url, api_key, timeout=4.0 if skip_probe else 12.0)
+    models = merge_model_lists(supplied_models, fetched_models)
+    selected_model = (model or "").strip() or best_default_model(models)
+    if models:
+        print(f"  模型列表: {len(models)} 个")
+    elif models_error and not skip_probe:
+        print(f"  ⚠️  模型列表读取失败: {models_error}", file=sys.stderr)
+    model_source = "manual" if (model or "").strip() else "auto"
 
     if dry_run:
         existing_data = load_slots(required=False)
@@ -1649,7 +3438,7 @@ def cmd_relay(
         print(f"DRY-RUN: 将 {verb} API 渠道")
         print(f"  slot:     {slot}")
         print(f"  base_url: {base_url}")
-        print(f"  model:    {model}")
+        print(f"  model:    {selected_model}")
         if no_switch:
             print("  --no-switch: 不会切换")
             return 0
@@ -1662,7 +3451,9 @@ def cmd_relay(
             "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
             "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
             "base_url": base_url,
-            "model": model,
+            "model": selected_model,
+            "model_source": model_source,
+            "models": models,
             "api_key": api_key,
         }
         simulated["slots"] = simulated_slots
@@ -1689,13 +3480,15 @@ def cmd_relay(
                 "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
                 "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
                 "base_url": base_url,
-                "model": model,
+                "model": selected_model,
+                "model_source": model_source,
+                "models": models,
                 "api_key": api_key,
             }
             save_slots(data)
             print(f"{'已更新' if existing else '已添加'} API 渠道：{slot}")
             print(f"  base_url: {base_url}")
-            print(f"  model:    {model}")
+            print(f"  model:    {selected_model}")
 
             if no_switch:
                 print(f"  稍后切换：codex-provider use {slot}")
@@ -1717,7 +3510,7 @@ def read_api_key_secure(*, from_stdin: bool) -> str:
 
 def reject_positional_api_key(argv: list[str]) -> None:
     """Reject legacy `add-api <url> <key>` before argparse can echo the key."""
-    value_options = {"--name", "--slot", "--model", "--display"}
+    value_options = {"--name", "--slot", "--model", "--models-json", "--display"}
     positionals = 0
     i = 0
     while i < len(argv):
@@ -1760,6 +3553,13 @@ def cmd_oauth(
             fail(f"auth file is API-key auth, not a Codex OAuth account: {auth_source}")
         if not decode_auth_email(auth_source):
             fail(f"auth file does not contain a readable Codex account email: {auth_source}")
+        if not dry_run:
+            ok, refresh_error = refresh_oauth_auth_file(auth_source)
+            if not ok:
+                fail(
+                    "官方账号登录态已失效，未写入 Codex 配置。"
+                    f"请重新登录该账号后重试。Codex 返回: {refresh_error}"
+                )
 
     if dry_run:
         existing_data = load_slots(required=False)
@@ -2328,7 +4128,7 @@ def run_internal_command(command: str, argv: list[str]) -> int:
         parser.add_argument("base_url")
         parser.add_argument("--api-key-stdin", action="store_true")
         parser.add_argument("--slot")
-        parser.add_argument("--model", default=DEFAULT_MODEL)
+        parser.add_argument("--model")
         parser.add_argument("--display")
         parser.add_argument("--skip-probe", action="store_true")
         parser.add_argument("--no-switch", action="store_true")
@@ -2342,6 +4142,7 @@ def run_internal_command(command: str, argv: list[str]) -> int:
             api_key,
             slot=args.slot,
             model=args.model,
+            models_json=None,
             display=args.display,
             skip_probe=args.skip_probe,
             no_switch=args.no_switch,
@@ -2368,6 +4169,15 @@ def run_internal_command(command: str, argv: list[str]) -> int:
         parser.add_argument("--no-restart", action="store_true")
         args = parser.parse_args(argv)
         return cmd_switch(args.slot, no_restart=args.no_restart)
+
+    if command == "ensure-app":
+        parser.add_argument("--no-restart", action="store_true")
+        args = parser.parse_args(argv)
+        return cmd_ensure_app(no_restart=args.no_restart)
+
+    if command == "restore-app":
+        parser.parse_args(argv)
+        return cmd_restore_app()
 
     if command == "remove":
         parser.add_argument("slot")
@@ -2405,6 +4215,8 @@ def main(argv: list[str] | None = None) -> int:
         "relay",
         "oauth",
         "switch",
+        "ensure-app",
+        "restore-app",
         "remove",
         "normalize-sessions",
         "rollback",
@@ -2427,7 +4239,8 @@ def main(argv: list[str] | None = None) -> int:
     p_add_api.add_argument("base_url")
     p_add_api.add_argument("--api-key-stdin", action="store_true")
     p_add_api.add_argument("--name", "--slot", dest="slot")
-    p_add_api.add_argument("--model", default=DEFAULT_MODEL)
+    p_add_api.add_argument("--model")
+    p_add_api.add_argument("--models-json", help="从 JSON 文件读取并缓存完整模型列表")
     p_add_api.add_argument("--display")
     p_add_api.add_argument("--skip-check", "--skip-probe", dest="skip_probe", action="store_true")
     p_add_api.add_argument("--no-switch", action="store_true")
@@ -2450,6 +4263,11 @@ def main(argv: list[str] | None = None) -> int:
     p_use.add_argument("--no-restart", action="store_true")
     p_use.add_argument("--dry-run", action="store_true",
                        help="只打印计划改动, 不写入")
+
+    p_ensure_app = sub.add_parser("ensure-app", help="确保 Codex App 增强已注入")
+    p_ensure_app.add_argument("--no-restart", action="store_true")
+
+    sub.add_parser("restore-app", help="按原生方式重启 Codex App, 移除运行时增强")
 
     p_rollback = sub.add_parser("rollback", help="从备份恢复 ~/.codex 状态")
     p_rollback.add_argument("target", nargs="?", default=None,
@@ -2478,6 +4296,7 @@ def main(argv: list[str] | None = None) -> int:
             api_key,
             slot=args.slot,
             model=args.model,
+            models_json=args.models_json,
             display=args.display,
             skip_probe=args.skip_probe,
             no_switch=args.no_switch,
@@ -2495,6 +4314,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "use":
         return cmd_switch(args.name, no_restart=args.no_restart, dry_run=args.dry_run)
+    if args.command == "ensure-app":
+        return cmd_ensure_app(no_restart=args.no_restart)
+    if args.command == "restore-app":
+        return cmd_restore_app()
     if args.command == "rollback":
         return cmd_rollback(args.target, list_only=args.list_only)
     parser.print_help()

@@ -129,25 +129,6 @@
           </div>
         </div>
 
-        <div class="card" id="card-default-key">
-          <div class="card-header">
-            <div class="card-title">🔑 默认 Key <span class="advanced-badge">CONFIG_OVERRIDE</span></div>
-          </div>
-          <div class="card-grid">
-            <div class="grid-label">名称:</div>
-            <div class="grid-value" id="key-name">—</div>
-            <div class="grid-label">分组:</div>
-            <div class="grid-value" id="key-group" style="color: var(--accent);">—</div>
-            <div class="grid-label">key:</div>
-            <div class="grid-value key-value-row">
-              <span id="key-value" class="key-value-text">—</span>
-              <button class="btn-small" id="btn-reveal">显示</button>
-            </div>
-            <div class="grid-label">端点:</div>
-            <div class="grid-value" id="ep-current" style="font-size: 10px; color: var(--accent);">—</div>
-          </div>
-        </div>
-
         <div class="card card-subscriptions" id="card-subscriptions">
           <div class="card-header">
             <div class="card-title">💳 我的订阅 <span class="subscription-count" id="subscription-count">0 ACTIVE</span></div>
@@ -159,46 +140,55 @@
 
       </div>
 
-      <div class="table-container">
-        <div class="table-header">
-          <div class="table-title">📡 端点</div>
-          <div class="table-action-group">
-            <button class="btn-action" id="btn-ping-all">ping</button>
+      <div class="relay-top-grid">
+        <div class="table-container table-container-keys">
+          <div class="table-header">
+            <div class="table-title">🔐 API Keys</div>
           </div>
+          <table class="t-keys">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>KEY</th>
+                <th>状态</th>
+                <th>分组</th>
+                <th class="right">操作</th>
+              </tr>
+            </thead>
+            <tbody id="t-keys-body"></tbody>
+          </table>
         </div>
-        <table class="t-endpoints">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>URL</th>
-              <th class="right">延迟</th>
-              <th class="right">操作</th>
-            </tr>
-          </thead>
-          <tbody id="t-endpoints-body"></tbody>
-        </table>
+
+        <div class="table-container table-container-endpoints">
+          <div class="table-header">
+            <div class="table-title">📡 端点</div>
+            <div class="table-action-group">
+              <button class="btn-action" id="btn-ping-all">ping</button>
+            </div>
+          </div>
+          <table class="t-endpoints">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>URL</th>
+                <th class="right">延迟</th>
+                <th class="right">操作</th>
+              </tr>
+            </thead>
+            <tbody id="t-endpoints-body"></tbody>
+          </table>
+        </div>
       </div>
 
       <div class="table-container">
         <div class="table-header">
           <div class="table-title">📊 分组</div>
           <div class="table-action-group group-action-group">
-            <span class="group-selection-summary" id="group-selection-summary">已选 0</span>
-            <button class="btn-action" id="btn-toggle-all-groups" type="button" disabled>全选</button>
             <button class="btn-action" id="btn-test-selected-groups" disabled>测试</button>
           </div>
         </div>
         <table class="t-groups">
-          <thead>
-            <tr>
-              <th class="checkbox-col" aria-label="选择"></th>
-              <th>倍率</th>
-              <th>名称</th>
-              <th class="right">gpt-5.5</th>
-              <th class="right">image-2</th>
-              <th class="right">操作</th>
-            </tr>
-          </thead>
+          <thead id="t-groups-head"></thead>
           <tbody id="t-groups-body"></tbody>
         </table>
       </div>
@@ -375,6 +365,22 @@
         <button class="btn-action primary" id="btn-config-official">配置</button>
       </div>
       <div class="config-result hidden" id="config-target-result" aria-live="polite"></div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="key-secret-modal">
+  <div class="modal-container key-secret-container">
+    <div class="modal-title">
+      <span>🔐 API Key</span>
+      <button class="link" id="btn-key-secret-close" style="margin-left: auto;">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="key-secret-name" id="key-secret-name">—</div>
+      <pre class="key-secret-value" id="key-secret-value">—</pre>
+      <div class="key-secret-actions">
+        <button class="btn-action primary" id="btn-key-secret-copy">复制</button>
+      </div>
     </div>
   </div>
 </div>

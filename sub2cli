@@ -51,14 +51,27 @@ def default_config_path() -> str:
 DEFAULT_CDP_HOST = os.environ.get("EDGE_CDP_HOST", "127.0.0.1")
 DEFAULT_CDP_PORT = int(os.environ.get("EDGE_CDP_PORT", "9222"))
 DEFAULT_DOMAIN = "https://www.codex2api.com"
+TEST_KEY_NAME = "测试专用"
 
 # 持久化到 config["relays"][domain] 下的字段
 RELAY_FIELDS = (
     "default_key_id",
     "default_key_name",
+    "codex_key_id",
+    "codex_key_name",
     "default_endpoint_name",
     "default_endpoint_url",
+    "group_model_columns",
 )
+
+DEFAULT_GROUP_MODEL_COLUMNS = 2
+MODEL_KIND_IMAGE_RE = re.compile(r"(^|[-_/])image($|[-_/])|(^|[-_/])imagen($|[-_/])", re.I)
+MODEL_NON_TEXT_HINTS_RE = re.compile(
+    r"(image|imagen|audio|embedding|moderation|tts|whisper|dall[-_]?e|transcribe|realtime)",
+    re.I,
+)
+MODEL_SMALL_HINTS_RE = re.compile(r"(^|[-_/])(mini|nano|small|lite|spark)($|[-_/])", re.I)
+DEFAULT_FALLBACK_MODEL = "gpt-5.5"
 
 
 # ==================== ANSI 颜色 ====================
@@ -307,8 +320,186 @@ class Sub2Context:
 
 # ==================== 无状态的 OpenAI-兼容探测 ====================
 
+def openai_api_endpoint(base_url: str, path: str) -> str:
+    cleaned = (base_url or "").strip().rstrip("/")
+    if not cleaned:
+        return ""
+    suffix = (path or "").strip("/")
+    if not suffix:
+        return cleaned
+    if cleaned.endswith(f"/{suffix}"):
+        return cleaned
+    if cleaned.endswith("/v1"):
+        return f"{cleaned}/{suffix}"
+    return f"{cleaned}/v1/{suffix}"
+
+
+def models_endpoint(base_url: str) -> str:
+    return openai_api_endpoint(base_url, "models")
+
+
+def parse_models_payload(payload: object) -> list[str]:
+    found: list[str] = []
+
+    def walk(value: object) -> None:
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                found.append(value)
+            return
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if isinstance(value, dict):
+            for key in ("id", "model", "name"):
+                raw = value.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    found.append(raw.strip())
+                    return
+            for key in ("data", "models", "items"):
+                nested = value.get(key)
+                if isinstance(nested, (list, dict)):
+                    walk(nested)
+                    return
+
+    walk(payload)
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in found:
+        if item not in seen:
+            result.append(item)
+            seen.add(item)
+    return result
+
+
+def fetch_models(base_url: str, api_key: str | None = None, timeout: float = 8.0) -> tuple[list[str], str | None]:
+    url = models_endpoint(base_url)
+    if not url:
+        return [], "missing endpoint"
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        return parse_models_payload(r.json()), None
+    except (requests.RequestException, ValueError) as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+
+
+def model_version_key(model: str) -> tuple:
+    nums = [int(n) for n in re.findall(r"\d+", model or "")]
+    padded = nums[:5] + [0] * max(0, 5 - len(nums))
+    text = (model or "").lower()
+    small_penalty = 1 if MODEL_SMALL_HINTS_RE.search(text) else 0
+    non_text_penalty = 1 if MODEL_NON_TEXT_HINTS_RE.search(text) else 0
+    codex_bonus = 1 if re.search(r"(^|[-_/])(codex|code)($|[-_/])", text) else 0
+    return (-non_text_penalty, *padded, -small_penalty, codex_bonus, -len(text), text)
+
+
+def best_default_model(models: list[str], fallback: str = DEFAULT_FALLBACK_MODEL) -> str:
+    usable = [m for m in models if isinstance(m, str) and m.strip()]
+    if not usable:
+        return fallback
+    return sorted(usable, key=model_version_key, reverse=True)[0]
+
+
+def model_is_image(model: str) -> bool:
+    return bool(MODEL_KIND_IMAGE_RE.search(model or ""))
+
+
+def normalize_group_model_columns(columns: object, available_models: list[str] | None = None) -> list[str]:
+    available = [m for m in (available_models or []) if isinstance(m, str) and m.strip()]
+    requested: list[str] = []
+    had_requested_list = isinstance(columns, list)
+    if isinstance(columns, list):
+        requested = [str(item).strip() for item in columns if str(item or "").strip()]
+    result: list[str] = []
+    for model in requested:
+        if model not in result:
+            result.append(model)
+    if result and had_requested_list:
+        return result
+    sorted_available = sorted(available, key=model_version_key, reverse=True)
+    for model in sorted_available:
+        if len(result) >= DEFAULT_GROUP_MODEL_COLUMNS:
+            break
+        if model not in result:
+            result.append(model)
+    while len(result) < DEFAULT_GROUP_MODEL_COLUMNS:
+        fallback = best_default_model(available, DEFAULT_FALLBACK_MODEL)
+        if fallback in result:
+            break
+        result.append(fallback)
+    return result
+
+
+def merge_model_lists(*lists: list[str] | None) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for items in lists:
+        for item in items or []:
+            model = str(item or "").strip()
+            if model and model not in seen:
+                result.append(model)
+                seen.add(model)
+    return result
+
+
+def probe_group_models(
+    ctx: Sub2Context,
+    cfg: dict,
+    keys: list[dict] | None = None,
+    groups: list[dict] | None = None,
+    *,
+    key: dict | None = None,
+    timeout: float = 8.0,
+) -> tuple[dict[int, list[str]], list[str], str | None]:
+    """Read /models per group by temporarily moving the probe key, then restore it."""
+    keys = keys if keys is not None else ctx.fetch_keys()
+    groups = groups if groups is not None else ctx.fetch_groups()
+    default_key = key or find_default_key(keys, cfg)
+    if not default_key:
+        return {}, [], "未设置测试 key"
+    key_id = default_key.get("id")
+    original_gid = default_key.get("group_id")
+    ep_url = cfg.get("default_endpoint_url") or normalize_v1(ctx.domain)
+    by_group: dict[int, list[str]] = {}
+    all_models: list[str] = []
+    first_error: str | None = None
+    current_key = default_key
+    try:
+        for group in groups:
+            gid = group.get("id")
+            if gid is None:
+                continue
+            gid_int = int(gid)
+            if current_key.get("group_id") != gid_int:
+                ok, err = ctx.update_key_group(int(key_id), gid_int)
+                if not ok:
+                    first_error = first_error or f"{group.get('name') or gid_int}: {err}"
+                    continue
+                keys = ctx.fetch_keys()
+                current_key = find_default_key(keys, cfg) or current_key
+            models, err = fetch_models(ep_url, current_key.get("key", ""), timeout=timeout)
+            if err:
+                first_error = first_error or f"{group.get('name') or gid_int}: {err}"
+            by_group[gid_int] = models
+            all_models = merge_model_lists(all_models, models)
+    finally:
+        if original_gid is not None and key_id is not None and current_key.get("group_id") != original_gid:
+            ctx.update_key_group(int(key_id), int(original_gid))
+    return by_group, all_models, first_error
+
+
+def test_model(base_url: str, api_key: str, model: str) -> dict:
+    return test_image(base_url, api_key, model=model) if model_is_image(model) else test_chat(base_url, api_key, model=model)
+
+
 def test_chat(base_url: str, api_key: str, model: str = "gpt-5.5") -> dict:
-    url = base_url.rstrip("/") + "/chat/completions"
+    url = openai_api_endpoint(base_url, "chat/completions")
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -341,7 +532,7 @@ def test_chat(base_url: str, api_key: str, model: str = "gpt-5.5") -> dict:
 
 
 def test_image(base_url: str, api_key: str, model: str = "gpt-image-2") -> dict:
-    url = base_url.rstrip("/") + "/images/generations"
+    url = openai_api_endpoint(base_url, "images/generations")
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -370,7 +561,9 @@ def test_image(base_url: str, api_key: str, model: str = "gpt-image-2") -> dict:
 
 def probe_endpoint(base_url: str, api_key: str | None = None) -> dict:
     """探测 OpenAI 兼容端点 /models。200=通+有 key，401=可达需鉴权，其他=有问题。"""
-    url = base_url.rstrip("/") + "/models"
+    url = models_endpoint(base_url)
+    if not url:
+        return {"status": -1, "latency_ms": 0, "ok": False, "summary": "missing endpoint"}
     headers = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -444,9 +637,36 @@ def find_key_by_name(keys: list[dict], name: str) -> dict | None:
 
 def find_key_by_id(keys: list[dict], kid) -> dict | None:
     for k in keys:
-        if k.get("id") == kid:
+        if str(k.get("id")) == str(kid):
             return k
     return None
+
+
+def find_default_key(keys: list[dict], cfg: dict) -> dict | None:
+    key_id = cfg.get("default_key_id")
+    if key_id is not None:
+        found = find_key_by_id(keys, key_id)
+        if found:
+            return found
+    key_name = cfg.get("default_key_name", "")
+    return find_key_by_name(keys, key_name) if key_name else None
+
+
+def find_codex_key(keys: list[dict], cfg: dict) -> dict | None:
+    key_id = cfg.get("codex_key_id")
+    if key_id is not None:
+        found = find_key_by_id(keys, key_id)
+        if found:
+            return found
+    key_name = cfg.get("codex_key_name", "")
+    if key_name:
+        found = find_key_by_name(keys, key_name)
+        if found:
+            return found
+    default_key = find_default_key(keys, cfg)
+    if default_key and default_key.get("name") != TEST_KEY_NAME:
+        return default_key
+    return next((k for k in keys if k.get("name") != TEST_KEY_NAME), None) or default_key
 
 
 def find_endpoint(endpoints: list[dict], name: str) -> dict | None:
@@ -456,14 +676,14 @@ def find_endpoint(endpoints: list[dict], name: str) -> dict | None:
     return None
 
 
+def normalize_endpoint_url(url: str) -> str:
+    """Preserve the endpoint URL exactly as the web UI exposes it, modulo whitespace/slashes."""
+    return (url or "").strip().rstrip("/")
+
+
 def normalize_v1(url: str) -> str:
-    """与 web UI 一致：先剥掉尾部 /v1 和斜杠，再统一补上 /v1。"""
-    if not url:
-        return url
-    s = url.rstrip("/")
-    if s.endswith("/v1"):
-        s = s[:-3].rstrip("/")
-    return s + "/v1"
+    """Compatibility alias for the endpoint URL stored in config."""
+    return normalize_endpoint_url(url)
 
 
 def collect_endpoints(settings: dict, fallback_site: str = "") -> list[dict]:
@@ -471,19 +691,19 @@ def collect_endpoints(settings: dict, fallback_site: str = "") -> list[dict]:
     base = settings.get("api_base_url") or ""
     if base:
         eps.append({
-            "name": "默认", "endpoint": normalize_v1(base), "description": "默认线路"
+            "name": "默认", "endpoint": normalize_endpoint_url(base), "description": "默认线路"
         })
     for c in settings.get("custom_endpoints") or []:
         eps.append({
             "name": c.get("name", "?"),
-            "endpoint": normalize_v1(c.get("endpoint", "")),
+            "endpoint": normalize_endpoint_url(c.get("endpoint", "")),
             "description": c.get("description", ""),
         })
     if not eps and fallback_site:
         fallback = fallback_site if re.match(r"^https?://", fallback_site) else f"https://{fallback_site}"
         eps.append({
             "name": "默认",
-            "endpoint": normalize_v1(fallback),
+            "endpoint": normalize_endpoint_url(fallback),
             "description": "域名 fallback",
         })
     return eps
@@ -491,6 +711,29 @@ def collect_endpoints(settings: dict, fallback_site: str = "") -> list[dict]:
 
 def auto_pick_key(keys: list[dict]) -> dict | None:
     return keys[0] if keys else None
+
+
+def ensure_test_key(ctx: Sub2Context, keys: list[dict], *, verbose: bool = False) -> tuple[list[dict], dict | None]:
+    """Ensure sub2cli has a dedicated API key for probes and group tests."""
+    found = find_key_by_name(keys, TEST_KEY_NAME)
+    if found:
+        return keys, found
+    if verbose:
+        print(color(f"  · 未找到测试 key，自动创建 {TEST_KEY_NAME} …", C_DIM))
+    created = ctx.create_key(name=TEST_KEY_NAME)
+    keys = ctx.fetch_keys()
+    found = find_key_by_name(keys, TEST_KEY_NAME)
+    if found:
+        if verbose:
+            print(color(f"    ✓ 已创建测试 key: {TEST_KEY_NAME} (id={found.get('id')})", C_GREEN))
+        return keys, found
+    if created and created.get("name") == TEST_KEY_NAME:
+        if verbose:
+            print(color(f"    ✓ 已创建测试 key: {TEST_KEY_NAME} (id={created.get('id')})", C_GREEN))
+        return keys, created
+    if verbose:
+        print(color(f"    ✗ 自动创建 {TEST_KEY_NAME} 失败", C_YELLOW))
+    return keys, None
 
 
 def auto_pick_endpoint(eps: list[dict]) -> dict | None:
@@ -514,30 +757,46 @@ def ensure_defaults(
 ) -> tuple[dict, dict | None, dict | None]:
     """读 keys/endpoints；若 cfg 里的默认值缺失/失效，自动填一个并 save。"""
     keys = ctx.fetch_keys()
-    if not keys:
-        if verbose:
-            print(color("  · 该中转尚未创建任何 key，自动建一个 sub2cli …", C_DIM))
-        new_key = ctx.create_key(name="sub2cli")
-        if new_key:
-            if verbose:
-                print(color(f"    ✓ 已创建 key: {new_key.get('name')} (id={new_key.get('id')})", C_GREEN))
-            keys = ctx.fetch_keys()
-        else:
-            if verbose:
-                print(color("    ✗ 自动创建 key 失败 (POST /keys 没成功)", C_YELLOW))
+    keys, test_key = ensure_test_key(ctx, keys, verbose=verbose)
 
     settings = ctx.fetch_settings() or {}
     eps = collect_endpoints(settings, fallback_site=ctx.domain)
 
-    dk_name = cfg.get("default_key_name", "")
-    default_key = find_key_by_name(keys, dk_name) if dk_name else None
-    if not default_key:
+    default_key = find_default_key(keys, cfg)
+    if test_key:
+        default_key = test_key
+        if (
+            cfg.get("default_key_id") != test_key.get("id")
+            or cfg.get("default_key_name") != test_key.get("name")
+        ):
+            if verbose:
+                print(color(f"  · 默认测试 key: {TEST_KEY_NAME}", C_DIM))
+            cfg["default_key_id"] = test_key.get("id")
+            cfg["default_key_name"] = test_key.get("name")
+    elif not default_key:
         default_key = auto_pick_key(keys)
         if default_key:
             cfg["default_key_id"] = default_key.get("id")
             cfg["default_key_name"] = default_key.get("name")
             if verbose:
-                print(color(f"  · 自动选默认 key: {default_key.get('name')}", C_DIM))
+                print(color(f"  · 自动选测试 key: {default_key.get('name')}", C_DIM))
+    elif (
+        cfg.get("default_key_id") != default_key.get("id")
+        or cfg.get("default_key_name") != default_key.get("name")
+    ):
+            cfg["default_key_id"] = default_key.get("id")
+            cfg["default_key_name"] = default_key.get("name")
+
+    codex_key = find_codex_key(keys, cfg)
+    if codex_key:
+        if (
+            cfg.get("codex_key_id") != codex_key.get("id")
+            or cfg.get("codex_key_name") != codex_key.get("name")
+        ):
+            cfg["codex_key_id"] = codex_key.get("id")
+            cfg["codex_key_name"] = codex_key.get("name")
+            if verbose:
+                print(color(f"  · 配置 Codex 用 key: {codex_key.get('name')}", C_DIM))
 
     de_name = cfg.get("default_endpoint_name", "")
     default_ep = find_endpoint(eps, de_name) if de_name else None
@@ -550,6 +809,12 @@ def ensure_defaults(
                 print(color(
                     f"  · 自动选默认线路: {default_ep.get('name')} "
                     f"({default_ep.get('endpoint')})", C_DIM))
+    elif cfg.get("default_endpoint_url") != default_ep.get("endpoint"):
+        cfg["default_endpoint_url"] = default_ep.get("endpoint")
+        if verbose:
+            print(color(
+                f"  · 同步默认线路 URL: {default_ep.get('name')} "
+                f"({default_ep.get('endpoint')})", C_DIM))
 
     save_config(cfg, ctx.config_path)
     return cfg, default_key, default_ep
@@ -696,7 +961,8 @@ def select_menu(
 
 def print_banner(
     ctx: Sub2Context, user: dict,
-    default_key: dict | None, default_ep: dict | None
+    default_key: dict | None, default_ep: dict | None,
+    codex_key: dict | None = None,
 ) -> None:
     host = urlparse(ctx.domain).hostname or "?"
     print(color("sub2cli", C_BOLD + C_CYAN) + color(f" — {host} 控制台", C_DIM))
@@ -717,10 +983,17 @@ def print_banner(
         rate = g.get("rate_multiplier")
         rate_s = f"{rate}x" if rate is not None else "?"
         print(
-            color("  名称:    ", C_DIM) + color(default_key.get("name", "?"), C_CYAN)
+            color("  测试 key:", C_DIM) + color(default_key.get("name", "?"), C_CYAN)
             + color(f"  ·  分组 {gname} ({rate_s})", C_DIM)
         )
-        print(color("  apikey:  ", C_DIM) + mask_key(default_key.get("key", "")))
+        if codex_key:
+            cg = codex_key.get("group") or {}
+            crate = cg.get("rate_multiplier")
+            crate_s = f"{crate}x" if crate is not None else "?"
+            print(
+                color("  Codex key:", C_DIM) + color(codex_key.get("name", "?"), C_CYAN)
+                + color(f"  ·  分组 {cg.get('name','?')} ({crate_s})", C_DIM)
+            )
         if default_ep:
             ep_name = default_ep.get("name", "?")
             ep_suffix = f"  ({ep_name})" if ep_name and ep_name != "默认" else ""
@@ -730,7 +1003,7 @@ def print_banner(
                 + color(ep_suffix, C_DIM)
             )
     else:
-        print(color("  默认:    ", C_DIM) + color("(未配置，运行 setup)", C_YELLOW))
+        print(color("  测试 key:", C_DIM) + color("(未配置，运行 setup)", C_YELLOW))
     print()
 
 
@@ -739,11 +1012,11 @@ def cmd_help() -> None:
     rows = [
         ("ep / endpoints / ping", "端点连通性测试 + 可选设默认"),
         ("g / groups", "分组列表 + 可用性测试"),
-        ("key [name]", "切换默认 key（不带参数则菜单选）"),
-        ("export", "导出当前默认的 shell env 片段（自动 pbcopy）"),
+        ("key [name]", "切换 Codex 配置用 key（不带参数则菜单选）"),
+        ("export", "导出 Codex 配置用 shell env 片段（自动 pbcopy）"),
         ("b / balance", "刷新余额、并发"),
         ("h / hist / history", "最近兑换历史"),
-        ("reveal", "完整显示默认 apikey（默认掩码）"),
+        ("reveal", "完整显示 Codex 配置用 apikey"),
         ("setup", "重跑首次配置向导"),
         ("? / help", "本帮助"),
         ("q / quit / exit", "退出（Ctrl-D 同效）"),
@@ -849,8 +1122,7 @@ def _fmt_test_cell(r: dict | None, width: int = 14) -> str:
 
 
 def cmd_groups(ctx: Sub2Context, cfg: dict) -> dict:
-    """列分组 → 选 (含「自动选择」) → 切默认 key 到该分组 → 跑 gpt-5.5 + gpt-image-2，
-    表格行动态刷新。自动模式按倍率低到高跑，找到两个都通的就停。"""
+    """列分组 → 选 (含「自动选择」) → 切测试 key 到该分组 → 跑用户配置的模型列。"""
     groups = ctx.fetch_groups()
     if not groups:
         print(color("  （无可用分组）", C_YELLOW))
@@ -863,11 +1135,22 @@ def cmd_groups(ctx: Sub2Context, cfg: dict) -> dict:
             keys_by_group.setdefault(gid, []).append(k)
 
     ep_url = cfg.get("default_endpoint_url") or normalize_v1(ctx.domain)
-    default_key_name = cfg.get("default_key_name", "")
-    default_key = find_key_by_name(keys, default_key_name)
+    default_key = find_default_key(keys, cfg)
     if not default_key:
-        print(color("  未设置默认 key — 无法测试。先去『名称』设一个。", C_YELLOW))
+        print(color("  未设置测试 key — 无法测试。", C_YELLOW))
         return cfg
+    default_key_name = default_key.get("name", "")
+    _group_models, model_list, _models_error = probe_group_models(ctx, cfg, keys, groups, timeout=8)
+    if not model_list:
+        model_list, _models_error = fetch_models(ep_url, default_key.get("key", ""), timeout=8)
+    model_columns = normalize_group_model_columns(cfg.get("group_model_columns"), model_list)
+    keys = ctx.fetch_keys()
+    default_key = find_default_key(keys, cfg) or default_key
+    keys_by_group = {}
+    for k in keys:
+        gid = k.get("group_id")
+        if gid is not None:
+            keys_by_group.setdefault(gid, []).append(k)
 
     sorted_groups = sorted(
         groups, key=lambda x: x.get("rate_multiplier") or 99999
@@ -878,20 +1161,20 @@ def cmd_groups(ctx: Sub2Context, cfg: dict) -> dict:
     def render() -> None:
         clear_screen()
         print(color("分组测试", C_BOLD + C_CYAN))
-        print(color(f"  端点: {ep_url}  ·  默认 key: {default_key_name}", C_DIM))
+        print(color(f"  端点: {ep_url}  ·  测试 key: {default_key_name}", C_DIM))
         print()
-        print(color(
-            "   #  倍率   分组                              gpt-5.5         image",
-            C_DIM,
-        ))
+        header_models = "  ".join(f"{model[:14]:<14}" for model in model_columns)
+        print(color(f"   #  倍率   分组                              {header_models}", C_DIM))
         for i, g in enumerate(sorted_groups, 1):
             gid = g.get("id")
             name = (g.get("name") or "?")[:30]
             rate = g.get("rate_multiplier")
             rate_s = f"{rate}x" if rate is not None else "?"
             r = results.get(gid)
-            chat_cell = _fmt_test_cell(r.get("chat") if r else None)
-            img_cell = _fmt_test_cell(r.get("image") if r else None)
+            model_cells = [
+                _fmt_test_cell((r or {}).get(model), width=14)
+                for model in model_columns
+            ]
             star = ""
             for k in keys_by_group.get(gid, []):
                 if k.get("name") == default_key_name:
@@ -900,11 +1183,11 @@ def cmd_groups(ctx: Sub2Context, cfg: dict) -> dict:
             arrow = color(" ◀ 测试中", C_YELLOW) if gid == in_progress_gid else ""
             print(
                 f"  [{i:>2}] {rate_s:>5}  {name:<30}{star}  "
-                f"{chat_cell}  {img_cell}{arrow}"
+                f"{'  '.join(model_cells)}{arrow}"
             )
         auto_idx = len(sorted_groups) + 1
-        print(f"  [{auto_idx:>2}] {color('自动选择 (倍率低→高，两个都通就停)', C_CYAN)}")
-        print(color("\n  ★ = 默认 key 当前所在分组", C_DIM))
+        print(f"  [{auto_idx:>2}] {color('自动选择 (倍率低→高，全部模型都通就停)', C_CYAN)}")
+        print(color("\n  ★ = 测试 key 当前所在分组", C_DIM))
 
     render()
     auto_idx = len(sorted_groups) + 1
@@ -921,20 +1204,17 @@ def cmd_groups(ctx: Sub2Context, cfg: dict) -> dict:
         cur_gid = default_key.get("group_id")
         if cur_gid != gid:
             in_progress_gid = gid
-            results[gid] = {"chat": {"running": True}, "image": {"running": True}}
+            results[gid] = {model: {"running": True} for model in model_columns}
             render()
             ok, err = ctx.update_key_group(default_key["id"], gid)
             if not ok:
-                results[gid] = {
-                    "chat": {"ok": False, "status": "切换失败", "summary": err},
-                    "image": {"ok": False, "status": "切换失败", "summary": err},
-                }
+                results[gid] = {model: {"ok": False, "status": "切换失败", "summary": err} for model in model_columns}
                 render()
                 if not auto_mode:
                     break
                 continue
             keys = ctx.fetch_keys()
-            default_key = find_key_by_name(keys, default_key_name)
+            default_key = find_default_key(keys, cfg)
             keys_by_group = {}
             for k in keys:
                 kgid = k.get("group_id")
@@ -944,18 +1224,15 @@ def cmd_groups(ctx: Sub2Context, cfg: dict) -> dict:
         api_key = default_key.get("key", "")
 
         results.setdefault(gid, {})
-        results[gid]["chat"] = {"running": True}
-        results[gid]["image"] = {"running": True}
-        render()
-        r_chat = test_chat(ep_url, api_key, model="gpt-5.5")
-        results[gid]["chat"] = r_chat
-        render()
-        r_img = test_image(ep_url, api_key, model="gpt-image-2")
-        results[gid]["image"] = r_img
+        for model in model_columns:
+            results[gid][model] = {"running": True}
+            render()
+            results[gid][model] = test_model(ep_url, api_key, model=model)
+            render()
         in_progress_gid = None
         render()
 
-        if auto_mode and r_chat.get("ok") and r_img.get("ok"):
+        if auto_mode and all((results[gid].get(model) or {}).get("ok") for model in model_columns):
             final_chosen = g
             break
 
@@ -963,19 +1240,19 @@ def cmd_groups(ctx: Sub2Context, cfg: dict) -> dict:
         if final_chosen:
             print(color(
                 f"\n  ✓ 自动选定: 「{final_chosen.get('name')}」 ({final_chosen.get('rate_multiplier')}x)"
-                f"  — 默认 key 现已在此分组",
+                f"  — 测试 key 现已在此分组",
                 C_GREEN,
             ))
         else:
-            print(color("\n  ✗ 没有一个分组两项测试都通过", C_RED))
+            print(color("\n  ✗ 没有一个分组全部模型都通过", C_RED))
     else:
         g = targets[0]
-        print(color(f"\n  默认 key 现在分组「{g.get('name')}」", C_DIM))
+        print(color(f"\n  测试 key 现在分组「{g.get('name')}」", C_DIM))
     return cfg
 
 
 def cmd_key(ctx: Sub2Context, cfg: dict, arg: str | None) -> dict:
-    """测试 + 选择 key (按 key 维度，因为 key↔分组 1:1)。"""
+    """测试 + 选择配置 Codex 用 key (测试专用 key 不受影响)。"""
     keys = ctx.fetch_keys()
     if not keys:
         print(color("  没有可用 key", C_YELLOW))
@@ -985,22 +1262,23 @@ def cmd_key(ctx: Sub2Context, cfg: dict, arg: str | None) -> dict:
         if not match:
             print(color(f"  未找到 key: {arg}", C_RED))
             return cfg
-        cfg["default_key_name"] = match.get("name")
-        cfg["default_key_id"] = match.get("id")
+        cfg["codex_key_name"] = match.get("name")
+        cfg["codex_key_id"] = match.get("id")
         save_config(cfg, ctx.config_path)
-        print(color(f"  ✓ 默认 key → {match['name']}", C_GREEN))
+        print(color(f"  ✓ Codex 配置 key → {match['name']}", C_GREEN))
         return cfg
 
     ep_url = cfg.get("default_endpoint_url") or normalize_v1(ctx.domain)
     print(color(f"测试每把 key (GET {ep_url}/models):", C_BOLD))
     cur_idx = 1
+    codex_key = find_codex_key(keys, cfg)
     results: list[tuple[dict, dict]] = []
     for i, k in enumerate(keys, 1):
         g = k.get("group") or {}
         gname = g.get("name", "?")
         rate = g.get("rate_multiplier")
         rate_s = f"{rate}x" if rate is not None else "?"
-        is_cur = k.get("name") == cfg.get("default_key_name")
+        is_cur = codex_key and k.get("id") == codex_key.get("id")
         if is_cur:
             cur_idx = i
         status = k.get("status", "?")
@@ -1014,31 +1292,31 @@ def cmd_key(ctx: Sub2Context, cfg: dict, arg: str | None) -> dict:
         else:
             results.append((k, {"ok": False}))
             probe_s = color("(已停用)", C_DIM)
-        cur_mark = color(" ★当前", C_GREEN) if is_cur else ""
+        cur_mark = color(" ★Codex", C_GREEN) if is_cur else ""
         print(
             f"  [{i}] {color(k.get('name','?'), C_CYAN):<14} "
             f"{mask_key(k.get('key',''))}  "
             f"分组: {gname} ({rate_s}){cur_mark}"
         )
         print(f"      {probe_s}")
-    pick = ask_choice("选择新默认", len(keys), default=cur_idx)
+    pick = ask_choice("选择 Codex 配置用 key", len(keys), default=cur_idx)
     if pick is None:
         print()
         return cfg
     k = keys[pick - 1]
-    cfg["default_key_name"] = k.get("name")
-    cfg["default_key_id"] = k.get("id")
+    cfg["codex_key_name"] = k.get("name")
+    cfg["codex_key_id"] = k.get("id")
     save_config(cfg, ctx.config_path)
-    print(color(f"  ✓ 默认 → {k['name']}（分组 {(k.get('group') or {}).get('name','?')}）", C_GREEN))
+    print(color(f"  ✓ Codex 配置 key → {k['name']}（分组 {(k.get('group') or {}).get('name','?')}）", C_GREEN))
     print()
     return cfg
 
 
 def cmd_export(ctx: Sub2Context, cfg: dict) -> None:
     keys = ctx.fetch_keys()
-    k = find_key_by_name(keys, cfg.get("default_key_name", "")) if cfg.get("default_key_name") else None
+    k = find_codex_key(keys, cfg)
     if not k:
-        print(color("  未设置默认 key，运行 'key' 命令选一个", C_YELLOW))
+        print(color("  未设置 Codex 配置用 key，运行 'key' 命令选一个", C_YELLOW))
         return
     url = cfg.get("default_endpoint_url") or ""
     api_key = k.get("key", "")
@@ -1107,7 +1385,7 @@ def _run_inject(inject_bin: str, url: str, api_key: str, source_label: str) -> N
 
 
 def cmd_inject_codex(ctx: Sub2Context, cfg: dict) -> None:
-    """配置到 Codex CLI / Codex App: 用当前配置 或 临时输入新的 url+apikey."""
+    """配置到 Codex CLI / Codex App: 用选中的 Codex key 或临时输入新的 url+apikey."""
     inject_bin = _resolve_inject_bin()
     if not inject_bin:
         here = os.path.dirname(os.path.abspath(__file__))
@@ -1116,16 +1394,15 @@ def cmd_inject_codex(ctx: Sub2Context, cfg: dict) -> None:
         return
 
     sub_options: list[tuple[str, str]] = [
-        ("使用当前配置", "current"),
+        ("使用已选 Codex key", "current"),
         ("使用新的 url + apikey", "new"),
     ]
 
     cur_apikey = "(空)"
-    if cfg.get("default_key_name"):
-        _keys = ctx.fetch_keys()
-        _k = find_key_by_name(_keys, cfg["default_key_name"])
-        if _k and _k.get("key"):
-            cur_apikey = mask_key(_k["key"])
+    _keys = ctx.fetch_keys()
+    _k = find_codex_key(_keys, cfg)
+    if _k and _k.get("key"):
+        cur_apikey = mask_key(_k["key"])
 
     def sub_banner() -> None:
         print(color("配置 codex — 选择来源", C_BOLD + C_CYAN))
@@ -1142,9 +1419,9 @@ def cmd_inject_codex(ctx: Sub2Context, cfg: dict) -> None:
 
     if pick == "current":
         keys = ctx.fetch_keys()
-        k = find_key_by_name(keys, cfg.get("default_key_name", "")) if cfg.get("default_key_name") else None
+        k = find_codex_key(keys, cfg)
         if not k:
-            print(color("  未设置默认 key，先去 [名称] 选一个，或选 '使用新的 url + apikey'", C_YELLOW))
+            print(color("  未设置 Codex 配置用 key，先去 [名称] 选一个，或选 '使用新的 url + apikey'", C_YELLOW))
             return
         url = cfg.get("default_endpoint_url") or ""
         api_key = k.get("key", "")
@@ -1268,15 +1545,16 @@ def cmd_select_relay(state: dict) -> dict:
     state["cfg"] = cfg
     state["default_key"] = dk
     state["default_ep"] = de
+    state["codex_key"] = find_codex_key(new_ctx.fetch_keys(), cfg)
     print(color(f"  ✓ 切到 {target_domain}", C_GREEN))
     return state
 
 
 def cmd_reveal(ctx: Sub2Context, cfg: dict) -> None:
     keys = ctx.fetch_keys()
-    k = find_key_by_name(keys, cfg.get("default_key_name", "")) if cfg.get("default_key_name") else None
+    k = find_codex_key(keys, cfg)
     if not k:
-        print(color("  未设置默认 key", C_YELLOW))
+        print(color("  未设置 Codex 配置用 key", C_YELLOW))
         return
     print(f"  {color(k.get('name','?'), C_CYAN)}: {k.get('key','')}")
 
@@ -1394,6 +1672,8 @@ def run_wizard(
         "domain": ctx.domain,
         "default_key_id": default_key.get("id"),
         "default_key_name": default_key.get("name"),
+        "codex_key_id": default_key.get("id"),
+        "codex_key_name": default_key.get("name"),
         "default_endpoint_name": default_ep.get("name"),
         "default_endpoint_url": default_ep.get("endpoint"),
     }
@@ -1440,14 +1720,19 @@ def main() -> int:
     state = {
         "ctx": ctx, "cfg": cfg, "user": user,
         "default_key": default_key, "default_ep": default_ep,
+        "codex_key": find_codex_key(ctx.fetch_keys(), cfg),
     }
 
     def banner_fn():
-        print_banner(state["ctx"], state["user"], state["default_key"], state["default_ep"])
+        print_banner(
+            state["ctx"], state["user"], state["default_key"],
+            state["default_ep"], state.get("codex_key")
+        )
 
     def refresh_default_key():
         ks = state["ctx"].fetch_keys()
-        state["default_key"] = find_key_by_name(ks, state["cfg"].get("default_key_name", ""))
+        state["default_key"] = find_default_key(ks, state["cfg"])
+        state["codex_key"] = find_codex_key(ks, state["cfg"])
 
     def refresh_default_ep():
         s = state["ctx"].fetch_settings() or {}
@@ -1485,6 +1770,7 @@ def main() -> int:
             state["cfg"], state["default_key"], state["default_ep"] = ensure_defaults(
                 state["ctx"], state["cfg"], verbose=False
             )
+            refresh_default_key()
             print(color("  ✓ 已刷新", C_GREEN))
             pause()
             continue
@@ -1501,7 +1787,7 @@ def main() -> int:
 
         elif choice == "groups":
             state["cfg"] = cmd_groups(state["ctx"], state["cfg"])
-            refresh_default_key()  # 切 group 后默认 key 的 group_id 变了
+            refresh_default_key()  # 切 group 后测试 key 的 group_id 变了
             pause()
 
         elif choice == "key":

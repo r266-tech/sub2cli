@@ -2,7 +2,7 @@
 
 **Sub2API / codex2api 中转站 + Codex 官方账号的一站式配置器。**
 
-管理多个中转站和多个 Codex 官方账号，查看余额、订阅、endpoint、分组和 key，批量检测 `gpt-5.5` / `image-2` 可用性，测完直接把选中的中转或官方账号配置到本机 Codex CLI / Codex App。
+管理多个中转站和多个 Codex 官方账号，查看余额、订阅、endpoint、分组和 key，按当前中转支持的模型自定义批量检测列，测完直接把选中的中转或官方账号配置到本机 Codex CLI / Codex App。
 
 macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-class.
 
@@ -61,8 +61,9 @@ open sub2cli -> test -> select -> 配置 Codex
 | Official Codex accounts | Discover/import saved Codex OAuth accounts and switch between official accounts and relay channels. |
 | Balance and subscriptions | Show account status, balance, concurrency and active subscription usage. |
 | Endpoint checks | Ping every endpoint exposed by the relay and select the fastest/desired URL. |
-| Group checks | Batch-test selected groups against `gpt-5.5` and `image-2` before switching. |
+| Group checks | Batch-test selected groups against user-selected model columns read from the current relay. |
 | Codex config | Write `~/.codex/config.toml` and `~/.codex/auth.json`, restart/reopen Codex App when needed, and keep rollback backups. |
+| Codex App enhancements | Relay mode opens Codex with a small CDP injector that unlocks the plugin entry, adds a standard/fast service-tier toggle, and exposes relay models read from the current URL/API key in the app. |
 | CLI path | Use the same config engine from terminal, without the desktop GUI. |
 
 ## Agent Note
@@ -173,6 +174,12 @@ sub2cli-inject rollback latest
 
 `sub2cli-inject` rejects positional API keys intentionally. Use `--api-key-stdin` or the hidden prompt.
 
+Relay channels also enable a lightweight Codex App enhancement layer by default. When Codex is relaunched after `add-api` or `use`, sub2cli starts it with `--remote-debugging-port=9229`, injects the plugin/model/service-tier patch, and refreshes the model list from `<base_url>/v1/models`. Disable this with:
+
+```bash
+SUB2CLI_CODEX_ENHANCEMENTS=0 sub2cli-inject use <slot>
+```
+
 ## Requirements
 
 - macOS 12+
@@ -247,6 +254,8 @@ docs/images/     README screenshots
 ~/Library/Application Support/Codex profile slot
 ```
 
+For relay slots, `provider-slots.json` also caches the last model list returned by `/v1/models`; the active Codex App injection refreshes it best-effort on launch.
+
 ## Build Desktop DMG
 
 ```bash
@@ -273,7 +282,7 @@ The current release is unsigned and not notarized.
 - official Codex account discovery, import and switching
 - relay vs official account target picker
 - subscription/usage display
-- batch group checks for `gpt-5.5` and `image-2`
+- dynamic batch group checks with add/remove model columns
 - self-contained desktop build that no longer depends on a private `spike/` build folder
 - full relay URL support for self-hosted instances with scheme, port and path prefix
 
