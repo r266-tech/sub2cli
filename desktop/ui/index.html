@@ -3,6 +3,19 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!--
+    Content-Security-Policy: defense-in-depth for the privileged pywebview
+    WebView (it exposes ~55 bridge methods incl. shelling out + Keychain).
+    app.js is XSS-clean today (textContent only) — this stops a future innerHTML
+    regression on relay/credential-derived data from escalating to script exec.
+    - script-src 'self' 'unsafe-inline' 'unsafe-eval': pywebview injects its
+      bridge JS and builds API stubs with new Function(); without these the
+      pywebviewready event never fires and the app stays on bootstrap forever.
+    - style-src 'self' 'unsafe-inline': the markup uses inline style="" attrs.
+    - img-src 'self' data:: local + data-URI icons only.
+    - connect-src 'none': the page never does network I/O (all via the bridge).
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'" />
   <title>sub2cli</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -77,7 +90,15 @@
         <div class="muted small">载入中…</div>
       </div>
     </div>
-    <div class="sidebar-resizer" id="sidebar-resizer" role="separator" aria-orientation="horizontal" aria-label="调整列表高度" tabindex="0"></div>
+    <div class="sidebar-zone custom-zone">
+      <div class="sidebar-section-title">
+        <span>自定义api</span>
+        <button class="sidebar-title-action" id="btn-add-custom-api" type="button" title="添加自定义 API">[+]</button>
+      </div>
+      <div class="custom-api-list" id="custom-api-list">
+        <div class="muted small">载入中…</div>
+      </div>
+    </div>
     <div class="sidebar-zone official-zone">
       <div class="sidebar-section-title">
         <span>官号列表</span>
@@ -88,6 +109,15 @@
       </div>
     </div>
   </aside>
+
+  <div
+    class="sidebar-width-resizer"
+    id="sidebar-width-resizer"
+    role="separator"
+    aria-orientation="vertical"
+    aria-label="调整侧边栏宽度"
+    title="拖拽调整侧边栏宽度"
+  ></div>
 
   <main>
 
@@ -150,7 +180,6 @@
               <tr>
                 <th>名称</th>
                 <th>KEY</th>
-                <th>状态</th>
                 <th>分组</th>
                 <th class="right">操作</th>
               </tr>
@@ -193,9 +222,6 @@
         </table>
       </div>
 
-      <footer>
-        <button class="btn-primary primary big" id="btn-save-config">保存配置</button>
-      </footer>
       </div>
 
       <div class="official-dashboard hidden" id="official-dashboard">
@@ -255,9 +281,49 @@
 
           <div class="official-console-footer">
             <div class="usage-source" id="official-usage-source">[INFO] 读取 Codex app-server 中…</div>
-            <button class="btn-primary primary official-use-btn" id="btn-use-official">保存配置</button>
           </div>
         </div>
+      </div>
+
+      <div class="custom-dashboard hidden" id="custom-api-dashboard">
+        <div class="cards-row">
+          <div class="card card-custom-meta" id="card-custom-api">
+            <div class="card-header">
+              <div class="card-title">🔌 自定义 API</div>
+              <span class="custom-conn" id="custom-conn">—</span>
+            </div>
+            <div class="card-grid">
+              <div class="grid-label">名称:</div>
+              <div class="grid-value" id="custom-name">—</div>
+              <div class="grid-label">URL:</div>
+              <div class="grid-value" id="custom-url">—</div>
+              <div class="grid-label">KEY:</div>
+              <div class="grid-value" id="custom-key">—</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="table-container">
+          <div class="table-header">
+            <div class="table-title">🧪 模型测试</div>
+            <div class="table-action-group">
+              <button class="btn-action" id="btn-custom-refresh-models" title="重新读取该 API 的模型列表">读取模型</button>
+              <button class="btn-action" id="btn-custom-add-model" title="添加要测试的模型">+ 模型</button>
+              <button class="btn-action" id="btn-custom-test-all">测试</button>
+            </div>
+          </div>
+          <table class="t-custom-models">
+            <thead>
+              <tr>
+                <th>模型</th>
+                <th class="right">延迟</th>
+                <th class="right">操作</th>
+              </tr>
+            </thead>
+            <tbody id="t-custom-body"></tbody>
+          </table>
+        </div>
+
       </div>
 
     </section>
@@ -341,6 +407,38 @@
   </div>
 </div>
 
+<div class="modal-overlay hidden" id="add-custom-api-modal">
+  <div class="modal-container" style="width: 460px;">
+    <div class="modal-title">
+      <span>➕ 添加自定义 API</span>
+      <button class="link" id="btn-add-custom-close" style="margin-left: auto;">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label>API URL <span class="required">*</span></label>
+        <input type="text" id="add-custom-url" placeholder="https://api.example.com 或 .../v1" autocomplete="off" />
+      </div>
+      <div class="form-row">
+        <label>API Key <span class="required">*</span></label>
+        <input type="password" id="add-custom-key" placeholder="sk-..." autocomplete="off" />
+      </div>
+      <div class="form-row">
+        <label>名称 <span class="optional">(可选)</span></label>
+        <input type="text" id="add-custom-name" placeholder="留空则用域名" autocomplete="off" />
+      </div>
+
+      <div class="probe-result hidden" id="add-custom-probe-result"></div>
+
+      <div class="form-hint">创建时会用这对 URL + Key 请求 <code>/v1/models</code> 测连通，连通才保存。Key 存进 Keychain，不落配置文件。</div>
+      <div class="form-error hidden" id="add-custom-error"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-action" id="btn-add-custom-cancel">取消</button>
+      <button class="btn-action primary" id="btn-add-custom-submit">创建</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay hidden" id="config-target-modal">
   <div class="modal-container" style="width: 680px;">
     <div class="modal-title">
@@ -350,16 +448,24 @@
     <div class="modal-body">
       <div class="config-choice-row">
         <div>
-          <div class="config-choice-label">当前中转</div>
-          <div class="config-choice-value" id="choice-relay">—</div>
+          <div class="config-choice-label">中转</div>
+          <select class="config-choice-select" id="choice-relay" aria-label="选择中转"></select>
           <div class="config-choice-meta" id="choice-relay-meta">使用保存好的中转 url + key</div>
         </div>
         <button class="btn-action primary" id="btn-config-relay">配置</button>
       </div>
       <div class="config-choice-row">
         <div>
-          <div class="config-choice-label">当前官方账号</div>
-          <div class="config-choice-value" id="choice-codex">—</div>
+          <div class="config-choice-label">自定义 API</div>
+          <select class="config-choice-select" id="choice-custom" aria-label="选择自定义 API"></select>
+          <div class="config-choice-meta" id="choice-custom-meta">使用保存好的自定义 url + key</div>
+        </div>
+        <button class="btn-action primary" id="btn-config-custom">配置</button>
+      </div>
+      <div class="config-choice-row">
+        <div>
+          <div class="config-choice-label">官方账号</div>
+          <select class="config-choice-select" id="choice-codex" aria-label="选择官方账号"></select>
           <div class="config-choice-meta" id="choice-codex-meta">使用保存好的 Codex 官方账号</div>
         </div>
         <button class="btn-action primary" id="btn-config-official">配置</button>
@@ -388,7 +494,7 @@
 <div class="modal-overlay hidden" id="add-codex-account-modal">
   <div class="modal-container" style="width: 520px;">
     <div class="modal-title">
-      <span>➕ 新增 Codex 官方账号</span>
+      <span id="add-codex-title">➕ 新增 Codex 官方账号</span>
       <button class="link" id="btn-add-codex-close" style="margin-left: auto;">✕</button>
     </div>
     <div class="modal-body">
@@ -401,7 +507,7 @@
         <input type="text" id="add-codex-display" placeholder="Codex - name@example.com" autocomplete="off" />
       </div>
       <div class="form-hint">
-        点击后会打开 Codex / OpenAI 登录流程。登录成功后账号会自动出现在官号列表；不会立即切换当前 Codex，点「选用」或顶部「配置 Codex」才会注入。
+        点击后会打开 Codex / OpenAI 登录流程。登录成功后账号会自动出现在官号列表；不会立即切换当前 Codex，选择该账号后点顶部「配置 Codex」才会写入。
       </div>
       <div class="form-error hidden" id="add-codex-error"></div>
     </div>

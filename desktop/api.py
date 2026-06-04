@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ except Exception:  # noqa: BLE001 - optional outside the bundled macOS app env
 
 KEYCHAIN_SERVICE = "sub2cli"
 KEYCHAIN_CREDS_SERVICE = "sub2cli:creds"
+KEYCHAIN_CUSTOM_API_SERVICE = "sub2cli:custom-api"
 GITHUB_REPO = "r266-tech/sub2cli"
 INJECT_PLAN_TIMEOUT = 90
 INJECT_APPLY_TIMEOUT = 180
@@ -72,8 +74,23 @@ CODEX_CLI_FALLBACK_GLOBS = (
 CODEX_APP_BUNDLED_CLI = "/Applications/Codex.app/Contents/Resources/codex"
 
 
+# Cross-THREAD exclusion within this process. pywebview dispatches each JsApi
+# method on its own worker thread, so the previous class-global `_depth` counter
+# (mutated with no synchronization) let a second thread observe depth>0 and take
+# the "nested" branch WITHOUT ever acquiring the flock — two threads mutating
+# ~/.codex concurrently (lost updates). This RLock serializes all callers before
+# they touch the flock and gives correct same-thread reentrancy. The flock still
+# provides cross-PROCESS exclusion; this RLock provides cross-THREAD exclusion.
+_CODEX_STATE_RLOCK = threading.RLock()
+
+
 class CodexStateLock:
-    """Shared advisory lock for mutations under CODEX_HOME."""
+    """Shared advisory lock for mutations under CODEX_HOME.
+
+    Two layers: a per-process re-entrant threading.RLock (cross-thread) wrapping
+    a flock on CODEX_LOCK_PATH (cross-process). `_depth` is only read/written
+    while the RLock is held, so it is safe.
+    """
 
     _depth = 0
 
@@ -81,44 +98,67 @@ class CodexStateLock:
         self.timeout = timeout
         self._fd: int | None = None
         self._nested = False
+        self._holds_rlock = False
 
     def __enter__(self) -> "CodexStateLock":
-        if CodexStateLock._depth > 0:
-            CodexStateLock._depth += 1
-            self._nested = True
-            return self
-        CODEX_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(str(CODEX_LOCK_PATH), os.O_CREAT | os.O_WRONLY, 0o600)
-        deadline = time.time() + self.timeout
-        while True:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                os.ftruncate(self._fd, 0)
-                os.write(self._fd, f"pid={os.getpid()} t={int(time.time())}\n".encode())
-                CodexStateLock._depth = 1
+        # Block other threads first (reentrant for this thread). Honor timeout so
+        # a wedged holder can't hang the UI forever.
+        if not _CODEX_STATE_RLOCK.acquire(timeout=self.timeout):
+            raise RuntimeError(
+                f"Codex 配置正在被本进程的另一个线程修改 ({CODEX_LOCK_PATH})"
+            )
+        self._holds_rlock = True
+        try:
+            if CodexStateLock._depth > 0:
+                # Same-thread reentry (RLock guarantees we are that thread).
+                CodexStateLock._depth += 1
+                self._nested = True
                 return self
-            except OSError as exc:
-                if exc.errno not in (errno.EAGAIN, errno.EACCES):
-                    os.close(self._fd)
-                    self._fd = None
-                    raise
-                if time.time() >= deadline:
-                    os.close(self._fd)
-                    self._fd = None
-                    raise RuntimeError(f"Codex 配置正在被另一个 sub2cli 进程修改 ({CODEX_LOCK_PATH})")
-                time.sleep(0.1)
+            CODEX_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._fd = os.open(str(CODEX_LOCK_PATH), os.O_CREAT | os.O_WRONLY, 0o600)
+            deadline = time.time() + self.timeout
+            while True:
+                try:
+                    fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    os.ftruncate(self._fd, 0)
+                    os.write(self._fd, f"pid={os.getpid()} t={int(time.time())}\n".encode())
+                    CodexStateLock._depth = 1
+                    return self
+                except OSError as exc:
+                    if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                        os.close(self._fd)
+                        self._fd = None
+                        raise
+                    if time.time() >= deadline:
+                        os.close(self._fd)
+                        self._fd = None
+                        raise RuntimeError(
+                            f"Codex 配置正在被另一个 sub2cli 进程修改 ({CODEX_LOCK_PATH})"
+                        )
+                    time.sleep(0.1)
+        except BaseException:
+            # Anything failed after acquiring the RLock — release it so we never
+            # leak the cross-thread lock.
+            self._holds_rlock = False
+            _CODEX_STATE_RLOCK.release()
+            raise
 
     def __exit__(self, *_exc: object) -> None:
-        if self._nested:
-            CodexStateLock._depth = max(0, CodexStateLock._depth - 1)
-            return
-        CodexStateLock._depth = 0
-        if self._fd is not None:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-            finally:
-                os.close(self._fd)
-                self._fd = None
+        try:
+            if self._nested:
+                CodexStateLock._depth = max(0, CodexStateLock._depth - 1)
+                return
+            CodexStateLock._depth = 0
+            if self._fd is not None:
+                try:
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(self._fd)
+                    self._fd = None
+        finally:
+            if self._holds_rlock:
+                self._holds_rlock = False
+                _CODEX_STATE_RLOCK.release()
 
 
 def _is_executable_file(path: str) -> bool:
@@ -250,12 +290,20 @@ def _release_dmg_asset(release: dict | None) -> dict | None:
     return (preferred or candidates)[0]
 
 
-def _kc_creds_set(domain: str, email: str, password: str, *, allow_prompt: bool = False) -> None:
+def _kc_creds_set(domain: str, email: str, password: str, *, allow_prompt: bool = False) -> bool:
+    """Return True on a confirmed Keychain write, False on failure.
+
+    Callers MUST check this before reporting success — a swallowed failure means
+    the credential isn't persisted and is silently lost on next launch.
+    """
     username = f"{domain}|{email}"
     if not allow_prompt:
-        _security_set_password(KEYCHAIN_CREDS_SERVICE, username, password)
-        return
-    keyring.set_password(KEYCHAIN_CREDS_SERVICE, username, password)
+        return _security_set_password(KEYCHAIN_CREDS_SERVICE, username, password)
+    try:
+        keyring.set_password(KEYCHAIN_CREDS_SERVICE, username, password)
+        return True
+    except Exception:  # noqa: BLE001 - keyring backend may be unavailable
+        return False
 
 
 def _security_status(result: Any) -> int:
@@ -390,6 +438,12 @@ def _mask_api_key(api_key: str) -> str:
     return f"{api_key[:8]}...{api_key[-4:]}"
 
 
+def _is_loopback_relay_host(host: str) -> bool:
+    """True for localhost / 127.0.0.0/8 / ::1 — where cleartext http is benign."""
+    h = (host or "").split(":")[0].strip("[]").lower()
+    return h in ("localhost", "::1") or h.startswith("127.")
+
+
 def _mask_secret_text(text: Any, api_key: str | None = None) -> str:
     masked = "" if text is None else str(text)
     if api_key:
@@ -398,6 +452,15 @@ def _mask_secret_text(text: Any, api_key: str | None = None) -> str:
     masked = re.sub(
         r"(?i)(access|refresh|id)_token[^,}\n]*",
         lambda m: f"{m.group(1)}_token:<redacted>",
+        masked,
+    )
+    # Relay/OAuth bearer tokens are opaque or JWT, not sk- prefixed; mask both a
+    # `Bearer <token>` header form and any bare JWT so they don't leak into UI
+    # error dialogs or logs from Codex CLI stderr.
+    masked = re.sub(r"(?i)bearer\s+[A-Za-z0-9._\-]{8,}", "Bearer <redacted>", masked)
+    masked = re.sub(
+        r"eyJ[A-Za-z0-9_-]{6,}\.eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}",
+        "<jwt:redacted>",
         masked,
     )
     return masked
@@ -559,9 +622,25 @@ def _read_json_file(path: Path) -> dict:
 def _write_json_file(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    payload = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    # Create the tmp at 0600 from the start (O_EXCL) so the secret bytes are
+    # never world-readable in the window before chmod; fsync before rename for
+    # crash durability.
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _decode_jwt_claims(token: str | None) -> dict:
@@ -569,8 +648,11 @@ def _decode_jwt_claims(token: str | None) -> dict:
         return {}
     try:
         payload = token.split(".")[1]
+        if len(payload) > 8192:
+            return {}
         payload += "=" * ((4 - len(payload) % 4) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload.encode()))
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode()))
+        return claims if isinstance(claims, dict) else {}
     except Exception:
         return {}
 
@@ -1236,6 +1318,33 @@ def _copy_auth_material(source: Path, target: Path) -> None:
         raise
 
 
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=False)
+        resolved_root = root.resolve(strict=False)
+    except OSError:
+        return False
+    return resolved == resolved_root or resolved_root in resolved.parents
+
+
+def _safe_remove_file(path: Path, root: Path) -> bool:
+    if not _path_within(path, root):
+        return False
+    if path.is_file() or path.is_symlink():
+        path.unlink()
+        return True
+    return False
+
+
+def _safe_remove_tree(path: Path, root: Path) -> bool:
+    if not _path_within(path, root):
+        return False
+    if path.exists() and path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+        return True
+    return False
+
+
 def _ensure_codex_account_slot(slot: str) -> tuple[dict | None, str | None]:
     snapshot = _discover_codex_accounts(official_override=slot)
     account = next((a for a in snapshot.get("accounts", []) if a.get("slot") == slot), None)
@@ -1258,6 +1367,20 @@ def _ensure_codex_account_slot(slot: str) -> tuple[dict | None, str | None]:
             existing = slots.get(slot) or {}
             if existing and existing.get("mode") != "oauth":
                 return None, f"slot {slot!r} 已存在但不是官方账号渠道"
+            # Identity guard: never overwrite a slot that already holds a
+            # DIFFERENT account's auth (account_id/email mismatch). Slot names
+            # derive from email and are only made unique at discovery time, so a
+            # stale slot or two managed homes mapping to the same slug could
+            # otherwise write account A's auth onto a slot labeled account B.
+            if existing.get("auth_file"):
+                existing_ident = _codex_auth_identity(existing.get("auth_file"))
+                existing_key = _identity_key_from_ident(existing_ident)
+                source_key = _identity_key_from_ident(_codex_auth_identity(str(source)))
+                if existing_key and source_key and existing_key != source_key:
+                    return None, (
+                        f"slot {slot!r} 已绑定其他账号 ({existing_ident.get('email') or existing_key})，"
+                        f"拒绝覆盖"
+                    )
             if source.resolve(strict=False) != target.resolve(strict=False):
                 _copy_auth_material(source, target)
             slots[slot] = {
@@ -1306,13 +1429,30 @@ def _run_isolated_codex_login(slot: str) -> tuple[Path | None, dict | None, str,
         return None, None, "", "找不到 codex CLI, 无法启动登录"
 
     login_home = CODEX_HOME_PATH / "sub2cli-account-homes" / slot
-    login_home.mkdir(parents=True, exist_ok=True)
+    try:
+        if login_home.exists() or login_home.is_symlink():
+            removed = (
+                _safe_remove_tree(login_home, CODEX_HOME_PATH / "sub2cli-account-homes")
+                or _safe_remove_file(login_home, CODEX_HOME_PATH / "sub2cli-account-homes")
+            )
+            if not removed:
+                return None, None, "", f"隔离登录目录异常, 请手动清理: {_home_path(login_home)}"
+        login_home.mkdir(parents=True, exist_ok=True)
+        # OAuth tokens land here transiently; pin 0700 so they aren't readable
+        # via an inherited-default-mode directory.
+        os.chmod(login_home, 0o700)
+    except Exception as exc:
+        return None, None, "", f"准备隔离登录目录失败: {type(exc).__name__}: {exc}"
     env = os.environ.copy()
     env["CODEX_HOME"] = str(login_home)
-    env["PATH"] = os.environ.get(
-        "PATH",
-        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-    )
+    if not env.get("PATH"):
+        # No inherited PATH (e.g. launched from a GUI bundle). Build a fallback
+        # from the codex binary's own dir + standard system dirs, instead of
+        # hardcoding Homebrew/Intel paths that don't exist on every Mac.
+        fallback_dirs = [os.path.dirname(codex_path)] if codex_path else []
+        fallback_dirs += ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        seen: set[str] = set()
+        env["PATH"] = ":".join(d for d in fallback_dirs if d and not (d in seen or seen.add(d)))
     try:
         proc = subprocess.run(
             [codex_path, "login"],
@@ -1443,6 +1583,23 @@ def _codex_rpc_snapshot(
                 )
                 return {"error": detail, "account": account, "rate_limits": limits}
             if persist_refreshed_auth:
+                try:
+                    if proc.stdin is not None:
+                        proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                proc = None
                 _copy_auth_material(temp_auth_path, source_path)
             account["_refreshed_auth"] = True
             account["_refreshed_auth_path"] = _home_path(source_path)
@@ -1554,12 +1711,16 @@ def _kc_username(domain: str, email: str) -> str:
     return f"{domain}|{email}"
 
 
-def _kc_set(domain: str, email: str, token: str, *, allow_prompt: bool = False) -> None:
+def _kc_set(domain: str, email: str, token: str, *, allow_prompt: bool = False) -> bool:
+    """Return True on a confirmed Keychain write, False on failure (see _kc_creds_set)."""
     username = _kc_username(domain, email)
     if not allow_prompt:
-        _security_set_password(KEYCHAIN_SERVICE, username, token)
-        return
-    keyring.set_password(KEYCHAIN_SERVICE, username, token)
+        return _security_set_password(KEYCHAIN_SERVICE, username, token)
+    try:
+        keyring.set_password(KEYCHAIN_SERVICE, username, token)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _kc_get(domain: str, email: str, *, allow_prompt: bool = False) -> str | None:
@@ -1620,6 +1781,82 @@ def _accounts_for_domain(cfg: dict, domain: str) -> dict:
     return accounts.setdefault(domain, {"current": None, "saved": []})
 
 
+# ---- custom OpenAI-compatible APIs (user-supplied url + key) ----
+#
+# Unlike relays (Sub2API instances with login/token machinery), a custom API is
+# just a bare OpenAI-compatible endpoint: a base_url + api_key the user pastes
+# in. Metadata (id / name / base_url / model_columns) lives at cfg["custom_apis"]
+# — a top-level list that sub2cli_lib.save_config() never touches (it only
+# rewrites cfg["relays"][domain]). The api_key itself is kept in Keychain, never
+# in the plaintext config, mirroring how relay tokens/creds are stored.
+
+def _custom_apis(cfg: dict) -> list[dict]:
+    apis = cfg.get("custom_apis")
+    if not isinstance(apis, list):
+        apis = []
+        cfg["custom_apis"] = apis
+    return apis
+
+
+def _find_custom_api(cfg: dict, api_id: str) -> dict | None:
+    for entry in _custom_apis(cfg):
+        if isinstance(entry, dict) and entry.get("id") == api_id:
+            return entry
+    return None
+
+
+def _kc_custom_api_set(api_id: str, api_key: str) -> bool:
+    return _security_set_password(KEYCHAIN_CUSTOM_API_SERVICE, api_id, api_key)
+
+
+def _kc_custom_api_get(api_id: str) -> str | None:
+    return _security_get_password(KEYCHAIN_CUSTOM_API_SERVICE, api_id)
+
+
+def _kc_custom_api_delete(api_id: str) -> None:
+    try:
+        _security_delete_password(KEYCHAIN_CUSTOM_API_SERVICE, api_id)
+    except Exception:
+        pass
+
+
+def _custom_api_id_slug(value: str | None, fallback: str = "api") -> str:
+    text = (value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9_-]+", "-", text).strip("-_")
+    if not text or not re.match(r"^[a-z0-9]", text):
+        text = fallback
+    return text[:24]
+
+
+def _custom_api_base_slug(base_url: str, name: str = "") -> str:
+    if name.strip():
+        return _custom_api_id_slug(name)
+    host = ""
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(base_url).netloc or "").split(":")[0]
+    except Exception:
+        host = ""
+    host = host.replace("www.", "")
+    return _custom_api_id_slug(host or base_url)
+
+
+def _unique_custom_api_id(base: str, used: set[str]) -> str:
+    slug = _custom_api_id_slug(base)
+    if slug not in used:
+        used.add(slug)
+        return slug
+    for i in range(2, 1000):
+        suffix = f"-{i}"
+        candidate = f"{slug[:24 - len(suffix)]}{suffix}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+    fallback = f"{slug[:18]}-{os.urandom(3).hex()}"
+    used.add(fallback)
+    return fallback
+
+
 class JsApi:
     """Thread-safe-ish wrapper around Sub2Context for the pywebview bridge.
 
@@ -1630,6 +1867,7 @@ class JsApi:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._group_test_lock = threading.Lock()
         self._ctx: Any | None = None
         self._cfg: dict | None = None
         self._user: dict | None = None
@@ -1652,7 +1890,9 @@ class JsApi:
         if self._ctx is not None and self._cfg is not None:
             return self._ctx, self._cfg
         cfg = sub2cli_lib.load_config()
-        if not cfg:
+        if not cfg or not cfg.get("domain"):
+            # cfg can exist without a relay domain (e.g. only custom APIs saved),
+            # so guard on domain too — Sub2Context(None) would otherwise crash.
             raise RuntimeError(
                 "尚未配置 — 请先在终端运行 ./sub2cli 跑首次配置向导, "
                 "或在桌面 GUI 后续版本中走内置 wizard (P3)。"
@@ -1735,6 +1975,21 @@ class JsApi:
             "daily_limit_usd": group.get("daily_limit_usd"),
             "weekly_limit_usd": group.get("weekly_limit_usd"),
             "monthly_limit_usd": group.get("monthly_limit_usd"),
+        }
+
+    @staticmethod
+    def _serialize_custom_api(entry: dict, *, current_id: str | None = None, key: str | None = None) -> dict:
+        api_id = entry.get("id")
+        if key is None:
+            key = _kc_custom_api_get(api_id) or ""
+        return {
+            "id": api_id,
+            "name": entry.get("name") or entry.get("id") or "?",
+            "base_url": entry.get("base_url", ""),
+            "key_masked": _mask_api_key(key) if key else "(未保存)",
+            "has_key": bool(key),
+            "model_columns": entry.get("model_columns") or [],
+            "is_current": api_id == current_id,
         }
 
     def _import_edge_account_for_domain(self, domain: str) -> dict:
@@ -1837,7 +2092,7 @@ class JsApi:
         try:
             import AppKit  # type: ignore
             from AppKit import NSApp, NSAppearance, NSColor, NSImage  # type: ignore
-            from Foundation import NSMakeSize, NSOperationQueue  # type: ignore
+            from Foundation import NSMakeRect, NSMakeSize, NSOperationQueue  # type: ignore
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"AppKit import failed: {exc}"}
 
@@ -1964,6 +2219,39 @@ class JsApi:
                     except Exception:
                         pass
 
+            def _ensure_visible_frame(w: Any) -> None:
+                try:
+                    screen = w.screen() or AppKit.NSScreen.mainScreen()
+                    visible = screen.visibleFrame()
+                    frame = w.frame()
+                except Exception:
+                    return
+
+                min_w = 960.0
+                min_h = 680.0
+                target_w = min(1180.0, max(min_w, visible.size.width - 80.0))
+                target_h = min(820.0, max(min_h, visible.size.height - 80.0))
+                center_x = frame.origin.x + frame.size.width / 2.0
+                center_y = frame.origin.y + frame.size.height / 2.0
+                offscreen = (
+                    center_x < visible.origin.x
+                    or center_x > visible.origin.x + visible.size.width
+                    or center_y < visible.origin.y
+                    or center_y > visible.origin.y + visible.size.height
+                )
+                too_small = frame.size.width < min_w or frame.size.height < min_h
+                if not offscreen and not too_small:
+                    return
+
+                x = visible.origin.x + max(20.0, (visible.size.width - target_w) / 2.0)
+                y = visible.origin.y + max(20.0, (visible.size.height - target_h) / 2.0)
+                try:
+                    w.setFrame_display_(NSMakeRect(x, y, target_w, target_h), True)
+                    w.makeKeyAndOrderFront_(None)
+                    NSApp.activateIgnoringOtherApps_(True)
+                except Exception:
+                    pass
+
             def _sanitize_window(w: Any) -> None:
                 try:
                     content = w.contentView()
@@ -1997,6 +2285,7 @@ class JsApi:
                             _sanitize_titlebar_tree(last, True)
 
                 _show_native_buttons(w)
+                _ensure_visible_frame(w)
 
             for w in NSApp.windows():
                 try:
@@ -2495,100 +2784,67 @@ class JsApi:
         tmp.close()
         return ["--models-json", tmp.name], tmp
 
-    def inject_plan(self) -> dict:
-        """Dry-run: call sub2cli-inject add-api <url> <key> --dry-run.
+    def _run_inject_add_api(
+        self,
+        url: str,
+        api_key: str,
+        models: list[str],
+        *,
+        dry_run: bool,
+        model: str | None = None,
+        protocol: str = "responses",
+        slot: str | None = None,
+        display: str | None = None,
+    ) -> dict:
+        """Shared core for `sub2cli-inject add-api <url> <key>` (relay + custom API).
 
-        Returns {ok, plan_text, label, slot_hint, command}. The plan_text is
-        the raw stdout of the inject binary so the modal can display it
-        verbatim — we don't try to re-parse the inject's plan format here.
+        dry_run=True  → {ok, plan_text, changes} on success, else {ok: False, error, ...}.
+        dry_run=False → {ok, stdout, stderr, returncode, backup_name,
+                         rollback_command, auto_rollback}, with best-effort
+                         auto-rollback on timeout/failure.
+        All secrets are masked before returning. Callers add label/command.
         """
-        target = self._current_default_inject_target()
-        if not target:
-            return {
-                "ok": False,
-                "error": "未设置 Codex 配置用 key 或端点; 先在 API Keys 点“选用”。",
-            }
-        url, api_key, label, models = target
         inject_bin = self._resolve_inject_bin()
         if not inject_bin:
-            return {
-                "ok": False,
-                "error": "找不到 sub2cli-inject 二进制 (应在 repo 根 或 ~/.local/bin)",
-            }
+            # Preserve the original per-mode wording exactly (plan was more verbose).
+            hint = " (应在 repo 根 或 ~/.local/bin)" if dry_run else ""
+            return {"ok": False, "error": f"找不到 sub2cli-inject 二进制{hint}"}
         model_args, model_tmp = self._inject_models_args(models)
+        cmd = [inject_bin, "add-api", url, "--api-key-stdin", "--skip-check", "--protocol", protocol, *model_args]
+        if slot:
+            cmd.extend(["--name", slot])
+        if display:
+            cmd.extend(["--display", display])
+        if model:
+            cmd.extend(["--model", model])
+        if dry_run:
+            cmd.append("--dry-run")
+        timeout = INJECT_PLAN_TIMEOUT if dry_run else INJECT_APPLY_TIMEOUT
         try:
             proc = subprocess.run(
-                [inject_bin, "add-api", url, "--api-key-stdin", "--skip-check", *model_args, "--dry-run"],
+                cmd,
                 input=api_key,
                 capture_output=True,
                 text=True,
                 env=_inject_subprocess_env(),
-                timeout=INJECT_PLAN_TIMEOUT,
-            )
-        except subprocess.TimeoutExpired:
-            return {
-                "ok": False,
-                "error": f"dry-run 超过 {INJECT_PLAN_TIMEOUT} 秒仍未完成; 未写入任何 Codex 配置。",
-                "stdout": "",
-                "stderr": "",
-                "timeout": INJECT_PLAN_TIMEOUT,
-            }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "error": _mask_secret_text(f"调用 inject 失败: {type(exc).__name__}: {exc}", api_key),
-            }
-        finally:
-            if model_tmp is not None:
-                try:
-                    os.unlink(model_tmp.name)
-                except OSError:
-                    pass
-        if proc.returncode != 0:
-            return {
-                "ok": False,
-                "error": f"inject --dry-run 返回 {proc.returncode}",
-                "stderr": _mask_secret_text(proc.stderr, api_key),
-                "stdout": _mask_secret_text(proc.stdout, api_key),
-            }
-        return {
-            "ok": True,
-            "plan_text": _mask_secret_text(proc.stdout, api_key),
-            "label": label,
-            "command": f"sub2cli-inject add-api <url> --api-key-stdin --skip-check (dry-run)",
-            "changes": _parse_inject_plan_changes(proc.stdout, api_key),
-        }
-
-    def inject_apply(self) -> dict:
-        """Real inject: call sub2cli-inject add-api <url> <key> for current Codex key.
-
-        Returns {ok, stdout, stderr, backup_name, auto_rollback}.
-        """
-        target = self._current_default_inject_target()
-        if not target:
-            return {"ok": False, "error": "未设置 Codex 配置用 key 或端点"}
-        url, api_key, _label, models = target
-        inject_bin = self._resolve_inject_bin()
-        if not inject_bin:
-            return {"ok": False, "error": "找不到 sub2cli-inject 二进制"}
-        model_args, model_tmp = self._inject_models_args(models)
-        try:
-            proc = subprocess.run(
-                [inject_bin, "add-api", url, "--api-key-stdin", "--skip-check", *model_args],
-                input=api_key,
-                capture_output=True,
-                text=True,
-                env=_inject_subprocess_env(),
-                timeout=INJECT_APPLY_TIMEOUT,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
+            if dry_run:
+                return {
+                    "ok": False,
+                    "error": f"dry-run 超过 {timeout} 秒仍未完成; 未写入任何 Codex 配置。",
+                    "stdout": "",
+                    "stderr": "",
+                    "timeout": timeout,
+                }
             stdout = _coerce_proc_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
             stderr = _coerce_proc_text(getattr(exc, "stderr", None))
             backup_name = _extract_rollback_backup(stdout)
             rollback_result = _rollback_inject_backup(inject_bin, backup_name) if backup_name else None
             return {
                 "ok": False,
-                "error": f"配置超过 {INJECT_APPLY_TIMEOUT} 秒仍未完成",
+                "error": f"配置超过 {timeout} 秒仍未完成",
                 "stdout": _mask_secret_text(stdout, api_key),
                 "stderr": _mask_secret_text(stderr, api_key),
                 "returncode": None,
@@ -2597,13 +2853,30 @@ class JsApi:
                 "auto_rollback": _mask_result_texts(rollback_result, api_key),
             }
         except Exception as exc:
-            return {"ok": False, "error": _mask_secret_text(f"{type(exc).__name__}: {exc}", api_key)}
+            # Original plan path prefixed "调用 inject 失败: "; apply path did not.
+            prefix = "调用 inject 失败: " if dry_run else ""
+            return {"ok": False, "error": _mask_secret_text(f"{prefix}{type(exc).__name__}: {exc}", api_key)}
         finally:
             if model_tmp is not None:
                 try:
                     os.unlink(model_tmp.name)
                 except OSError:
                     pass
+
+        if dry_run:
+            if proc.returncode != 0:
+                return {
+                    "ok": False,
+                    "error": f"inject --dry-run 返回 {proc.returncode}",
+                    "stderr": _mask_secret_text(proc.stderr, api_key),
+                    "stdout": _mask_secret_text(proc.stdout, api_key),
+                }
+            return {
+                "ok": True,
+                "plan_text": _mask_secret_text(proc.stdout, api_key),
+                "changes": _parse_inject_plan_changes(proc.stdout, api_key),
+            }
+
         backup_name = _extract_rollback_backup(proc.stdout)
         rollback_result = None
         if proc.returncode != 0 and backup_name:
@@ -2617,6 +2890,36 @@ class JsApi:
             "rollback_command": f"sub2cli-inject rollback {backup_name}" if backup_name else None,
             "auto_rollback": _mask_result_texts(rollback_result, api_key),
         }
+
+    def inject_plan(self) -> dict:
+        """Dry-run: call sub2cli-inject add-api <url> <key> --dry-run.
+
+        Returns {ok, plan_text, label, command, changes}. The plan_text is the
+        raw stdout of the inject binary so the modal can display it verbatim.
+        """
+        target = self._current_default_inject_target()
+        if not target:
+            return {
+                "ok": False,
+                "error": "未设置 Codex 配置用 key 或端点; 先在 API Keys 点“选用”。",
+            }
+        url, api_key, label, models = target
+        result = self._run_inject_add_api(url, api_key, models, dry_run=True)
+        if result.get("ok"):
+            result["label"] = label
+            result["command"] = "sub2cli-inject add-api <url> --api-key-stdin --skip-check (dry-run)"
+        return result
+
+    def inject_apply(self) -> dict:
+        """Real inject: call sub2cli-inject add-api <url> <key> for current Codex key.
+
+        Returns {ok, stdout, stderr, backup_name, auto_rollback}.
+        """
+        target = self._current_default_inject_target()
+        if not target:
+            return {"ok": False, "error": "未设置 Codex 配置用 key 或端点"}
+        url, api_key, _label, models = target
+        return self._run_inject_add_api(url, api_key, models, dry_run=False)
 
     def ensure_codex_app(self) -> dict:
         """Keep the current Codex App process on the enhanced sub2cli launch path."""
@@ -2740,6 +3043,15 @@ class JsApi:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"URL 不合法: {exc}"}
 
+        # Warn (don't hard-block — localhost self-hosted relays use http) when a
+        # bearer token would be sent over cleartext http to a non-loopback host.
+        insecure_warning = None
+        _parsed = urlparse(domain)
+        if _parsed.scheme == "http" and not _is_loopback_relay_host(_parsed.hostname or ""):
+            insecure_warning = (
+                f"{_parsed.hostname} 使用明文 http，relay token 将以明文发送，建议改用 https"
+            )
+
         probe = Sub2Context(domain)
         is_sub2api, sub_msg = probe.settings_reachable_anonymous()
         if not is_sub2api:
@@ -2778,6 +3090,7 @@ class JsApi:
             "edge_email": edge_email,
             "turnstile": turnstile,
             "domain": domain,
+            "insecure_warning": insecure_warning,
         }
 
     def add_relay(self, url: str, email: str = "", password: str = "") -> dict:
@@ -2837,10 +3150,16 @@ class JsApi:
             for f in sub2cli_lib.RELAY_FIELDS:
                 cfg[f] = (relays[domain] or {}).get(f)
 
+            keychain_warning = None
             if token and email:
-                _kc_set(domain, email, token)
-                if save_creds:
-                    _kc_creds_set(domain, email, password)
+                if not _kc_set(domain, email, token):
+                    keychain_warning = (
+                        "token 未能写入 Keychain（下次启动可能需要重新登录）"
+                    )
+                if save_creds and not _kc_creds_set(domain, email, password):
+                    keychain_warning = (
+                        "登录凭据未能写入 Keychain（自动续登将不可用）"
+                    )
                 ad = _accounts_for_domain(cfg, domain)
                 if not any(a.get("email") == email for a in ad["saved"]):
                     ad["saved"].append({"email": email, "last_verified": int(time.time())})
@@ -2854,7 +3173,10 @@ class JsApi:
             self._codex_key = None
             self._default_ep = None
 
-        return self.bootstrap()
+        result = self.bootstrap()
+        if keychain_warning and isinstance(result, dict):
+            result["keychain_warning"] = keychain_warning
+        return result
 
     def switch_relay(self, domain: str) -> dict:
         """Change active relay. Rebuilds Sub2Context, re-runs bootstrap.
@@ -3064,8 +3386,11 @@ class JsApi:
                 )}
             return {"ok": False, "error": f"登录失败: {err}"}
         with self._lock:
-            _kc_set(ctx.domain, email, token)
-            _kc_creds_set(ctx.domain, email, password)
+            keychain_warning = None
+            if not _kc_set(ctx.domain, email, token):
+                keychain_warning = "token 未能写入 Keychain（下次启动可能需要重新登录）"
+            if not _kc_creds_set(ctx.domain, email, password):
+                keychain_warning = "登录凭据未能写入 Keychain（自动续登将不可用）"
             ad = _accounts_for_domain(cfg, ctx.domain)
             if not any(a.get("email") == email for a in ad["saved"]):
                 ad["saved"].append({"email": email, "last_verified": int(time.time())})
@@ -3081,7 +3406,10 @@ class JsApi:
             self._default_key = None
             self._codex_key = None
             self._default_ep = None
-        return self.bootstrap()
+        result = self.bootstrap()
+        if keychain_warning and isinstance(result, dict):
+            result["keychain_warning"] = keychain_warning
+        return result
 
     def switch_account(self, email: str) -> dict:
         """Activate a saved account.
@@ -3239,6 +3567,57 @@ class JsApi:
         accounts["login_home"] = _home_path(login_auth.parent)
         return accounts
 
+    def remove_codex_account(self, slot: str) -> dict:
+        """Remove a saved official Codex account slot and its local auth copy."""
+        slot = (slot or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,30}", slot):
+            return {"ok": False, "error": "slot 非法"}
+
+        removed: list[str] = []
+        try:
+            with CodexStateLock():
+                data = _read_json_file(PROVIDER_SLOTS_PATH)
+                slots = data.setdefault("slots", {})
+                existing = slots.get(slot)
+                if not existing or existing.get("mode") != "oauth":
+                    return {"ok": False, "error": f"未保存的官方账号: {slot}"}
+                if data.get("current") == slot:
+                    return {"ok": False, "error": "该官方账号当前正在 Codex 使用中，请先切到中转或其他账号后再删除。"}
+
+                auth_path = _expanded_path(existing.get("auth_file"))
+                slots.pop(slot, None)
+                replacement = next(
+                    (name for name, cfg in slots.items() if (cfg or {}).get("mode") == "oauth"),
+                    None,
+                )
+                if data.get("preferred_official_slot") == slot:
+                    if replacement:
+                        data["preferred_official_slot"] = replacement
+                    else:
+                        data.pop("preferred_official_slot", None)
+                if data.get("app_history_slot") == slot:
+                    data["app_history_slot"] = replacement
+                _write_json_file(PROVIDER_SLOTS_PATH, data)
+
+                if auth_path and auth_path.name != "auth.json":
+                    try:
+                        if _safe_remove_file(auth_path, CODEX_HOME_PATH):
+                            removed.append(_home_path(auth_path))
+                    except OSError:
+                        pass
+                login_home = CODEX_HOME_PATH / "sub2cli-account-homes" / slot
+                try:
+                    if _safe_remove_tree(login_home, CODEX_HOME_PATH / "sub2cli-account-homes"):
+                        removed.append(_home_path(login_home))
+                except OSError:
+                    pass
+        except Exception as exc:
+            return {"ok": False, "error": f"删除官方账号失败: {type(exc).__name__}: {exc}"}
+
+        accounts = _discover_codex_accounts()
+        accounts["removed"] = removed
+        return accounts
+
     def codex_account_usage(self, slot: str = "") -> dict:
         """Return local account identity and live Codex usage when this slot is active."""
         accounts = self.list_codex_accounts()
@@ -3249,7 +3628,10 @@ class JsApi:
         if not account:
             return {"ok": False, "error": "未找到官方账号"}
         auth_path = account.get("source_auth_file") or account.get("auth_file")
-        snapshot = _codex_rpc_snapshot(None if account.get("is_current_provider") else (auth_path or "").replace("~", str(Path.home()), 1))
+        expanded = _expanded_path(auth_path)
+        snapshot = _codex_rpc_snapshot(
+            None if account.get("is_current_provider") else (str(expanded) if expanded else None)
+        )
         return {"ok": True, "account": account, "snapshot": snapshot}
 
     def codex_account_config_plan(self, slot: str = "") -> dict:
@@ -3274,9 +3656,20 @@ class JsApi:
         inject_bin = self._resolve_inject_bin()
         if not inject_bin:
             return {"ok": False, "error": "找不到 sub2cli-inject 二进制"}
+        # Preview the SAME subcommand apply will run (add-account ... --dry-run),
+        # not `use`. cmd_oauth --dry-run exercises the same JSON/email/apikey
+        # validation as the real apply (it only skips the token refresh), so a
+        # clean plan now reliably predicts a clean apply.
+        source = _expanded_path(account.get("source_auth_file") or account.get("auth_file"))
+        if not source or not source.exists():
+            return {"ok": False, "error": f"账号 auth 文件不存在: {account.get('source_auth_file') or account.get('auth_file')}"}
+        plan_cmd = [inject_bin, "add-account", target, "--auth-file", str(source), "--dry-run"]
+        display = (account.get("display_name") or "").strip()
+        if display:
+            plan_cmd.extend(["--display", display])
         try:
             proc = subprocess.run(
-                [inject_bin, "use", target, "--dry-run"],
+                plan_cmd,
                 capture_output=True,
                 text=True,
                 env=_inject_subprocess_env(),
@@ -3288,11 +3681,11 @@ class JsApi:
                 "error": f"dry-run 超过 {INJECT_PLAN_TIMEOUT} 秒仍未完成; 未写入任何 Codex 配置。",
             }
         except Exception as exc:
-            return {"ok": False, "error": f"调用 use --dry-run 失败: {type(exc).__name__}: {exc}"}
+            return {"ok": False, "error": f"调用 add-account --dry-run 失败: {type(exc).__name__}: {exc}"}
         if proc.returncode != 0:
             return {
                 "ok": False,
-                "error": f"use --dry-run 返回 {proc.returncode}",
+                "error": f"add-account --dry-run 返回 {proc.returncode}",
                 "stderr": proc.stderr,
                 "stdout": proc.stdout,
             }
@@ -3300,7 +3693,7 @@ class JsApi:
             "ok": True,
             "plan_text": proc.stdout,
             "label": f"{account.get('email') or account.get('display_name') or target} · {account.get('plan_label') or 'Codex'}",
-            "command": f"sub2cli-inject use {target} (dry-run)",
+            "command": f"sub2cli-inject add-account {target} --auth-file … (dry-run)",
             "slot": target,
             "changes": _parse_use_plan_changes(proc.stdout, target),
         }
@@ -3320,16 +3713,6 @@ class JsApi:
         source = _expanded_path(account.get("source_auth_file") or account.get("auth_file"))
         if not source or not source.exists():
             return {"ok": False, "error": f"账号 auth 文件不存在: {account.get('source_auth_file') or account.get('auth_file')}"}
-        refresh_ok, refresh_error, refresh_snapshot = _refresh_codex_auth_file(source)
-        if not refresh_ok:
-            return {
-                "ok": False,
-                "error": refresh_error or "该官方账号登录态已失效，请重新登录后再配置",
-                "stdout": "",
-                "stderr": "",
-                "returncode": None,
-                "auth_refresh": refresh_snapshot,
-            }
         cmd = [inject_bin, "add-account", target, "--auth-file", str(source)]
         display = (account.get("display_name") or "").strip()
         if display:
@@ -3405,7 +3788,7 @@ class JsApi:
                 "ok": False,
                 "severity": "warn",
                 "message": "未在 /Applications/Codex.app 找到",
-                "fix_hint": "从 https://codex.io 下载安装; 若装在非默认位置可忽略",
+                "fix_hint": "从 https://openai.com/codex/ 安装 Codex; 若装在非默认位置可忽略",
             })
 
         # 2. codex CLI. Finder-launched macOS apps often do not inherit the
@@ -3588,53 +3971,337 @@ class JsApi:
             "group_model_columns": model_columns,
         }
 
-    def test_group(self, group_id: int, columns: list[str] | None = None) -> dict:
-        """Switch the dedicated test key to group_id and run selected model columns."""
-        with self._lock:
-            try:
-                ctx, cfg = self._ensure_ctx()
-            except RuntimeError as exc:
-                return {"ok": False, "error": str(exc)}
-            keys = ctx.fetch_keys()
-            keys, default_key = sub2cli_lib.ensure_test_key(ctx, keys)
-            if not default_key:
-                return {"ok": False, "error": "无法创建测试专用 key, 无法测试"}
-            ep_url = (cfg or {}).get("default_endpoint_url") or sub2cli_lib.normalize_v1(ctx.domain)
+    def test_group(
+        self,
+        group_id: int,
+        columns: list[str] | None = None,
+        restore: bool = True,
+    ) -> dict:
+        """Temporarily move the dedicated test key, probe models, then restore.
 
-            codex_key = self._codex_key or sub2cli_lib.find_codex_key(keys, cfg)
-            if default_key.get("group_id") != group_id:
-                ok, err = ctx.update_key_group(int(default_key["id"]), int(group_id))
-                if not ok:
-                    return {"ok": False, "error": f"切分组失败: {err}"}
-                # refresh
+        The relay stores a key's group server-side. Keep one backend transaction
+        around switch -> requests -> restore so overlapping UI clicks or model
+        discovery cannot move the test key mid-probe and misattribute results.
+        """
+        try:
+            target_group_id = int(group_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"分组 id 无效: {group_id}"}
+
+        with self._group_test_lock:
+            with self._lock:
+                try:
+                    ctx, cfg = self._ensure_ctx()
+                except RuntimeError as exc:
+                    return {"ok": False, "error": str(exc)}
                 keys = ctx.fetch_keys()
-                default_key = sub2cli_lib.find_key_by_name(keys, sub2cli_lib.TEST_KEY_NAME)
+                keys, default_key = sub2cli_lib.ensure_test_key(ctx, keys)
                 if not default_key:
-                    return {"ok": False, "error": "切完分组后测试 key 丢失"}
-                cfg["default_key_id"] = default_key.get("id")
-                cfg["default_key_name"] = default_key.get("name")
-                sub2cli_lib.save_config(cfg, ctx.config_path)
-                self._cfg = cfg
-                self._default_key = default_key
-                codex_key = self._codex_key or sub2cli_lib.find_codex_key(keys, cfg)
-                keys = self._mark_codex_key(keys, codex_key)
-            else:
-                keys = self._mark_codex_key(keys, codex_key)
-            api_key = default_key.get("key", "")
-            model_columns = sub2cli_lib.normalize_group_model_columns(
-                columns if columns is not None else (cfg or {}).get("group_model_columns"),
-                [],
-            )
+                    return {"ok": False, "error": "无法创建测试专用 key, 无法测试"}
+                try:
+                    test_key_id = int(default_key["id"])
+                except (KeyError, TypeError, ValueError):
+                    return {"ok": False, "error": "测试专用 key 缺少有效 id"}
 
-        # API calls outside lock — long-running, don't block other reads
-        results = {}
-        for model in model_columns:
-            results[model] = sub2cli_lib.test_model(ep_url, api_key, model=model)
+                original_group_id = default_key.get("group_id")
+                ep_url = (
+                    (cfg or {}).get("default_endpoint_url")
+                    or sub2cli_lib.normalize_v1(ctx.domain)
+                )
+                codex_key = self._codex_key or sub2cli_lib.find_codex_key(keys, cfg)
+
+                if (
+                    cfg.get("default_key_id") != default_key.get("id")
+                    or cfg.get("default_key_name") != default_key.get("name")
+                ):
+                    cfg["default_key_id"] = default_key.get("id")
+                    cfg["default_key_name"] = default_key.get("name")
+                    sub2cli_lib.save_config(cfg, ctx.config_path)
+                    self._cfg = cfg
+
+                if default_key.get("group_id") != target_group_id:
+                    ok, err = ctx.update_key_group(test_key_id, target_group_id)
+                    if not ok:
+                        return {"ok": False, "error": f"切分组失败: {err}"}
+                    keys = ctx.fetch_keys()
+                    default_key = sub2cli_lib.find_key_by_id(keys, test_key_id)
+                    if not default_key:
+                        return {"ok": False, "error": "切完分组后测试 key 丢失"}
+                api_key = default_key.get("key", "")
+                model_columns = sub2cli_lib.normalize_group_model_columns(
+                    columns if columns is not None else (cfg or {}).get("group_model_columns"),
+                    [],
+                )
+
+                results = {}
+                try:
+                    for model in model_columns:
+                        try:
+                            results[model] = sub2cli_lib.test_model(
+                                ep_url,
+                                api_key,
+                                model=model,
+                                text_probe="responses",
+                            )
+                        except Exception as exc:  # noqa: BLE001 - keep row-level result
+                            results[model] = {
+                                "ok": False,
+                                "status": "err",
+                                "latency_ms": 0,
+                                "summary": f"{type(exc).__name__}: {exc}",
+                            }
+                finally:
+                    restore_error = None
+                    if restore and original_group_id is not None:
+                        try:
+                            keys = ctx.fetch_keys()
+                            current_key = sub2cli_lib.find_key_by_id(keys, test_key_id)
+                            if (
+                                current_key
+                                and current_key.get("group_id") != original_group_id
+                            ):
+                                ok, err = ctx.update_key_group(
+                                    test_key_id,
+                                    int(original_group_id),
+                                )
+                                if not ok:
+                                    restore_error = err or "restore failed"
+                        except Exception as exc:  # noqa: BLE001 - report but keep results
+                            restore_error = f"{type(exc).__name__}: {exc}"
+                    keys = ctx.fetch_keys()
+                    default_key = (
+                        sub2cli_lib.find_key_by_id(keys, test_key_id)
+                        or default_key
+                    )
+                    codex_key = self._codex_key or sub2cli_lib.find_codex_key(keys, cfg)
+                    keys = self._mark_codex_key(keys, codex_key)
+                    self._default_key = default_key
+                    self._codex_key = codex_key
+
+                return {
+                    "ok": True,
+                    "group_id": target_group_id,
+                    "results": results,
+                    "restored": not restore or restore_error is None,
+                    "restore_error": restore_error,
+                    "default_key": self._serialize_key(default_key),
+                    "codex_key": self._serialize_key(codex_key) if codex_key else None,
+                    "keys": [self._serialize_key(k) for k in keys],
+                }
+
+    # ---- custom OpenAI-compatible APIs ----
+
+    def list_custom_apis(self) -> dict:
+        """Saved custom APIs + which one is current (for sidebar + dashboard)."""
+        cfg = sub2cli_lib.load_config() or {}
+        current_id = cfg.get("current_custom_api")
+        apis = [
+            self._serialize_custom_api(e, current_id=current_id)
+            for e in _custom_apis(cfg)
+            if isinstance(e, dict) and e.get("id")
+        ]
+        if current_id and not any(a["id"] == current_id for a in apis):
+            current_id = apis[0]["id"] if apis else None
+        return {"ok": True, "apis": apis, "current_id": current_id}
+
+    def probe_custom_api(self, url: str, api_key: str = "") -> dict:
+        """Connectivity test for a candidate custom endpoint: GET /v1/models.
+
+        Returns {ok, base_url, models, model_count, summary} on success, or
+        {ok: False, reachable, base_url, error} so the modal can distinguish a
+        dead host from a reachable-but-rejected key.
+        """
+        url = (url or "").strip()
+        api_key = (api_key or "").strip()
+        if not url:
+            return {"ok": False, "error": "URL 必填"}
+        base_url = sub2cli_lib._normalize_domain(url)
+        models, err = sub2cli_lib.fetch_models(base_url, api_key or None, timeout=8)
+        if err and not models:
+            reachable = err.startswith("HTTP 401") or err.startswith("HTTP 403")
+            return {
+                "ok": False,
+                "reachable": reachable,
+                "base_url": base_url,
+                "error": (f"可达但鉴权失败 ({err}), 检查 API Key" if reachable
+                          else f"连不通: {err}"),
+            }
         return {
             "ok": True,
-            "group_id": group_id,
-            "results": results,
-            "default_key": self._serialize_key(default_key),
-            "codex_key": self._serialize_key(codex_key) if codex_key else None,
-            "keys": [self._serialize_key(k) for k in keys],
+            "base_url": base_url,
+            "models": models,
+            "model_count": len(models),
+            "summary": f"连通 · {len(models)} 个模型" if models else "连通 (该端点 /models 为空)",
         }
+
+    def add_custom_api(self, url: str, api_key: str = "", name: str = "") -> dict:
+        """Validate connectivity, then persist a custom API (key → Keychain)."""
+        url = (url or "").strip()
+        api_key = (api_key or "").strip()
+        name = (name or "").strip()
+        if not url:
+            return {"ok": False, "error": "URL 必填"}
+        if not api_key:
+            return {"ok": False, "error": "API Key 必填"}
+        base_url = sub2cli_lib._normalize_domain(url)
+        # connectivity gate: must reach /models with the supplied key
+        models, err = sub2cli_lib.fetch_models(base_url, api_key, timeout=8)
+        if err and not models:
+            return {"ok": False, "error": f"无法连通: {err}", "base_url": base_url}
+        with self._lock:
+            cfg = sub2cli_lib.load_config() or {}
+            apis = _custom_apis(cfg)
+            used = {e.get("id") for e in apis if isinstance(e, dict)}
+            api_id = _unique_custom_api_id(_custom_api_base_slug(base_url, name), used)
+            if not _kc_custom_api_set(api_id, api_key):
+                return {"ok": False, "error": "无法把 API Key 写入 Keychain"}
+            entry = {
+                "id": api_id,
+                "name": name or _custom_api_base_slug(base_url, name),
+                "base_url": base_url,
+                "model_columns": sub2cli_lib.normalize_group_model_columns(None, models),
+                "created_at": int(time.time()),
+            }
+            apis.append(entry)
+            cfg["current_custom_api"] = api_id
+            sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
+        listing = self.list_custom_apis()
+        listing["added_id"] = api_id
+        listing["models"] = models
+        return listing
+
+    def remove_custom_api(self, api_id: str) -> dict:
+        """Drop a custom API from cfg + delete its Keychain key."""
+        api_id = (api_id or "").strip()
+        if not api_id:
+            return {"ok": False, "error": "id 必填"}
+        with self._lock:
+            cfg = sub2cli_lib.load_config()
+            if not cfg:
+                return {"ok": False, "error": "尚未配置"}
+            apis = _custom_apis(cfg)
+            if not _find_custom_api(cfg, api_id):
+                return {"ok": False, "error": f"未保存的自定义 API: {api_id}"}
+            apis[:] = [e for e in apis if e.get("id") != api_id]
+            if cfg.get("current_custom_api") == api_id:
+                cfg["current_custom_api"] = apis[0].get("id") if apis else None
+            sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
+        _kc_custom_api_delete(api_id)
+        listing = self.list_custom_apis()
+        listing["removed"] = api_id
+        return listing
+
+    def select_custom_api(self, api_id: str) -> dict:
+        """Mark a custom API as the current one (for highlight + config target)."""
+        api_id = (api_id or "").strip()
+        with self._lock:
+            cfg = sub2cli_lib.load_config()
+            if not cfg:
+                return {"ok": False, "error": "尚未配置"}
+            if not _find_custom_api(cfg, api_id):
+                return {"ok": False, "error": f"未保存的自定义 API: {api_id}"}
+            cfg["current_custom_api"] = api_id
+            sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
+        return self.list_custom_apis()
+
+    def update_custom_api_columns(self, api_id: str, columns: list[str]) -> dict:
+        """Persist the user-selected model test columns for a custom API."""
+        with self._lock:
+            cfg = sub2cli_lib.load_config()
+            if not cfg:
+                return {"ok": False, "error": "尚未配置"}
+            entry = _find_custom_api(cfg, api_id)
+            if not entry:
+                return {"ok": False, "error": f"未保存的自定义 API: {api_id}"}
+            model_columns = sub2cli_lib.normalize_group_model_columns(columns, [])
+            entry["model_columns"] = model_columns
+            sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
+        return {"ok": True, "id": api_id, "model_columns": model_columns}
+
+    def refresh_custom_api_models(self, api_id: str) -> dict:
+        """Re-read /models for a saved custom API (populates the model picker)."""
+        cfg = sub2cli_lib.load_config() or {}
+        entry = _find_custom_api(cfg, api_id)
+        if not entry:
+            return {"ok": False, "error": f"未保存的自定义 API: {api_id}"}
+        api_key = _kc_custom_api_get(api_id) or ""
+        models, err = sub2cli_lib.fetch_models(entry.get("base_url", ""), api_key or None, timeout=8)
+        return {
+            "ok": True,
+            "models": models,
+            "model_error": err,
+            "model_columns": entry.get("model_columns") or [],
+        }
+
+    def test_custom_api_model(self, api_id: str, model: str) -> dict:
+        """Run a single chat/image probe against a saved custom API + model."""
+        cfg = sub2cli_lib.load_config() or {}
+        entry = _find_custom_api(cfg, api_id)
+        if not entry:
+            return {"ok": False, "error": f"未保存的自定义 API: {api_id}"}
+        model = (model or "").strip()
+        if not model:
+            return {"ok": False, "error": "model 必填"}
+        api_key = _kc_custom_api_get(api_id) or ""
+        if not api_key:
+            return {"ok": False, "error": "Keychain 里没有这个自定义 API 的 Key"}
+        result = sub2cli_lib.test_model(entry.get("base_url", ""), api_key, model=model)
+        return {"ok": True, "model": model, "result": result}
+
+    def _custom_api_inject_target(self, api_id: str) -> tuple[str, str, str, list[str], str] | None:
+        """Return (base_url, api_key, label, models, selected_model) for configuring Codex."""
+        cfg = sub2cli_lib.load_config() or {}
+        entry = _find_custom_api(cfg, api_id)
+        if not entry:
+            return None
+        base_url = entry.get("base_url", "")
+        api_key = _kc_custom_api_get(api_id) or ""
+        if not base_url or not api_key:
+            return None
+        saved_models = [str(m).strip() for m in (entry.get("model_columns") or []) if str(m or "").strip()]
+        fetched_models, _err = sub2cli_lib.fetch_models(base_url, api_key, timeout=8)
+        models = sub2cli_lib.merge_model_lists(saved_models, fetched_models)
+        if not models:
+            models = saved_models
+        selected_model = saved_models[0] if saved_models else (models[0] if models else "")
+        label = f"自定义 API · {entry.get('name') or api_id} · {base_url}"
+        return base_url, api_key, label, models, selected_model
+
+    def custom_api_config_plan(self, api_id: str) -> dict:
+        """Dry-run configuring Codex to a saved custom API."""
+        target = self._custom_api_inject_target(api_id)
+        if not target:
+            return {"ok": False, "error": "未找到自定义 API 或缺少 Key"}
+        url, api_key, label, models, selected_model = target
+        display = f"Codex - {api_id} custom API"
+        result = self._run_inject_add_api(
+            url,
+            api_key,
+            models,
+            dry_run=True,
+            model=selected_model,
+            protocol="chat",
+            slot=api_id,
+            display=display,
+        )
+        if result.get("ok"):
+            result["label"] = label
+            result["command"] = "sub2cli-inject add-api <url> --api-key-stdin --skip-check (dry-run)"
+        return result
+
+    def custom_api_config_apply(self, api_id: str) -> dict:
+        """Configure Codex to a saved custom API (url + key)."""
+        target = self._custom_api_inject_target(api_id)
+        if not target:
+            return {"ok": False, "error": "未找到自定义 API 或缺少 Key"}
+        url, api_key, _label, models, selected_model = target
+        return self._run_inject_add_api(
+            url,
+            api_key,
+            models,
+            dry_run=False,
+            model=selected_model,
+            protocol="chat",
+            slot=api_id,
+            display=f"Codex - {api_id} custom API",
+        )

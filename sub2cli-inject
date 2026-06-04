@@ -13,6 +13,8 @@ import errno
 import fcntl
 import glob
 import getpass
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import re
@@ -57,8 +59,13 @@ RELAY_PROVIDER = "OpenAI"
 THREAD_PROVIDERS = (OAUTH_PROVIDER, RELAY_PROVIDER)
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
+PROTOCOL_PROXY_PORT = int(os.environ.get("SUB2CLI_PROTOCOL_PROXY_PORT", "18765"))
+PROTOCOL_PROXY_BASE_URL = f"http://127.0.0.1:{PROTOCOL_PROXY_PORT}/v1"
+PROTOCOL_PROXY_LOG = CODEX_HOME / "sub2cli-responses-proxy.log"
 CODEX_APP_BUNDLE = Path(os.environ.get("SUB2CLI_CODEX_APP", "/Applications/Codex.app")).expanduser()
-CODEX_APP_BUNDLED_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
+# Derive the bundled CLI from CODEX_APP_BUNDLE so a non-/Applications install
+# (via SUB2CLI_CODEX_APP) still finds the codex binary inside its own bundle.
+CODEX_APP_BUNDLED_CLI = CODEX_APP_BUNDLE / "Contents" / "Resources" / "codex"
 CODEX_APP_SERVER_CONTROL_SOCKET = CODEX_HOME / "app-server-control" / "app-server-control.sock"
 PREFERRED_CODEX_DEBUG_PORT = int(os.environ.get("SUB2CLI_CODEX_DEBUG_PORT", "9229"))
 CODEX_AUTH_REFRESH_TIMEOUT = int(os.environ.get("SUB2CLI_CODEX_AUTH_REFRESH_TIMEOUT", "25"))
@@ -74,8 +81,11 @@ FORCE_QUIT_CODEX = os.environ.get("SUB2CLI_CODEX_FORCE_QUIT", "1").lower() not i
     "no",
     "off",
 }
-APP_VERSION = "0.1.0"
-APP_URL = os.environ.get("CODEX_PROVIDER_URL", "https://github.com/r266-tech/codex-provider-macos")
+APP_VERSION = "0.2.2"
+APP_URL = os.environ.get(
+    "SUB2CLI_URL",
+    os.environ.get("CODEX_PROVIDER_URL", "https://github.com/r266-tech/sub2cli"),
+)
 APP_BANNER = r"""
   ____          _           ____                 _     _
  / ___|___   __| | _____  _|  _ \ _ __ _____   _(_) __| | ___ _ __
@@ -177,13 +187,42 @@ class Sub2cliLock:
                 self._fd = None
 
 
-def atomic_write_json(path: Path, data: dict, *, mode: int = 0o600) -> None:
+def _fsync_dir(path: Path) -> None:
+    """Best-effort fsync of a directory so a rename inside it is durable.
+
+    Some platforms/filesystems reject O_DIRECTORY fsync; ignore those.
+    """
+    try:
+        dir_fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def durable_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
+    """Crash-safe credential write: tmp created 0600, fsync'd, atomically renamed,
+    then the parent dir is fsync'd so the rename survives power loss.
+
+    This is the single primitive every credential/state writer routes through.
+    Creating the tmp with O_EXCL|mode also closes the world-readable window that
+    write_bytes()+chmod() would otherwise leave between create and chmod.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # fdopen took ownership of fd; ensure mode wasn't loosened by umask.
         os.chmod(tmp, mode)
-        tmp.replace(path)
+        os.replace(tmp, path)
     except Exception:
         if tmp.exists() or tmp.is_symlink():
             try:
@@ -191,38 +230,23 @@ def atomic_write_json(path: Path, data: dict, *, mode: int = 0o600) -> None:
             except OSError:
                 pass
         raise
+    _fsync_dir(path.parent)
+
+
+def atomic_write_json(path: Path, data: dict, *, mode: int = 0o600) -> None:
+    durable_write_bytes(
+        path,
+        (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+        mode=mode,
+    )
 
 
 def atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    try:
-        tmp.write_text(text)
-        os.chmod(tmp, mode)
-        tmp.replace(path)
-    except Exception:
-        if tmp.exists() or tmp.is_symlink():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-        raise
+    durable_write_bytes(path, text.encode("utf-8"), mode=mode)
 
 
 def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    try:
-        tmp.write_bytes(data)
-        os.chmod(tmp, mode)
-        tmp.replace(path)
-    except Exception:
-        if tmp.exists() or tmp.is_symlink():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-        raise
+    durable_write_bytes(path, data, mode=mode)
 
 
 def atomic_symlink(link_path: Path, target: Path) -> None:
@@ -265,19 +289,7 @@ def copy_auth_atomic(src: Path, *, mode: int = 0o600) -> None:
     if not src.exists():
         fail(f"slot auth file missing: {src}")
     data = src.read_bytes()
-    AUTH_JSON.parent.mkdir(parents=True, exist_ok=True)
-    tmp = AUTH_JSON.with_name(f"{AUTH_JSON.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    try:
-        tmp.write_bytes(data)
-        os.chmod(tmp, mode)
-        os.replace(tmp, AUTH_JSON)
-    except Exception:
-        if tmp.exists() or tmp.is_symlink():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-        raise
+    durable_write_bytes(AUTH_JSON, data, mode=mode)
 
 
 def flush_auth_to_slot(slot_auth_file: Path, *, mode: int = 0o600) -> bool:
@@ -296,18 +308,7 @@ def flush_auth_to_slot(slot_auth_file: Path, *, mode: int = 0o600) -> bool:
                 return False
         except OSError:
             pass
-    tmp = slot_auth_file.with_name(f"{slot_auth_file.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    try:
-        tmp.write_bytes(cur)
-        os.chmod(tmp, mode)
-        os.replace(tmp, slot_auth_file)
-    except Exception:
-        if tmp.exists() or tmp.is_symlink():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-        raise
+    durable_write_bytes(slot_auth_file, cur, mode=mode)
     return True
 
 
@@ -407,7 +408,7 @@ def validate_slot(slot: str) -> str:
 def load_slots(required: bool = True) -> dict:
     if not SLOTS_FILE.exists():
         if required:
-            fail(f"{SLOTS_FILE} not found. Run: codex-provider init")
+            fail(f"{SLOTS_FILE} not found. Run: sub2cli-inject init")
         return {"version": 1, "current": None, "app_history_slot": None, "slots": {}}
     try:
         data = json.loads(SLOTS_FILE.read_text())
@@ -446,7 +447,7 @@ def codex_app_main_pids() -> list[int]:
         str(CODEX_APP_BUNDLE / "Contents" / "MacOS" / "Codex"),
         str((CODEX_APP_BUNDLE / "Contents" / "MacOS" / "Codex").resolve(strict=False)),
     }
-    proc = subprocess.run(["ps", "axo", "pid=,command="], capture_output=True, text=True)
+    proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True)
     pids: set[int] = set()
     for line in proc.stdout.splitlines():
         stripped = line.strip()
@@ -466,11 +467,20 @@ def codex_app_main_pids() -> list[int]:
 
 
 def codex_bundle_pids() -> list[int]:
-    """Return target Codex.app process ids without using helper residue as liveness."""
+    """Return target Codex.app process ids (main + bundle helpers).
+
+    Match on argv0 being *inside* the bundle, not a bare substring anywhere in
+    the command line. This kills the app's own executables (main + Helper procs
+    launched from Contents/) but never an unrelated process that merely mentions
+    the bundle path in its arguments, e.g. `tail -f …/Contents/MacOS/Codex.log`
+    or an editor/build command operating on a file in the bundle.
+    """
     pids: set[int] = set(codex_main_pids())
-    marker_raw = str(CODEX_APP_BUNDLE / "Contents")
-    marker_resolved = str((CODEX_APP_BUNDLE / "Contents").resolve(strict=False))
-    proc = subprocess.run(["ps", "axo", "pid=,command="], capture_output=True, text=True)
+    prefixes = {
+        str(CODEX_APP_BUNDLE / "Contents") + os.sep,
+        str((CODEX_APP_BUNDLE / "Contents").resolve(strict=False)) + os.sep,
+    }
+    proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True)
     for line in proc.stdout.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -479,7 +489,8 @@ def codex_bundle_pids() -> list[int]:
         if len(parts) != 2:
             continue
         raw_pid, command = parts
-        if marker_raw not in command and marker_resolved not in command:
+        argv0 = command.split()[0] if command.split() else ""
+        if not any(argv0.startswith(prefix) for prefix in prefixes):
             continue
         try:
             pids.add(int(raw_pid))
@@ -545,7 +556,7 @@ def codex_cli_app_server_control_pids() -> list[int]:
     if pids:
         return sorted(pid for pid in pids if pid != os.getpid())
 
-    proc = subprocess.run(["ps", "axo", "pid=,command="], capture_output=True, text=True)
+    proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True)
     for line in proc.stdout.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -1674,11 +1685,18 @@ class DevToolsWebSocket:
         self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
         self.sock.settimeout(timeout)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
+        # Send an Origin matching the loopback debug port. Codex/Electron is
+        # launched with --remote-allow-origins=http://127.0.0.1:<port>; recent
+        # Chromium enforces origin matching on the CDP WS upgrade and rejects an
+        # absent/null Origin against a concrete allow-list, which would silently
+        # break injection on a future Codex bump.
+        origin = f"http://{self.host}:{self.port}"
         request = (
             f"GET {self.path} HTTP/1.1\r\n"
             f"Host: {self.host}:{self.port}\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
+            f"Origin: {origin}\r\n"
             f"Sec-WebSocket-Key: {key}\r\n"
             "Sec-WebSocket-Version: 13\r\n"
             "\r\n"
@@ -1686,11 +1704,32 @@ class DevToolsWebSocket:
         self.sock.sendall(request.encode("ascii"))
         response = b""
         while b"\r\n\r\n" not in response:
-            response += self.sock.recv(4096)
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise OSError("websocket handshake closed by peer")
+            response += chunk
             if len(response) > 65536:
                 raise OSError("websocket handshake too large")
-        if b" 101 " not in response.split(b"\r\n", 1)[0]:
-            raise OSError("websocket handshake failed")
+        header_block = response.split(b"\r\n\r\n", 1)[0]
+        lines = header_block.split(b"\r\n")
+        status_line = lines[0]
+        # Require an exact 101 status code, not a loose substring match.
+        status_parts = status_line.split(b" ")
+        if len(status_parts) < 2 or status_parts[1] != b"101":
+            raise OSError(f"websocket handshake failed: {status_line.decode('latin-1', 'replace')}")
+        # Validate Sec-WebSocket-Accept = base64(sha1(key + GUID)).
+        headers = {}
+        for line in lines[1:]:
+            if b":" in line:
+                name, _, value = line.partition(b":")
+                headers[name.strip().lower()] = value.strip()
+        if headers.get(b"upgrade", b"").lower() != b"websocket":
+            raise OSError("websocket handshake missing Upgrade: websocket")
+        expected = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        )
+        if headers.get(b"sec-websocket-accept") != expected:
+            raise OSError("websocket handshake Sec-WebSocket-Accept mismatch")
 
     def close(self) -> None:
         try:
@@ -1958,17 +1997,25 @@ def refresh_oauth_auth_file(auth_file: Path) -> tuple[bool, str]:
                 if payload.get("id") == 2:
                     response = payload
             stderr = read_available_pipe_text(proc.stderr) if proc.stderr is not None else ""
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
             if response is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
                 return False, "Codex CLI 校验官方账号超时"
             if response.get("error"):
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
                 return False, mask_auth_error(json.dumps(response.get("error"), ensure_ascii=False))
             result = response.get("result") or {}
             account = result.get("account") or {}
@@ -1979,7 +2026,30 @@ def refresh_oauth_auth_file(auth_file: Path) -> tuple[bool, str]:
                     if stderr
                     else "Codex CLI 未返回有效官方账号，refresh token 可能已失效"
                 )
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
                 return False, detail
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
             tmp_out = auth_file.with_name(f"{auth_file.name}.{os.getpid()}.{time.time_ns()}.tmp")
             tmp_out.write_bytes(refreshed_auth.read_bytes())
             os.chmod(tmp_out, 0o600)
@@ -2111,7 +2181,7 @@ def probe_relay(base_url: str, api_key: str, timeout: float = 12.0) -> tuple[boo
         headers={
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json",
-            "User-Agent": "codex-provider-macos/1.0",
+            "User-Agent": f"sub2cli/{APP_VERSION}",
         },
     )
     try:
@@ -2248,6 +2318,461 @@ def merge_model_lists(*lists: list[str] | None) -> list[str]:
     return result
 
 
+def chat_completions_endpoint(base_url: str) -> str:
+    cleaned = base_url.strip().rstrip("/")
+    if not cleaned:
+        return ""
+    lowered = cleaned.lower()
+    if lowered.endswith("/chat/completions"):
+        return cleaned
+    if lowered.endswith("/v1"):
+        return f"{cleaned}/chat/completions"
+    return f"{cleaned}/v1/chat/completions"
+
+
+def _response_id_from_chat(chat_id: str | None) -> str:
+    chat_id = (chat_id or "sub2cli_compat").strip() or "sub2cli_compat"
+    return chat_id if chat_id.startswith("resp_") else f"resp_{chat_id}"
+
+
+def _message_content_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                raw = item.get("text") or item.get("content") or item.get("input")
+                if isinstance(raw, str):
+                    parts.append(raw)
+    elif isinstance(content, dict):
+        raw = content.get("text") or content.get("content") or content.get("input")
+        if isinstance(raw, str):
+            parts.append(raw)
+    return "\n".join(part for part in parts if part)
+
+
+def _append_responses_input(value: object, messages: list[dict]) -> None:
+    if isinstance(value, str):
+        messages.append({"role": "user", "content": value})
+        return
+    if not isinstance(value, list):
+        return
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type == "function_call_output":
+            call_id = str(item.get("call_id") or item.get("id") or "").strip()
+            output = item.get("output")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call_id or "call_compat",
+                "content": output if isinstance(output, str) else json.dumps(output, ensure_ascii=False),
+            })
+            continue
+        if item_type == "function_call":
+            call_id = str(item.get("call_id") or item.get("id") or "").strip() or "call_compat"
+            name = str(item.get("name") or "").strip() or "tool"
+            arguments = item.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }],
+            })
+            continue
+        role = str(item.get("role") or "user").strip() or "user"
+        if role == "developer":
+            role = "system"
+        if role not in {"system", "user", "assistant", "tool"}:
+            role = "user"
+        text = _message_content_text(item.get("content"))
+        if text:
+            messages.append({"role": role, "content": text})
+
+
+def responses_to_chat_request(body: dict) -> dict:
+    result: dict = {}
+    if body.get("model") is not None:
+        result["model"] = body.get("model")
+    messages: list[dict] = []
+    instructions = _message_content_text(body.get("instructions"))
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+    _append_responses_input(body.get("input"), messages)
+    if not messages:
+        messages.append({"role": "user", "content": ""})
+    result["messages"] = messages
+    if body.get("max_output_tokens") is not None:
+        result["max_tokens"] = body.get("max_output_tokens")
+    for key in ("max_tokens", "temperature", "top_p", "stream"):
+        if body.get(key) is not None:
+            result[key] = body.get(key)
+    if result.get("stream"):
+        result["stream_options"] = {"include_usage": True}
+
+    tools: list[dict] = []
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or tool.get("function", {}).get("name") or "").strip()
+        if not name:
+            continue
+        params = tool.get("parameters") or tool.get("input_schema") or tool.get("schema") or {}
+        if not isinstance(params, dict):
+            params = {}
+        params.setdefault("type", "object")
+        params.setdefault("properties", {})
+        fn = {
+            "name": name,
+            "description": str(tool.get("description") or ""),
+            "parameters": params,
+        }
+        tools.append({"type": "function", "function": fn})
+    if tools:
+        result["tools"] = tools
+        if body.get("parallel_tool_calls") is not None:
+            result["parallel_tool_calls"] = body.get("parallel_tool_calls")
+    return result
+
+
+def _usage_to_responses(usage: object) -> dict:
+    usage = usage if isinstance(usage, dict) else {}
+    prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    total = int(usage.get("total_tokens") or (prompt + completion))
+    details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
+    return {
+        "input_tokens": prompt,
+        "output_tokens": completion,
+        "total_tokens": total,
+        "output_tokens_details": {
+            "reasoning_tokens": int(details.get("reasoning_tokens") or 0),
+        },
+    }
+
+
+def chat_completion_to_response(body: dict) -> dict:
+    choices = body.get("choices") if isinstance(body.get("choices"), list) else []
+    first = choices[0] if choices and isinstance(choices[0], dict) else {}
+    msg = first.get("message") if isinstance(first.get("message"), dict) else {}
+    chat_id = str(body.get("id") or "chatcmpl_sub2cli")
+    response_id = _response_id_from_chat(chat_id)
+    model = str(body.get("model") or msg.get("model") or "")
+    output: list[dict] = []
+    reasoning = msg.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        output.append({
+            "id": f"rs_{chat_id}",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+            "reasoning_content": reasoning,
+        })
+    content = msg.get("content")
+    if isinstance(content, list):
+        content = _message_content_text(content)
+    if isinstance(content, str) and content:
+        output.append({
+            "id": f"msg_{chat_id}",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content, "annotations": []}],
+        })
+    for idx, call in enumerate(msg.get("tool_calls") or []):
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        output.append({
+            "id": f"fc_{idx}_{chat_id}",
+            "type": "function_call",
+            "status": "completed",
+            "call_id": str(call.get("id") or f"call_{idx}"),
+            "name": str(fn.get("name") or "tool"),
+            "arguments": fn.get("arguments") if isinstance(fn.get("arguments"), str) else "{}",
+        })
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(body.get("created") or time.time()),
+        "status": "completed",
+        "model": model,
+        "output": output,
+        "usage": _usage_to_responses(body.get("usage")),
+    }
+
+
+def _sse(event: str, data: object) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+def response_json_to_sse(response: dict) -> bytes:
+    chunks: list[str] = []
+    chunks.append(_sse("response.created", {"response": {k: v for k, v in response.items() if k != "output"}}))
+    chunks.append(_sse("response.in_progress", {"response": {**response, "status": "in_progress", "output": []}}))
+    for output_index, item in enumerate(response.get("output") or []):
+        chunks.append(_sse("response.output_item.added", {"output_index": output_index, "item": item}))
+        if item.get("type") == "message":
+            content = (item.get("content") or [{}])[0]
+            text = str(content.get("text") or "")
+            chunks.append(_sse("response.content_part.added", {
+                "item_id": item.get("id"), "output_index": output_index, "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            }))
+            if text:
+                chunks.append(_sse("response.output_text.delta", {
+                    "item_id": item.get("id"), "output_index": output_index, "content_index": 0,
+                    "delta": text,
+                }))
+            chunks.append(_sse("response.output_text.done", {
+                "item_id": item.get("id"), "output_index": output_index, "content_index": 0,
+                "text": text,
+            }))
+            chunks.append(_sse("response.content_part.done", {
+                "item_id": item.get("id"), "output_index": output_index, "content_index": 0,
+                "part": {"type": "output_text", "text": text, "annotations": []},
+            }))
+        elif item.get("type") == "function_call":
+            args = str(item.get("arguments") or "")
+            if args:
+                chunks.append(_sse("response.function_call_arguments.delta", {
+                    "item_id": item.get("id"), "output_index": output_index, "delta": args,
+                }))
+            chunks.append(_sse("response.function_call_arguments.done", {
+                "item_id": item.get("id"), "output_index": output_index, "arguments": args,
+            }))
+        chunks.append(_sse("response.output_item.done", {"output_index": output_index, "item": item}))
+    chunks.append(_sse("response.completed", {"response": response}))
+    chunks.append("data: [DONE]\n\n")
+    return "".join(chunks).encode("utf-8")
+
+
+def chat_sse_to_response_json(raw: bytes) -> dict:
+    content = ""
+    reasoning = ""
+    chat_id = "chatcmpl_sub2cli"
+    model = ""
+    created = int(time.time())
+    usage: dict = {}
+    tools: dict[int, dict] = {}
+    for raw_line in raw.decode("utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except ValueError:
+            continue
+        if isinstance(payload.get("error"), dict):
+            raise RuntimeError(payload["error"].get("message") or json.dumps(payload["error"], ensure_ascii=False))
+        chat_id = str(payload.get("id") or chat_id)
+        model = str(payload.get("model") or model)
+        created = int(payload.get("created") or created)
+        if isinstance(payload.get("usage"), dict):
+            usage = payload["usage"]
+        choices = payload.get("choices") if isinstance(payload.get("choices"), list) else []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            if isinstance(delta.get("content"), str):
+                content += delta["content"]
+            if isinstance(delta.get("reasoning_content"), str):
+                reasoning += delta["reasoning_content"]
+            for tc in delta.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                idx = int(tc.get("index") or 0)
+                state = tools.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if tc.get("id"):
+                    state["id"] = str(tc.get("id"))
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                if fn.get("name"):
+                    state["name"] = str(fn.get("name"))
+                if isinstance(fn.get("arguments"), str):
+                    state["arguments"] += fn["arguments"]
+    message: dict = {"role": "assistant", "content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if tools:
+        message["tool_calls"] = [
+            {
+                "id": tool.get("id") or f"call_{idx}",
+                "type": "function",
+                "function": {"name": tool.get("name") or "tool", "arguments": tool.get("arguments") or "{}"},
+            }
+            for idx, tool in sorted(tools.items())
+        ]
+    return chat_completion_to_response({
+        "id": chat_id,
+        "created": created,
+        "model": model,
+        "choices": [{"message": message, "finish_reason": "tool_calls" if tools else "stop"}],
+        "usage": usage,
+    })
+
+
+def _active_chat_proxy_slot() -> dict:
+    data = load_slots(required=False)
+    slot = data.get("current")
+    cfg = (data.get("slots") or {}).get(slot) or {}
+    if cfg.get("mode") != "relay" or cfg.get("protocol") != "chat":
+        raise RuntimeError("当前渠道不是 chat-completions 自定义 API")
+    if not str(cfg.get("base_url") or "").strip() or not str(cfg.get("api_key") or "").strip():
+        raise RuntimeError("chat-completions 自定义 API 缺少 base_url 或 api_key")
+    return cfg
+
+
+class ResponsesProxyHandler(BaseHTTPRequestHandler):
+    server_version = "sub2cli-responses-proxy/0.1"
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        try:
+            PROTOCOL_PROXY_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with PROTOCOL_PROXY_LOG.open("a", encoding="utf-8") as fh:
+                fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), fmt % args))
+        except OSError:
+            pass
+
+    def _send(self, status: int, body: bytes, content_type: str = "application/json") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, status: int, payload: object) -> None:
+        self._send(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path == "/healthz":
+            self._send_json(200, {"ok": True})
+            return
+        if path not in {"/models", "/v1/models"}:
+            self._send_json(404, {"error": {"message": "not found"}})
+            return
+        try:
+            cfg = _active_chat_proxy_slot()
+            endpoint = models_endpoint(str(cfg.get("base_url") or ""))
+            req = urlrequest.Request(endpoint, headers={
+                "Authorization": f"Bearer {cfg.get('api_key')}",
+                "Accept": "application/json",
+                "User-Agent": "sub2cli-responses-proxy/0.1",
+            })
+            with urlrequest.urlopen(req, timeout=30) as resp:
+                body = resp.read(4 * 1024 * 1024)
+                content_type = resp.headers.get("Content-Type") or "application/json"
+            self._send(200, body, content_type)
+        except Exception as exc:
+            self._send_json(502, {"error": {"message": str(exc)}})
+
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path not in {"/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact"}:
+            self._send_json(404, {"error": {"message": "not found"}})
+            return
+        try:
+            cfg = _active_chat_proxy_slot()
+            length = int(self.headers.get("Content-Length") or "0")
+            body = self.rfile.read(length)
+            responses_body = json.loads(body.decode("utf-8"))
+            chat_body = responses_to_chat_request(responses_body)
+            endpoint = chat_completions_endpoint(str(cfg.get("base_url") or ""))
+            req = urlrequest.Request(
+                endpoint,
+                data=json.dumps(chat_body, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {cfg.get('api_key')}",
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream" if chat_body.get("stream") else "application/json",
+                    "User-Agent": "sub2cli-responses-proxy/0.1",
+                },
+                method="POST",
+            )
+            try:
+                with urlrequest.urlopen(req, timeout=600) as resp:
+                    upstream = resp.read()
+                    upstream_type = resp.headers.get("Content-Type") or ""
+            except urlerror.HTTPError as exc:
+                err_body = exc.read()[:1024 * 1024]
+                self._send(exc.code, err_body or str(exc).encode("utf-8"), exc.headers.get("Content-Type") or "application/json")
+                return
+            wants_stream = bool(responses_body.get("stream"))
+            if "text/event-stream" in upstream_type:
+                response = chat_sse_to_response_json(upstream)
+            else:
+                response = chat_completion_to_response(json.loads(upstream.decode("utf-8")))
+            if wants_stream:
+                self._send(200, response_json_to_sse(response), "text/event-stream")
+            else:
+                self._send_json(200, response)
+        except Exception as exc:
+            payload = {"error": {"message": str(exc), "type": "sub2cli_proxy_error"}}
+            if self.headers.get("accept", "").lower().find("text/event-stream") >= 0:
+                failed = _sse("response.failed", {"response": {"status": "failed", "error": payload["error"]}}) + "data: [DONE]\n\n"
+                self._send(500, failed.encode("utf-8"), "text/event-stream")
+            else:
+                self._send_json(500, payload)
+
+
+def run_responses_proxy(port: int = PROTOCOL_PROXY_PORT) -> int:
+    server = ThreadingHTTPServer(("127.0.0.1", port), ResponsesProxyHandler)
+    print(f"sub2cli responses proxy listening on http://127.0.0.1:{port}/v1", flush=True)
+    server.serve_forever()
+    return 0
+
+
+def _self_command_prefix() -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, str(Path(__file__).resolve())]
+
+
+def protocol_proxy_healthy(port: int = PROTOCOL_PROXY_PORT) -> bool:
+    try:
+        with urlrequest.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.8) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def ensure_protocol_proxy(port: int = PROTOCOL_PROXY_PORT) -> bool:
+    if protocol_proxy_healthy(port):
+        return False
+    PROTOCOL_PROXY_LOG.parent.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+    for key in list(env):
+        if key.startswith("_PYI_"):
+            env.pop(key, None)
+    with PROTOCOL_PROXY_LOG.open("ab") as log:
+        subprocess.Popen(
+            [*_self_command_prefix(), "responses-proxy", "--port", str(port)],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            close_fds=True,
+            start_new_session=True,
+            env=env,
+        )
+    for _ in range(30):
+        time.sleep(0.1)
+        if protocol_proxy_healthy(port):
+            return True
+    return False
+
+
 def load_models_json(path: str | None) -> list[str]:
     if not path:
         return []
@@ -2363,7 +2888,13 @@ def strip_relay_provider_block(text: str) -> str:
     ).rstrip() + "\n"
 
 
-def patch_config(*, mode: str, model: str, relay_base_url: str | None = None) -> bool:
+def patch_config(
+    *,
+    mode: str,
+    model: str,
+    relay_base_url: str | None = None,
+    protocol: str = "responses",
+) -> bool:
     text = CONFIG_TOML.read_text() if CONFIG_TOML.exists() else ""
     provider = RELAY_PROVIDER if mode == "relay" else OAUTH_PROVIDER
     new_text = set_top_level_config(
@@ -2379,10 +2910,11 @@ def patch_config(*, mode: str, model: str, relay_base_url: str | None = None) ->
     if mode == "relay":
         if not relay_base_url:
             fail("relay_base_url is required for relay mode")
+        codex_base_url = PROTOCOL_PROXY_BASE_URL if protocol == "chat" else relay_base_url.rstrip("/")
         block = (
             f"\n[model_providers.{RELAY_PROVIDER}]\n"
             f'name = "{RELAY_PROVIDER}"\n'
-            f'base_url = "{toml_quote(relay_base_url.rstrip("/"))}"\n'
+            f'base_url = "{toml_quote(codex_base_url)}"\n'
             'wire_api = "responses"\n'
             "requires_openai_auth = true\n"
         )
@@ -2436,14 +2968,45 @@ def config_clean_for_slot(cfg: dict) -> bool:
         return False
     relay_url = relay_block_base_url(text)
     if mode == "relay":
+        expected_url = PROTOCOL_PROXY_BASE_URL if cfg.get("protocol") == "chat" else str(cfg.get("base_url", "")).rstrip("/")
         return (
-            relay_url == str(cfg.get("base_url", "")).rstrip("/")
+            relay_url == expected_url
             and top_level_bool_value(text, "disable_response_storage") is True
         )
     return relay_url is None
 
 
+BACKUP_RETENTION = int(os.environ.get("SUB2CLI_BACKUP_RETENTION", "20"))
+
+
+def prune_old_backups(keep: int = BACKUP_RETENTION) -> None:
+    """Cap provider-switch-backups to the `keep` most recent dirs.
+
+    Snapshots contain plaintext relay api_key copies and OAuth auth.json copies;
+    without a cap they accumulate forever (disk growth + a widening credential
+    footprint that any home-dir backup/sync would capture). Best-effort: a prune
+    failure must never abort a switch.
+    """
+    if keep < 0 or not BACKUP_ROOT.exists():
+        return
+    try:
+        dirs = sorted(
+            (p for p in BACKUP_ROOT.iterdir() if p.is_dir()),
+            key=lambda p: p.name,
+        )
+    except OSError:
+        return
+    for stale in dirs[: max(0, len(dirs) - keep)]:
+        try:
+            shutil.rmtree(stale)
+        except OSError:
+            pass
+
+
 def new_backup_dir(label: str) -> Path:
+    # Prune before creating so the just-made backup is never a prune target.
+    # keep-1 here, because we are about to add one more.
+    prune_old_backups(max(0, BACKUP_RETENTION - 1))
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", label)
     path = BACKUP_ROOT / f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}-{safe}"
     path.mkdir(parents=True, exist_ok=False)
@@ -2454,11 +3017,18 @@ def backup_state_db(backup_dir: Path) -> Path | None:
     if not STATE_DB.exists():
         return None
     target = backup_dir / STATE_DB.name
-    with sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=30) as src:
-        src.execute("PRAGMA busy_timeout=30000")
-        with sqlite3.connect(target) as dst:
-            src.backup(dst)
-    os.chmod(target, 0o600)
+    # Best-effort: a backup failure (incl. os.chmod OSError, e.g. dir removed or
+    # FS remounted read-only mid-switch) must NOT abort an otherwise-successful
+    # switch. normalize_state_db only guards sqlite3.Error, so swallow OSError here.
+    try:
+        with sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=30) as src:
+            src.execute("PRAGMA busy_timeout=30000")
+            with sqlite3.connect(target) as dst:
+                src.backup(dst)
+        os.chmod(target, 0o600)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"  ⚠️  state_5.sqlite 备份失败，继续: {exc}", file=sys.stderr)
+        return None
     return target
 
 
@@ -2900,7 +3470,9 @@ def compute_switch_plan(data: dict, target_slot: str) -> dict:
             "type": "patch_toml",
             "path": str(CONFIG_TOML),
             "section": f"[model_providers.{RELAY_PROVIDER}]",
-            "base_url": cfg.get("base_url"),
+            "base_url": PROTOCOL_PROXY_BASE_URL if cfg.get("protocol") == "chat" else cfg.get("base_url"),
+            "upstream_base_url": cfg.get("base_url") if cfg.get("protocol") == "chat" else None,
+            "protocol": cfg.get("protocol") or "responses",
             "model": slot_config_model(cfg, refresh=False),
         })
     else:
@@ -2958,6 +3530,10 @@ def print_switch_plan(plan: dict) -> None:
             print(f"    {i}. patch:  {a['path']}  {a['section']}")
             if a.get("base_url"):
                 print(f"       base_url = {a['base_url']}")
+            if a.get("upstream_base_url"):
+                print(f"       upstream = {a['upstream_base_url']}")
+            if a.get("protocol"):
+                print(f"       protocol = {a['protocol']}")
             print(f"       model = {a['model']}")
         elif t == "normalize_sessions":
             print(
@@ -3044,7 +3620,13 @@ def restore_from_backup(backup_dir: Path) -> int:
     schema = snap.get("schema")
     if schema not in (1, 2, 3):
         fail(f"unknown snapshot schema {schema!r} in {snap_path} (expected 1, 2 or 3)")
-    quit_codex()
+    # Best-effort quit: rollback's file writes don't require Codex to be down.
+    # If quit_codex() fail()s on a stuck app (SystemExit), do NOT abort the
+    # restore — that would leave ~/.codex half-switched. Restore files first.
+    try:
+        quit_codex()
+    except SystemExit as exc:
+        print(f"  ⚠️  回滚前未能退出 Codex App（继续恢复文件）: {exc}", file=sys.stderr)
     stop_codex_cli_app_server()
     restored: list[str] = []
     warnings: list[str] = []
@@ -3312,12 +3894,25 @@ def cmd_switch(
             if prev_mode == "oauth" and prev_auth and str(prev_auth):
                 try:
                     flush_auth_to_slot(prev_auth)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    print(f"  ⚠️  未能保存上一个渠道的最新登录态，切换继续: {exc}", file=sys.stderr)
+        elif previous == target_slot and mode == "oauth":
+            # Re-selecting the slot that is already current (e.g. watchdog
+            # "repair current channel" via cmd_ensure_app, or `use <current>`).
+            # The live auth.json may hold a token codex refreshed since the last
+            # switch; OAuth refresh tokens are single-use. Flush live -> slot
+            # FIRST so the freshest token lands in the slot before the
+            # copy_auth_atomic below writes it back. Without this, copy_auth_atomic
+            # would clobber the live (newer) token with the slot's stale copy.
+            try:
+                flush_auth_to_slot(auth_target)
+            except OSError as exc:
+                print(f"  ⚠️  未能保存当前渠道的最新登录态，继续: {exc}", file=sys.stderr)
 
         if mode == "relay":
             api_key = str(cfg.get("api_key") or "").strip()
             base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
+            protocol = "chat" if cfg.get("protocol") == "chat" else "responses"
             if not api_key or not base_url:
                 fail(f"relay slot {target_slot!r} is missing api_key/base_url")
             selected_model = slot_config_model(cfg, refresh=True)
@@ -3326,7 +3921,7 @@ def cmd_switch(
                 cfg["model_source"] = "auto"
                 slots[target_slot] = cfg
             write_apikey_auth(auth_target, api_key)
-            patch_config(mode="relay", model=selected_model, relay_base_url=base_url)
+            patch_config(mode="relay", model=selected_model, relay_base_url=base_url, protocol=protocol)
         else:
             patch_config(mode="oauth", model=slot_config_model(cfg, refresh=False))
 
@@ -3347,9 +3942,7 @@ def cmd_switch(
                 try:
                     parsed = json.loads(cur)
                     if parsed.get("auth_mode") != "apikey":
-                        auth_target.parent.mkdir(parents=True, exist_ok=True)
-                        auth_target.write_bytes(cur)
-                        os.chmod(auth_target, 0o600)
+                        durable_write_bytes(auth_target, cur, mode=0o600)
                         # AUTH_JSON already holds the right content; no overwrite needed.
                         recovered = True
                         print(f"  ↳ 自当前 auth.json 恢复 oauth token 到 {auth_target}")
@@ -3364,6 +3957,13 @@ def cmd_switch(
         data["current"] = target_slot
         data.setdefault("app_history_slot", target_slot)
         save_slots(data)
+        if mode == "relay" and cfg.get("protocol") == "chat":
+            if ensure_protocol_proxy():
+                print(f"  Responses→Chat 代理已启动: {PROTOCOL_PROXY_BASE_URL}")
+            elif protocol_proxy_healthy():
+                print(f"  Responses→Chat 代理已就绪: {PROTOCOL_PROXY_BASE_URL}")
+            else:
+                fail(f"Responses→Chat 代理启动失败，请查看 {PROTOCOL_PROXY_LOG}")
 
         verb = "已修复当前渠道" if previous == target_slot else "已切换到"
         print(f"{verb}：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
@@ -3375,6 +3975,8 @@ def cmd_switch(
         if mode == "relay":
             print(f"  base_url    -> {cfg.get('base_url')}")
             print(f"  model       -> {slot_config_model(cfg, refresh=False)}")
+            if cfg.get("protocol") == "chat":
+                print(f"  protocol    -> chat via {PROTOCOL_PROXY_BASE_URL}")
         elif not auth_target.exists() or auth_target.stat().st_size < 10:
             print(f"  尚未登录：请运行 `codex login` 写入 {auth_target}")
         print_session_summary(session_stats)
@@ -3402,6 +4004,7 @@ def cmd_relay(
     slot: str | None = None,
     model: str | None = None,
     models_json: str | None = None,
+    protocol: str = "responses",
     display: str | None = None,
     skip_probe: bool = False,
     no_switch: bool = False,
@@ -3412,6 +4015,7 @@ def cmd_relay(
     api_key = api_key.strip()
     if not api_key:
         fail("API key 不能为空")
+    protocol = "chat" if protocol == "chat" else "responses"
     slot = validate_slot(slot) if slot else slot_from_url(base_url)
 
     if not skip_probe:
@@ -3439,6 +4043,7 @@ def cmd_relay(
         print(f"  slot:     {slot}")
         print(f"  base_url: {base_url}")
         print(f"  model:    {selected_model}")
+        print(f"  protocol: {protocol}")
         if no_switch:
             print("  --no-switch: 不会切换")
             return 0
@@ -3454,6 +4059,7 @@ def cmd_relay(
             "model": selected_model,
             "model_source": model_source,
             "models": models,
+            "protocol": protocol,
             "api_key": api_key,
         }
         simulated["slots"] = simulated_slots
@@ -3483,15 +4089,17 @@ def cmd_relay(
                 "model": selected_model,
                 "model_source": model_source,
                 "models": models,
+                "protocol": protocol,
                 "api_key": api_key,
             }
             save_slots(data)
             print(f"{'已更新' if existing else '已添加'} API 渠道：{slot}")
             print(f"  base_url: {base_url}")
             print(f"  model:    {selected_model}")
+            print(f"  protocol: {protocol}")
 
             if no_switch:
-                print(f"  稍后切换：codex-provider use {slot}")
+                print(f"  稍后切换：sub2cli-inject use {slot}")
                 print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
                 return 0
             return cmd_switch(slot, no_restart=no_restart, backup_dir=backup_dir)
@@ -3510,7 +4118,7 @@ def read_api_key_secure(*, from_stdin: bool) -> str:
 
 def reject_positional_api_key(argv: list[str]) -> None:
     """Reject legacy `add-api <url> <key>` before argparse can echo the key."""
-    value_options = {"--name", "--slot", "--model", "--models-json", "--display"}
+    value_options = {"--name", "--slot", "--model", "--models-json", "--display", "--protocol"}
     positionals = 0
     i = 0
     while i < len(argv):
@@ -3625,7 +4233,7 @@ def cmd_oauth(
             save_slots(data)
             print(f"{'已更新' if existing else '已添加'}账号渠道：{slot}")
             if no_switch:
-                print(f"  稍后切换：codex-provider use {slot}")
+                print(f"  稍后切换：sub2cli-inject use {slot}")
                 print("  切过去后运行：codex login")
                 print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
                 return 0
@@ -3650,8 +4258,8 @@ def cmd_list() -> int:
     slots = data.get("slots", {})
     if not slots:
         print("还没有渠道")
-        print("  添加 API：  codex-provider add-api https://relay.example.com sk-...")
-        print("  添加账号： codex-provider add-account work")
+        print("  添加 API：  sub2cli-inject add-api https://relay.example.com sk-...")
+        print("  添加账号： sub2cli-inject add-account work")
         return 0
     for key, cfg in slots.items():
         marker = "*" if key == current else " "
@@ -3668,7 +4276,7 @@ def cmd_status() -> int:
     slots = data.get("slots", {})
     if not current or current not in slots:
         print("当前没有渠道")
-        print("  运行：codex-provider")
+        print("  运行：sub2cli-inject")
         return 0
     cfg = slots[current]
     provider = slot_thread_provider(cfg)
@@ -3692,7 +4300,7 @@ def cmd_status() -> int:
     preview = normalize_sessions(provider, dry_run=True)
     print_session_summary(preview)
     if not slot_is_clean(data, current):
-        print(f"  状态不一致：运行 `codex-provider use {current}` 修复")
+        print(f"  状态不一致：运行 `sub2cli-inject use {current}` 修复")
     return 0
 
 
@@ -3713,14 +4321,34 @@ def cmd_remove(slot: str, *, hard: bool = False) -> int:
     if hard:
         auth_path = Path(cfg.get("auth_file", "")).expanduser()
         profile_path = Path(cfg.get("app_profile_dir", "")).expanduser()
+        remaining_slots = data.get("slots", {})
         if auth_path.is_file() or auth_path.is_symlink():
             if CODEX_HOME.resolve(strict=False) in auth_path.resolve(strict=False).parents:
                 auth_path.unlink()
                 print(f"  removed {auth_path}")
+            else:
+                # --hard means "purge the credential". If the auth file lives
+                # outside CODEX_HOME (an imported account), don't silently skip —
+                # tell the user so they can delete it themselves.
+                print(
+                    f"  ⚠️  未删除 auth 文件（在 CODEX_HOME 之外，请手动删除）: {auth_path}",
+                    file=sys.stderr,
+                )
+        # Only rmtree the profile if no OTHER remaining slot still points at it,
+        # otherwise --hard on one slot would destroy a profile a sibling shares.
+        profile_key = str(profile_path.resolve(strict=False))
+        shared_by = [
+            name
+            for name, other in remaining_slots.items()
+            if str(Path(str((other or {}).get("app_profile_dir", ""))).expanduser().resolve(strict=False)) == profile_key
+        ]
         if profile_path.exists() and not profile_path.is_symlink():
-            if APP_SUPPORT.resolve(strict=False) in profile_path.resolve(strict=False).parents:
-                import shutil
-
+            if shared_by:
+                print(
+                    f"  ⚠️  保留 App profile（仍被其他渠道使用: {', '.join(shared_by)}）: {profile_path}",
+                    file=sys.stderr,
+                )
+            elif APP_SUPPORT.resolve(strict=False) in profile_path.resolve(strict=False).parents:
                 shutil.rmtree(profile_path)
                 print(f"  removed {profile_path}")
     return 0
@@ -4025,7 +4653,7 @@ def menu_normalize() -> None:
 
 
 def cmd_version() -> int:
-    print(f"codex-provider {APP_VERSION}")
+    print(f"sub2cli-inject {APP_VERSION}")
     print(APP_URL)
     return 0
 
@@ -4095,7 +4723,7 @@ def cmd_menu() -> int:
 
 
 def run_internal_command(command: str, argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog=f"codex-provider {command}")
+    parser = argparse.ArgumentParser(prog=f"sub2cli-inject {command}")
 
     if command == "menu":
         parser.parse_args(argv)
@@ -4129,6 +4757,7 @@ def run_internal_command(command: str, argv: list[str]) -> int:
         parser.add_argument("--api-key-stdin", action="store_true")
         parser.add_argument("--slot")
         parser.add_argument("--model")
+        parser.add_argument("--protocol", choices=["responses", "chat"], default="responses")
         parser.add_argument("--display")
         parser.add_argument("--skip-probe", action="store_true")
         parser.add_argument("--no-switch", action="store_true")
@@ -4143,6 +4772,7 @@ def run_internal_command(command: str, argv: list[str]) -> int:
             slot=args.slot,
             model=args.model,
             models_json=None,
+            protocol=args.protocol,
             display=args.display,
             skip_probe=args.skip_probe,
             no_switch=args.no_switch,
@@ -4199,6 +4829,11 @@ def run_internal_command(command: str, argv: list[str]) -> int:
         args = parser.parse_args(argv)
         return cmd_rollback(args.target, list_only=args.list_only)
 
+    if command == "responses-proxy":
+        parser.add_argument("--port", type=int, default=PROTOCOL_PROXY_PORT)
+        args = parser.parse_args(argv)
+        return run_responses_proxy(args.port)
+
     fail(f"unknown internal command: {command}")
     return 1
 
@@ -4220,6 +4855,7 @@ def main(argv: list[str] | None = None) -> int:
         "remove",
         "normalize-sessions",
         "rollback",
+        "responses-proxy",
     }
     if argv and argv[0] in internal_commands:
         return run_internal_command(argv[0], argv[1:])
@@ -4227,7 +4863,7 @@ def main(argv: list[str] | None = None) -> int:
         reject_positional_api_key(argv[1:])
 
     parser = argparse.ArgumentParser(
-        prog="codex-provider",
+        prog="sub2cli-inject",
         description="在已保存的 Codex 账号和 API 渠道之间切换。",
         formatter_class=ChineseHelpFormatter,
         add_help=False,
@@ -4241,6 +4877,8 @@ def main(argv: list[str] | None = None) -> int:
     p_add_api.add_argument("--name", "--slot", dest="slot")
     p_add_api.add_argument("--model")
     p_add_api.add_argument("--models-json", help="从 JSON 文件读取并缓存完整模型列表")
+    p_add_api.add_argument("--protocol", choices=["responses", "chat"], default="responses",
+                           help="上游协议: responses=原生 Responses API, chat=Chat Completions 经本地代理转换")
     p_add_api.add_argument("--display")
     p_add_api.add_argument("--skip-check", "--skip-probe", dest="skip_probe", action="store_true")
     p_add_api.add_argument("--no-switch", action="store_true")
@@ -4297,6 +4935,7 @@ def main(argv: list[str] | None = None) -> int:
             slot=args.slot,
             model=args.model,
             models_json=args.models_json,
+            protocol=args.protocol,
             display=args.display,
             skip_probe=args.skip_probe,
             no_switch=args.no_switch,

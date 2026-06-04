@@ -19,11 +19,19 @@ const state = {
   groupModels: {}, // group_id -> model names returned while the test key is in that group
   modelError: null,
   groupModelColumns: [], // model names selected for group test columns
+  groupTestRunning: false,
+  relays: [],
   lastDomain: null,  // current relay domain, for modal hints
   currentEmail: null,
   viewMode: 'relay',
   codexAccounts: [],
   currentCodexAccount: null,
+  customApis: [],          // [{id, name, base_url, key_masked, model_columns, is_current}]
+  currentCustomApi: null,  // full object of the selected custom API
+  customApiModels: [],     // available models from refresh_custom_api_models
+  customApiColumns: [],    // model names the user picked to test
+  customApiResults: {},    // model -> {ok, latency_ms, status, running}
+  customApiModelError: null,
   currentInjectTarget: 'relay',
   configTargetRunning: false,
   retryRelayDomain: null,
@@ -46,6 +54,11 @@ function showScreen(id) {
   }
 }
 
+// Intentional no-ops: the v2 dark UI has no status-bar / brand-subtitle element
+// (per the selected design). Kept as stubs so the ~80 existing call sites stay
+// valid without scattering progress text into a non-existent slot. Do NOT treat
+// as "unimplemented" — wiring these needs a real UI element, which is a design
+// change (route via AGENTS.md gemini flow), not a bug fix.
 function setStatus(_text, _cls = '') {}
 
 function setBrandSubtitle(_text) {}
@@ -144,6 +157,25 @@ function leftPercent(used) {
 }
 
 // build a <span class="tag ..."> element for a probe/test result cell
+function probeErrorLabel(result) {
+  const status = result && result.status;
+  if (status != null && status !== -1 && status !== 'err') return String(status);
+  const summary = String((result && result.summary) || '').toLowerCase();
+  if (summary.includes('readtimeout') || summary.includes('timeout') || summary.includes('timed out')) {
+    return '超时';
+  }
+  if (summary.includes('connectionerror') || summary.includes('failed to establish') || summary.includes('connection aborted')) {
+    return '网络';
+  }
+  if (summary.includes('name resolution') || summary.includes('dns') || summary.includes('nodename')) {
+    return 'DNS';
+  }
+  if (summary.includes('ssl') || summary.includes('tls')) {
+    return 'TLS';
+  }
+  return '请求失败';
+}
+
 function buildTag(result) {
   const span = document.createElement('span');
   span.className = 'tag';
@@ -163,7 +195,9 @@ function buildTag(result) {
     return span;
   }
   span.classList.add('err');
-  span.textContent = `[ERR] ${result.status ?? '?'}`;
+  span.textContent = `[ERR] ${probeErrorLabel(result)}`;
+  const detail = result.summary || (result.status != null ? `status=${result.status}` : '');
+  if (detail) span.title = detail;
   return span;
 }
 
@@ -192,6 +226,33 @@ function uniqueModels(items) {
     seen.add(model);
   }
   return result;
+}
+
+function sidebarItemButton(text, { className = '', title = '', onClick } = {}) {
+  const button = el('button', {
+    className: `sidebar-item-mini ${className}`.trim(),
+    text,
+    attrs: { type: 'button', title, draggable: 'false' },
+    onClick: (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (onClick) onClick(e);
+    },
+  });
+  button.addEventListener('mousedown', (e) => e.stopPropagation());
+  button.addEventListener('dragstart', (e) => e.preventDefault());
+  return button;
+}
+
+function appendSidebarActions(item, buttons) {
+  const actions = el('div', { className: 'sidebar-item-actions' });
+  for (const button of buttons || []) actions.appendChild(button);
+  item.appendChild(actions);
+  return actions;
+}
+
+function suppressSidebarContextMenu(item) {
+  item.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
 function normalizeGroupModelColumns(columns, models) {
@@ -292,7 +353,7 @@ async function bootstrap(autoRecovered = false) {
 async function refresh() {
   setStatus('刷新中…', 'warn');
   try {
-    const data = await window.pywebview.api.refresh();
+    const data = (await window.pywebview.api.refresh()) || {};
     if (!data.ok) {
       setStatus('刷新失败', 'err');
       if (data.needs_login) {
@@ -370,6 +431,12 @@ function applyBootstrap(data) {
   state.bootstrapped = true;
   state.lastDomain = data.domain || data.site || null;
   state.endpoints = data.endpoints || [];
+  // Reset batch-test checkbox selection on every (re)bootstrap. group ids are
+  // server-assigned per relay and collide across relays (1,2,3…); carrying the
+  // old map over a relay/account switch would leave rows pre-selected and let
+  // 批量测试 fire a real group-switch against the WRONG relay's group. Batch
+  // selection is an explicit per-session action, so starting unchecked is correct.
+  state.groupSelected = {};
   state.groups = data.groups || [];
   state.keys = data.keys || [];
   state.subscriptions = data.subscriptions || [];
@@ -388,6 +455,7 @@ function applyBootstrap(data) {
   renderGroups(data.groups || [], data.keys || [], data.default_key);
   refreshSidebar();  // sidebar is independent of bootstrap data
   refreshCodexAccounts();
+  refreshCustomApis();
   updateContextLabels();
   updateAccountChip((data.user && data.user.email) || null);
 }
@@ -414,24 +482,9 @@ function updateContextLabels() {
   const codex = currentCodexLabel();
   const popRelay = $('#pop-current-relay');
   const popCodex = $('#pop-current-codex');
-  const choiceRelay = $('#choice-relay');
-  const choiceCodex = $('#choice-codex');
-  const choiceRelayMeta = $('#choice-relay-meta');
-  const choiceCodexMeta = $('#choice-codex-meta');
   if (popRelay) popRelay.textContent = relay;
   if (popCodex) popCodex.textContent = codex;
-  if (choiceRelay) choiceRelay.textContent = relay;
-  if (choiceCodex) choiceCodex.textContent = codex;
-  if (choiceRelayMeta) {
-    const key = state.codexKey && state.codexKey.name ? state.codexKey.name : '未选 key';
-    const ep = state.defaultEndpoint && state.defaultEndpoint.name ? state.defaultEndpoint.name : '默认端点';
-    choiceRelayMeta.textContent = `Codex key: ${key} · 端点: ${ep}`;
-  }
-  if (choiceCodexMeta) {
-    choiceCodexMeta.textContent = state.currentCodexAccount
-      ? `${state.currentCodexAccount.plan_label || 'Codex'} · ${state.currentCodexAccount.slot}${state.currentCodexAccount.is_registered ? '' : ' · 待注册'}`
-      : '请先在官号列表新增或选择账号';
-  }
+  updateConfigChoiceMeta();
 }
 
 // ---- sidebar (multi-relay) ----
@@ -512,7 +565,7 @@ function makeSortableItem(item, key) {
 async function refreshSidebar() {
   const list = $('#sidebar-list');
   try {
-    const r = await window.pywebview.api.list_relays_full();
+    const r = (await window.pywebview.api.list_relays_full()) || {};
     if (!r.ok) {
       list.replaceChildren(el('div', {
         className: 'muted small',
@@ -521,24 +574,31 @@ async function refreshSidebar() {
       return;
     }
     const relays = applyStoredOrder(r.relays || [], RELAY_ORDER_KEY, (relay) => relay.domain);
+    state.relays = relays;
     const frag = document.createDocumentFragment();
     for (const relay of relays) {
       const item = el('div', { className: 'relay-item' + (relay.is_current ? ' active' : '') });
+      suppressSidebarContextMenu(item);
       makeSortableItem(item, relay.domain);
       const info = el('div', { className: 'relay-info' });
       info.appendChild(el('span', { className: 'relay-domain', text: relay.site || relay.domain }));
       item.appendChild(info);
+      appendSidebarActions(item, [
+        sidebarItemButton('删除', {
+          className: 'danger',
+          title: '删除中转站',
+          onClick: () => {
+            if (confirm(`删除中转站 ${relay.site || relay.domain}?\n会清掉它在 Keychain 里的 token 和密码 (不可恢复).`)) {
+              removeRelay(relay.domain);
+            }
+          },
+        }),
+      ]);
       if (relay.is_current) item.addEventListener('click', () => {
         if (!state.dragSorting) showRelayDashboard();
       });
       else item.addEventListener('click', () => {
         if (!state.dragSorting) switchRelay(relay.domain);
-      });
-      item.addEventListener('contextmenu', (e) => {
-        e.preventDefault();
-        if (confirm(`删除中转站 ${relay.site || relay.domain}?\n会清掉它在 Keychain 里的 token 和密码 (不可恢复).`)) {
-          removeRelay(relay.domain);
-        }
       });
       frag.appendChild(item);
     }
@@ -561,7 +621,7 @@ async function refreshCodexAccounts() {
   const list = $('#codex-account-list');
   if (!list) return;
   try {
-    const r = await window.pywebview.api.list_codex_accounts();
+    const r = (await window.pywebview.api.list_codex_accounts()) || {};
     if (!r.ok) {
       list.replaceChildren(el('div', { className: 'muted small', text: r.error || '(空)' }));
       state.codexAccounts = [];
@@ -586,10 +646,22 @@ function renderCodexAccountList() {
   for (const acc of state.codexAccounts) {
     const active = state.currentCodexAccount && state.currentCodexAccount.slot === acc.slot;
     const item = el('div', { className: 'codex-account-item' + (active ? ' active' : '') });
+    suppressSidebarContextMenu(item);
     makeSortableItem(item, codexAccountKey(acc));
     const main = el('div', { className: 'codex-account-main' });
     main.appendChild(el('div', { className: 'codex-account-name', text: codexAccountName(acc) }));
     item.appendChild(main);
+    appendSidebarActions(item, [
+      sidebarItemButton('重登', {
+        title: '重新登录此官方账号',
+        onClick: () => openReloginCodexAccountModal(acc),
+      }),
+      sidebarItemButton('删除', {
+        className: 'danger',
+        title: '删除此官方账号槽位',
+        onClick: () => removeCodexAccount(acc),
+      }),
+    ]);
     item.addEventListener('click', () => {
       if (!state.dragSorting) selectCodexAccount(acc.slot);
     });
@@ -660,7 +732,7 @@ async function selectCodexAccount(slot) {
   updateContextLabels();
   renderOfficialDashboard(state.currentCodexAccount);
   try {
-    const r = await window.pywebview.api.select_codex_account(slot);
+    const r = (await window.pywebview.api.select_codex_account(slot)) || {};
     if (r.ok) {
       state.codexAccounts = mergeCodexAccountsPreserveOrder(r.accounts);
       state.currentCodexAccount = r.current_official || state.currentCodexAccount;
@@ -679,9 +751,379 @@ function showRelayDashboard() {
 function renderMainMode() {
   const relay = $('#relay-dashboard');
   const official = $('#official-dashboard');
+  const custom = $('#custom-api-dashboard');
   if (!relay || !official) return;
   relay.classList.toggle('hidden', state.viewMode !== 'relay');
   official.classList.toggle('hidden', state.viewMode !== 'official');
+  if (custom) custom.classList.toggle('hidden', state.viewMode !== 'custom');
+}
+
+// ---- custom OpenAI-compatible APIs ----
+
+function customApiName(api) {
+  if (!api) return '未命名 API';
+  return api.name || api.base_url || api.id || '未命名 API';
+}
+
+async function refreshCustomApis() {
+  const list = $('#custom-api-list');
+  if (!list) return;
+  try {
+    const r = await window.pywebview.api.list_custom_apis();
+    if (!r || !r.ok) {
+      list.replaceChildren(el('div', { className: 'muted small', text: (r && r.error) || '(空)' }));
+      state.customApis = [];
+      state.currentCustomApi = null;
+      updateContextLabels();
+      return;
+    }
+    state.customApis = r.apis || [];
+    const found = state.customApis.find((a) => a.id === r.current_id);
+    if (state.currentCustomApi) {
+      const stillThere = state.customApis.find((a) => a.id === state.currentCustomApi.id);
+      state.currentCustomApi = stillThere || found || null;
+    } else {
+      state.currentCustomApi = found || null;
+    }
+    renderCustomApiList();
+    updateContextLabels();
+    if (state.viewMode === 'custom') {
+      if (state.currentCustomApi) renderCustomApiDashboard();
+      else showRelayDashboard();  // the one being viewed got removed elsewhere
+    }
+  } catch (err) {
+    list.replaceChildren(el('div', { className: 'muted small', text: '错: ' + String(err) }));
+  }
+}
+
+function renderCustomApiList() {
+  const list = $('#custom-api-list');
+  if (!list) return;
+  const frag = document.createDocumentFragment();
+  for (const api of state.customApis) {
+    const active = state.currentCustomApi && state.currentCustomApi.id === api.id;
+    const item = el('div', { className: 'custom-api-item' + (active ? ' active' : '') });
+    suppressSidebarContextMenu(item);
+    const main = el('div', { className: 'custom-api-main' });
+    main.appendChild(el('div', { className: 'custom-api-name', text: customApiName(api) }));
+    item.appendChild(main);
+    appendSidebarActions(item, [
+      sidebarItemButton('删除', {
+        className: 'danger',
+        title: '删除自定义 API',
+        onClick: () => {
+          if (confirm(`删除自定义 API ${customApiName(api)}?\n会清掉它在 Keychain 里的 Key (不可恢复).`)) {
+            removeCustomApi(api.id);
+          }
+        },
+      }),
+    ]);
+    item.addEventListener('click', () => selectCustomApi(api.id));
+    frag.appendChild(item);
+  }
+  list.replaceChildren(frag);
+}
+
+async function selectCustomApi(id) {
+  const local = state.customApis.find((a) => a.id === id);
+  if (!local) return;
+  state.currentCustomApi = local;
+  state.viewMode = 'custom';
+  state.customApiResults = {};
+  state.customApiColumns = uniqueModels(local.model_columns || []);
+  state.customApiModels = uniqueModels(local.model_columns || []);
+  state.customApiModelError = null;
+  renderMainMode();
+  renderCustomApiList();
+  updateContextLabels();
+  renderCustomApiDashboard();
+  try {
+    const r = await window.pywebview.api.select_custom_api(id);
+    if (r && r.ok) {
+      state.customApis = r.apis || state.customApis;
+      const next = state.customApis.find((a) => a.id === id);
+      if (next) state.currentCustomApi = next;
+      renderCustomApiList();
+    }
+  } catch (_) {}
+  loadCustomApiModels(id);
+}
+
+async function loadCustomApiModels(id) {
+  try {
+    const r = await window.pywebview.api.refresh_custom_api_models(id);
+    if (!r || !r.ok) return;
+    if (!state.currentCustomApi || state.currentCustomApi.id !== id) return;
+    state.customApiModels = uniqueModels([...(r.models || []), ...state.customApiColumns]);
+    state.customApiModelError = r.model_error || null;
+    if ((r.model_columns || []).length && !state.customApiColumns.length) {
+      state.customApiColumns = uniqueModels(r.model_columns);
+    }
+    renderCustomApiDashboard();
+  } catch (_) {}
+}
+
+function renderCustomApiDashboard() {
+  const api = state.currentCustomApi;
+  if (!api) return;
+  setOptionalText('#custom-name', customApiName(api));
+  setOptionalText('#custom-url', api.base_url || '—');
+  setOptionalText('#custom-key', api.key_masked || '—');
+  const conn = $('#custom-conn');
+  if (conn) {
+    if (state.customApiModelError) {
+      conn.textContent = '读取模型失败';
+      conn.className = 'custom-conn err';
+    } else {
+      conn.textContent = `${state.customApiModels.length} 个模型`;
+      conn.className = 'custom-conn ok';
+    }
+  }
+  renderCustomModelTable();
+}
+
+function setCustomApiColumns(columns, { persist = true } = {}) {
+  // Keep the raw list — blanks are allowed so the user can add an empty row
+  // and type a model name not in /models. The backend normalizes/dedupes on
+  // persist, and the test/run paths filter out blanks.
+  const cols = (Array.isArray(columns) ? columns : []).map((m) => String(m == null ? '' : m));
+  state.customApiColumns = cols;
+  const active = new Set(cols);
+  for (const m of Object.keys(state.customApiResults)) {
+    if (!active.has(m)) delete state.customApiResults[m];
+  }
+  renderCustomModelTable();
+  if (persist && state.currentCustomApi) persistCustomApiColumns();
+}
+
+async function persistCustomApiColumns() {
+  if (!state.currentCustomApi) return;
+  try {
+    await window.pywebview.api.update_custom_api_columns(state.currentCustomApi.id, state.customApiColumns);
+  } catch (_) {}
+}
+
+function renderCustomModelTable() {
+  const tbody = $('#t-custom-body');
+  if (!tbody) return;
+  const frag = document.createDocumentFragment();
+  state.customApiColumns.forEach((model, idx) => {
+    const tr = document.createElement('tr');
+    const modelTd = el('td', { className: 'custom-model-cell' });
+    const currentModel = String(model || '').trim();
+    const options = uniqueModels([currentModel, ...state.customApiModels, ...state.customApiColumns]);
+    if (options.length) {
+      const select = el('select', {
+        className: 'custom-model-select',
+        attrs: { 'aria-label': '模型名', title: '模型名' },
+      });
+      if (!currentModel) {
+        select.appendChild(el('option', {
+          text: '选择模型',
+          attrs: { value: '' },
+        }));
+      }
+      for (const optionModel of options) {
+        const opt = el('option', {
+          text: optionModel,
+          attrs: { value: optionModel },
+        });
+        if (optionModel === currentModel) opt.selected = true;
+        select.appendChild(opt);
+      }
+      select.addEventListener('change', () => {
+        const next = [...state.customApiColumns];
+        next[idx] = select.value.trim();
+        setCustomApiColumns(next);
+      });
+      modelTd.appendChild(select);
+    } else {
+      const input = el('input', {
+        className: 'custom-model-input',
+        attrs: {
+          type: 'text', value: model,
+          placeholder: '模型名', 'aria-label': '模型名', spellcheck: 'false',
+        },
+      });
+      input.addEventListener('change', () => {
+        const next = [...state.customApiColumns];
+        next[idx] = input.value.trim();
+        setCustomApiColumns(next);
+      });
+      modelTd.appendChild(input);
+    }
+    tr.appendChild(modelTd);
+
+    const resTd = el('td', { className: 'right custom-model-result' });
+    resTd.appendChild(buildTag(state.customApiResults[model]));
+    tr.appendChild(resTd);
+
+    const actTd = el('td', { className: 'right custom-model-actions' });
+    actTd.appendChild(el('button', {
+      className: 'link',
+      text: '测试',
+      attrs: { type: 'button', title: '测试此模型' },
+      onClick: () => testCustomApiModels([model]),
+    }));
+    if (state.customApiColumns.length > 1) {
+      actTd.appendChild(el('button', {
+        className: 'group-model-remove',
+        text: '×',
+        attrs: { type: 'button', title: '移除', 'aria-label': '移除模型' },
+        onClick: () => setCustomApiColumns(state.customApiColumns.filter((_, i) => i !== idx)),
+      }));
+    }
+    tr.appendChild(actTd);
+    frag.appendChild(tr);
+  });
+  if (!state.customApiColumns.length) {
+    const tr = document.createElement('tr');
+    tr.appendChild(el('td', {
+      className: 'muted small',
+      text: '还没有要测试的模型，点「+ 模型」添加',
+      attrs: { colspan: '3' },
+    }));
+    frag.appendChild(tr);
+  }
+  tbody.replaceChildren(frag);
+  updateCustomTestButton();
+}
+
+function updateCustomTestButton() {
+  const btn = $('#btn-custom-test-all');
+  if (!btn) return;
+  const testable = state.customApiColumns.filter((m) => String(m || '').trim()).length;
+  btn.disabled = testable === 0;
+  btn.textContent = testable > 0 ? `测试 ${testable}` : '测试';
+}
+
+function addCustomModelRow() {
+  const existing = new Set(state.customApiColumns.map((m) => String(m || '').trim()));
+  const candidate = uniqueModels(state.customApiModels).find((m) => !existing.has(m));
+  setCustomApiColumns([...state.customApiColumns, candidate || '']);
+  requestAnimationFrame(() => {
+    const inputs = document.querySelectorAll('#t-custom-body .custom-model-input, #t-custom-body .custom-model-select');
+    const last = inputs[inputs.length - 1];
+    if (last) last.focus();
+  });
+}
+
+async function testCustomApiModels(models) {
+  const api = state.currentCustomApi;
+  if (!api) return;
+  const targets = uniqueModels(models).filter((m) => String(m || '').trim());
+  if (!targets.length) return;
+  for (const m of targets) state.customApiResults[m] = { running: true };
+  renderCustomModelTable();
+  let done = 0;
+  for (const model of targets) {
+    setStatus(`测试模型 ${done + 1}/${targets.length}…`, 'warn');
+    try {
+      const r = await window.pywebview.api.test_custom_api_model(api.id, model);
+      state.customApiResults[model] = (r && r.ok && r.result)
+        ? r.result
+        : { ok: false, status: 'err', summary: (r && r.error) || '调用失败' };
+    } catch (err) {
+      state.customApiResults[model] = { ok: false, status: 'err', summary: String(err) };
+    }
+    done++;
+    renderCustomModelTable();
+  }
+  setStatus(`✓ 完成 ${done}/${targets.length} 个模型`, 'ok');
+}
+
+async function removeCustomApi(id) {
+  try {
+    const r = await window.pywebview.api.remove_custom_api(id);
+    if (!r || !r.ok) {
+      setStatus((r && r.error) || '删除失败', 'err');
+      return;
+    }
+    if (state.currentCustomApi && state.currentCustomApi.id === id) {
+      state.currentCustomApi = null;
+      if (state.viewMode === 'custom') showRelayDashboard();
+    }
+    state.customApis = r.apis || [];
+    renderCustomApiList();
+    updateContextLabels();
+    setStatus('✓ 已删除自定义 API', 'ok');
+  } catch (err) {
+    setStatus(String(err), 'err');
+  }
+}
+
+// ---- add custom API modal ----
+
+function openAddCustomApiModal() {
+  $('#add-custom-url').value = '';
+  $('#add-custom-key').value = '';
+  $('#add-custom-name').value = '';
+  resetAddCustomApiUI();
+  $('#add-custom-api-modal').classList.remove('hidden');
+  setTimeout(() => $('#add-custom-url').focus(), 50);
+}
+
+function closeAddCustomApiModal() {
+  $('#add-custom-api-modal').classList.add('hidden');
+}
+
+function resetAddCustomApiUI() {
+  const result = $('#add-custom-probe-result');
+  result.className = 'probe-result hidden';
+  result.textContent = '';
+  const errBox = $('#add-custom-error');
+  errBox.classList.add('hidden');
+  errBox.textContent = '';
+  const btn = $('#btn-add-custom-submit');
+  btn.disabled = false;
+  btn.textContent = '创建';
+}
+
+async function submitAddCustomApi() {
+  const url = $('#add-custom-url').value.trim();
+  const key = $('#add-custom-key').value.trim();
+  const name = $('#add-custom-name').value.trim();
+  const errBox = $('#add-custom-error');
+  const result = $('#add-custom-probe-result');
+  errBox.classList.add('hidden');
+  errBox.textContent = '';
+  if (!url || !key) {
+    errBox.textContent = 'URL 和 API Key 必填';
+    errBox.classList.remove('hidden');
+    return;
+  }
+  const btn = $('#btn-add-custom-submit');
+  btn.disabled = true;
+  btn.textContent = '测试连通中…';
+  result.className = 'probe-result probe-info';
+  result.textContent = '正在请求 /v1/models 测连通…';
+  result.classList.remove('hidden');
+  try {
+    const r = await window.pywebview.api.add_custom_api(url, key, name);
+    if (!r || !r.ok) {
+      result.classList.add('hidden');
+      errBox.textContent = (r && r.error) || '创建失败';
+      errBox.classList.remove('hidden');
+      btn.disabled = false;
+      btn.textContent = '创建';
+      return;
+    }
+    state.customApis = r.apis || [];
+    state.customApiModels = uniqueModels(r.models || []);
+    closeAddCustomApiModal();
+    if (r.added_id) {
+      await selectCustomApi(r.added_id);
+    } else {
+      refreshCustomApis();
+    }
+    setStatus(`✓ 已添加自定义 API · ${(r.models || []).length} 个模型`, 'ok');
+  } catch (err) {
+    result.classList.add('hidden');
+    errBox.textContent = err && err.message ? err.message : String(err);
+    errBox.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = '创建';
+  }
 }
 
 async function removeRelay(domain) {
@@ -711,7 +1153,7 @@ async function switchRelay(domain) {
   setStatus(`切到 ${domain}…`, 'warn');
   showScreen('loading');
   try {
-    const data = await window.pywebview.api.switch_relay(domain);
+    const data = (await window.pywebview.api.switch_relay(domain)) || {};
     if (!data.ok) {
       if (data.needs_login) {
         showLoginError(data.domain || domain, `请先在浏览器登录 ${data.domain || domain}`);
@@ -766,7 +1208,7 @@ async function loadAccountList() {
   const list = $('#account-list');
   list.replaceChildren(el('div', { className: 'muted small', text: '加载中…' }));
   try {
-    const r = await window.pywebview.api.list_accounts();
+    const r = (await window.pywebview.api.list_accounts()) || {};
     if (!r.ok) {
       list.replaceChildren(el('div', { className: 'muted small', text: r.error || '(空)' }));
       updateAccountDeleteButton(null);
@@ -859,6 +1301,8 @@ async function submitAddAccount() {
 }
 
 function openAddCodexAccountModal() {
+  const title = $('#add-codex-title');
+  if (title) title.textContent = '➕ 新增 Codex 官方账号';
   $('#add-codex-slot').value = '';
   $('#add-codex-display').value = '';
   $('#add-codex-error').classList.add('hidden');
@@ -868,6 +1312,17 @@ function openAddCodexAccountModal() {
   submit.textContent = '登录并添加';
   $('#add-codex-account-modal').classList.remove('hidden');
   setTimeout(() => $('#add-codex-slot').focus(), 50);
+}
+
+function openReloginCodexAccountModal(acc = state.currentCodexAccount) {
+  openAddCodexAccountModal();
+  if (!acc) return;
+  const title = $('#add-codex-title');
+  if (title) title.textContent = '↻ 重新登录 Codex 官方账号';
+  $('#add-codex-slot').value = acc.slot || '';
+  $('#add-codex-display').value = acc.display_name || '';
+  $('#add-codex-error').textContent = '该账号的本地 OAuth refresh token 已失效。重新登录会覆盖同名 slot 的登录文件。';
+  $('#add-codex-error').classList.remove('hidden');
 }
 
 function closeAddCodexAccountModal() {
@@ -914,12 +1369,37 @@ async function submitAddCodexAccount() {
   }
 }
 
+async function removeCodexAccount(acc = state.currentCodexAccount) {
+  if (!acc || !acc.slot) {
+    setStatus('请先选择官方账号', 'warn');
+    return;
+  }
+  const label = acc.email || acc.display_name || acc.slot;
+  if (!confirm(`删除官方账号 ${label}?\n会移除 sub2cli 保存的本地登录副本；不会删除 Codex 历史。`)) return;
+  setStatus(`删除官方账号 ${label}…`, 'warn');
+  try {
+    const r = await window.pywebview.api.remove_codex_account(acc.slot);
+    if (!r || !r.ok) {
+      setStatus((r && r.error) || '删除失败', 'err');
+      return;
+    }
+    state.codexAccounts = applyStoredOrder(r.accounts || [], CODEX_ORDER_KEY, codexAccountKey);
+    state.currentCodexAccount = r.current_official || state.codexAccounts[0] || null;
+    renderCodexAccountList();
+    updateContextLabels();
+    if (state.viewMode === 'official') renderOfficialDashboard(state.currentCodexAccount);
+    setStatus(`✓ 已删除官方账号 ${label}`, 'ok');
+  } catch (err) {
+    setStatus(err && err.message ? err.message : String(err), 'err');
+  }
+}
+
 async function switchAccount(email) {
   setStatus(`切到 ${email}…`, 'warn');
   closeAccountPop();
   showScreen('loading');
   try {
-    const data = await window.pywebview.api.switch_account(email);
+    const data = (await window.pywebview.api.switch_account(email)) || {};
     if (!data.ok) {
       showError('切账号失败', data.error);
       setStatus('错误', 'err');
@@ -939,7 +1419,7 @@ async function switchAccount(email) {
 async function deleteAccount(email) {
   if (!email) return;
   try {
-    const r = await window.pywebview.api.delete_account(email);
+    const r = (await window.pywebview.api.delete_account(email)) || {};
     if (!r.ok) {
       setStatus(r.error || '删除失败', 'err');
       return;
@@ -960,9 +1440,94 @@ function deleteCurrentAccount() {
 
 // ---- configure Codex modal (choice → direct apply + rollback) ----
 
+function selectValue(id) {
+  const node = $(id);
+  return node ? String(node.value || '').trim() : '';
+}
+
+function setSelectOptions(select, rows, selectedValue, emptyText) {
+  if (!select) return;
+  select.replaceChildren();
+  if (!rows.length) {
+    select.appendChild(el('option', {
+      text: emptyText,
+      attrs: { value: '', disabled: 'true', selected: 'true' },
+    }));
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  for (const row of rows) {
+    const option = el('option', {
+      text: row.label,
+      attrs: { value: row.value },
+    });
+    select.appendChild(option);
+  }
+  const values = new Set(rows.map((row) => row.value));
+  select.value = values.has(selectedValue) ? selectedValue : rows[0].value;
+}
+
+function renderConfigTargetChoices() {
+  const relayRows = (state.relays || []).map((relay) => ({
+    value: relay.domain,
+    label: relay.site || relay.domain,
+  }));
+  const customRows = (state.customApis || []).map((api) => ({
+    value: api.id,
+    label: customApiName(api),
+  }));
+  const officialRows = (state.codexAccounts || []).map((acc) => ({
+    value: acc.slot,
+    label: acc.email || acc.display_name || acc.slot,
+  }));
+  setSelectOptions($('#choice-relay'), relayRows, state.lastDomain || '', '未设置');
+  setSelectOptions($('#choice-custom'), customRows, state.currentCustomApi ? state.currentCustomApi.id : '', '未设置');
+  setSelectOptions($('#choice-codex'), officialRows, state.currentCodexAccount ? state.currentCodexAccount.slot : '', '未设置');
+  updateConfigChoiceMeta();
+}
+
+function updateConfigChoiceMeta() {
+  const relayValue = selectValue('#choice-relay');
+  const relay = (state.relays || []).find((item) => item.domain === relayValue);
+  const relayMeta = $('#choice-relay-meta');
+  if (relayMeta) {
+    if (relay) {
+      relayMeta.textContent = `Codex key: ${relay.default_key_name || '未选 key'} · 端点: ${relay.default_endpoint_name || '默认端点'}`;
+    } else {
+      relayMeta.textContent = '请先在左侧「中转」新增或选择';
+    }
+  }
+
+  const customValue = selectValue('#choice-custom');
+  const custom = (state.customApis || []).find((api) => api.id === customValue);
+  const customMeta = $('#choice-custom-meta');
+  if (customMeta) {
+    customMeta.textContent = custom
+      ? custom.base_url || '使用保存好的自定义 url + key'
+      : '请先在左侧「自定义api」新增或选择';
+  }
+
+  const officialValue = selectValue('#choice-codex');
+  const official = (state.codexAccounts || []).find((acc) => acc.slot === officialValue);
+  const officialMeta = $('#choice-codex-meta');
+  if (officialMeta) {
+    officialMeta.textContent = official
+      ? `${official.plan_label || 'Codex'} · ${official.slot}${official.is_registered ? '' : ' · 待注册'}`
+      : '请先在官号列表新增或选择账号';
+  }
+
+  const buttons = configTargetButtons();
+  if (!state.configTargetRunning) {
+    if (buttons.relay) buttons.relay.disabled = !relay;
+    if (buttons.custom) buttons.custom.disabled = !custom;
+    if (buttons.official) buttons.official.disabled = !official;
+  }
+}
+
 function openConfigTargetModal() {
-  updateContextLabels();
   resetConfigTargetUi();
+  renderConfigTargetChoices();
   $('#config-target-modal').classList.remove('hidden');
 }
 
@@ -973,6 +1538,46 @@ function closeConfigTargetModal() {
 
 async function startRelayConfig() {
   state.currentInjectTarget = 'relay';
+  const domain = selectValue('#choice-relay');
+  if (!domain) {
+    renderConfigTargetResult('warn', '没有可配置的中转', '请先在左侧中转列表新增或选择一个中转。', { tag: '[WARN]' });
+    setStatus('请先选择中转', 'warn');
+    return;
+  }
+  if (domain !== state.lastDomain) {
+    if (state.configTargetRunning) return;
+    state.configTargetRunning = true;
+    setConfigTargetBusy('relay', '切换中…');
+    renderConfigTargetResult('running', '正在切换中转', `先切换到 ${domain}, 再配置到 Codex。`);
+    try {
+      const data = await window.pywebview.api.switch_relay(domain);
+      if (!data || !data.ok) {
+        renderConfigTargetResult(
+          data && data.needs_login ? 'warn' : 'err',
+          data && data.needs_login ? '中转需要重新登录' : '切换中转失败',
+          (data && (data.error || `请先在浏览器登录 ${data.domain || domain}`)) || '切换失败。',
+          { tag: data && data.needs_login ? '[WARN]' : '[ERR]' }
+        );
+        setStatus('切换中转失败', 'err');
+        return;
+      }
+      state.pingResults = {};
+      state.groupResults = {};
+      state.viewMode = 'relay';
+      state.retryRelayDomain = null;
+      applyBootstrap(data);
+      renderMainMode();
+      showScreen('dashboard');
+      renderConfigTargetChoices();
+    } catch (err) {
+      renderConfigTargetResult('err', '切换中转失败', err && err.message ? err.message : String(err), { tag: '[ERR]' });
+      setStatus('切换中转失败', 'err');
+      return;
+    } finally {
+      state.configTargetRunning = false;
+      resetConfigTargetButtons();
+    }
+  }
   if (window.pywebview && window.pywebview.api && window.pywebview.api.relay_config_status) {
     try {
       const r = await window.pywebview.api.relay_config_status();
@@ -1000,20 +1605,53 @@ async function startRelayConfig() {
 
 function startOfficialConfig() {
   state.currentInjectTarget = 'official';
-  applyConfigTarget('official');
-}
-
-function chooseOfficialAccount() {
-  const acc = state.currentCodexAccount;
-  if (!acc) {
-    setStatus('请先在左侧选择官方账号', 'warn');
+  const slot = selectValue('#choice-codex');
+  if (!slot) {
+    renderConfigTargetResult('warn', '没有可配置的官方账号', '请先在官号列表新增或选择一个官方账号。', { tag: '[WARN]' });
+    setStatus('请先选择官方账号', 'warn');
     return;
   }
-  state.viewMode = 'official';
-  renderMainMode();
-  renderCodexAccountList();
-  updateContextLabels();
-  setStatus(`✓ 已选定官方账号：${acc.email || acc.display_name || acc.slot}`, 'ok');
+  const local = (state.codexAccounts || []).find((acc) => acc.slot === slot);
+  if (local) state.currentCodexAccount = local;
+  if (!state.currentCodexAccount || state.currentCodexAccount.slot !== slot) {
+    renderConfigTargetResult('warn', '官方账号不存在', `未找到官方账号槽位 ${slot}。`, { tag: '[WARN]' });
+    return;
+  }
+  window.pywebview.api.select_codex_account(slot)
+    .then((r) => {
+      if (r && r.ok) {
+        state.codexAccounts = applyStoredOrder(r.accounts || state.codexAccounts, CODEX_ORDER_KEY, codexAccountKey);
+        state.currentCodexAccount = r.current_official || state.currentCodexAccount;
+        renderCodexAccountList();
+        if (state.viewMode === 'official') renderOfficialDashboard(state.currentCodexAccount);
+        renderConfigTargetChoices();
+      }
+      applyConfigTarget('official');
+    })
+    .catch(() => applyConfigTarget('official'));
+}
+
+function startCustomConfig() {
+  state.currentInjectTarget = 'custom';
+  const id = selectValue('#choice-custom');
+  if (!id) {
+    renderConfigTargetResult('warn', '没有可配置的自定义 API', '请先在左侧「自定义api」新增或选择一个 API。', { tag: '[WARN]' });
+    setStatus('请先选择自定义 API', 'warn');
+    return;
+  }
+  const local = (state.customApis || []).find((api) => api.id === id);
+  if (local) state.currentCustomApi = local;
+  window.pywebview.api.select_custom_api(id)
+    .then((r) => {
+      if (r && r.ok) {
+        state.customApis = r.apis || state.customApis;
+        state.currentCustomApi = (state.customApis || []).find((api) => api.id === id) || state.currentCustomApi;
+        renderCustomApiList();
+        renderConfigTargetChoices();
+      }
+      applyConfigTarget('custom');
+    })
+    .catch(() => applyConfigTarget('custom'));
 }
 
 function resetConfigTargetUi() {
@@ -1027,24 +1665,27 @@ function resetConfigTargetUi() {
   resetConfigTargetButtons();
 }
 
+function configTargetButtons() {
+  return {
+    relay: $('#btn-config-relay'),
+    custom: $('#btn-config-custom'),
+    official: $('#btn-config-official'),
+  };
+}
+
 function resetConfigTargetButtons() {
-  const relayBtn = $('#btn-config-relay');
-  const officialBtn = $('#btn-config-official');
-  if (relayBtn) {
-    relayBtn.disabled = false;
-    relayBtn.textContent = '配置';
-  }
-  if (officialBtn) {
-    officialBtn.disabled = false;
-    officialBtn.textContent = '配置';
-  }
+  Object.values(configTargetButtons()).forEach((btn) => {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.textContent = '配置';
+  });
+  updateConfigChoiceMeta();
 }
 
 function setConfigTargetBusy(target, text = '配置中…') {
-  const relayBtn = $('#btn-config-relay');
-  const officialBtn = $('#btn-config-official');
-  const active = target === 'official' ? officialBtn : relayBtn;
-  [relayBtn, officialBtn].forEach((btn) => {
+  const btns = configTargetButtons();
+  const active = btns[target] || btns.relay;
+  Object.values(btns).forEach((btn) => {
     if (!btn) return;
     btn.disabled = true;
     btn.textContent = btn === active ? text : '等待';
@@ -1052,13 +1693,19 @@ function setConfigTargetBusy(target, text = '配置中…') {
 }
 
 function configTargetTitle(target) {
-  return target === 'official' ? '官方账号' : '当前中转';
+  if (target === 'official') return '官方账号';
+  if (target === 'custom') return '自定义 API';
+  return '中转';
 }
 
 function configTargetDetail(target) {
   if (target === 'official') {
     const acc = state.currentCodexAccount;
     return acc ? `${acc.email || acc.display_name || acc.slot} · ${acc.plan_label || 'Codex'}` : '未选择官方账号';
+  }
+  if (target === 'custom') {
+    const api = state.currentCustomApi;
+    return api ? `${customApiName(api)} · ${api.base_url || ''}` : '未选择自定义 API';
   }
   const key = state.codexKey && state.codexKey.name ? state.codexKey.name : '未选 key';
   const ep = state.defaultEndpoint && state.defaultEndpoint.name ? state.defaultEndpoint.name : '默认端点';
@@ -1101,17 +1748,27 @@ function renderConfigTargetResult(kind, title, detail, options = {}) {
   if (options.log) {
     children.push(el('pre', { className: 'config-result-log', text: options.log }));
   }
+  const actionButtons = [];
+  if (options.relogin) {
+    actionButtons.push(el('button', {
+      className: 'btn-action primary',
+      text: '重新登录此账号',
+      attrs: { type: 'button' },
+      onClick: () => openReloginCodexAccountModal(options.reloginAccount || state.currentCodexAccount),
+    }));
+  }
   if (options.undo && state.lastInjectBackup) {
+    actionButtons.push(el('button', {
+      className: `btn-action ${options.undoDanger === false ? '' : 'danger'}`,
+      text: options.undoLabel || '撤销本次配置',
+      attrs: { type: 'button' },
+      onClick: undoConfigTarget,
+    }));
+  }
+  if (actionButtons.length) {
     children.push(el('div', {
       className: 'config-result-actions',
-      children: [
-        el('button', {
-          className: `btn-action ${options.undoDanger === false ? '' : 'danger'}`,
-          text: options.undoLabel || '撤销本次配置',
-          attrs: { type: 'button' },
-          onClick: undoConfigTarget,
-        }),
-      ],
+      children: actionButtons,
     }));
   }
   box.replaceChildren(...children);
@@ -1120,9 +1777,15 @@ function renderConfigTargetResult(kind, title, detail, options = {}) {
 async function applyConfigTarget(target) {
   if (state.configTargetRunning) return;
   const isOfficial = target === 'official';
+  const isCustom = target === 'custom';
   if (isOfficial && !state.currentCodexAccount) {
     renderConfigTargetResult('warn', '没有可配置的官方账号', '请先在左侧官号列表新增或选择一个官方账号。', { tag: '[WARN]' });
     setStatus('请先选择官方账号', 'warn');
+    return;
+  }
+  if (isCustom && !state.currentCustomApi) {
+    renderConfigTargetResult('warn', '没有可配置的自定义 API', '请先在左侧「自定义api」新增或选择一个 API。', { tag: '[WARN]' });
+    setStatus('请先选择自定义 API', 'warn');
     return;
   }
 
@@ -1138,9 +1801,14 @@ async function applyConfigTarget(target) {
   );
 
   try {
-    const r = isOfficial
-      ? await window.pywebview.api.codex_account_config_apply(state.currentCodexAccount && state.currentCodexAccount.slot)
-      : await window.pywebview.api.inject_apply();
+    let r;
+    if (isOfficial) {
+      r = await window.pywebview.api.codex_account_config_apply(state.currentCodexAccount && state.currentCodexAccount.slot);
+    } else if (isCustom) {
+      r = await window.pywebview.api.custom_api_config_apply(state.currentCustomApi && state.currentCustomApi.id);
+    } else {
+      r = await window.pywebview.api.inject_apply();
+    }
     const autoRollback = r && r.auto_rollback;
     const log = buildApplyLog(r || {}, configTargetTitle(target));
 
@@ -1161,6 +1829,7 @@ async function applyConfigTarget(target) {
 
     const rollbackOk = !!(autoRollback && autoRollback.ok);
     const rollbackFailed = !!(r && r.backup_name && (!autoRollback || !autoRollback.ok));
+    const needsRelogin = isOfficial && /refresh token|登录态已失效|signing in again|重新登录/i.test(String((r && r.error) || '') + '\n' + log);
     state.lastInjectBackup = rollbackFailed ? r.backup_name : null;
     renderConfigTargetResult(
       rollbackOk ? 'warn' : 'err',
@@ -1169,12 +1838,16 @@ async function applyConfigTarget(target) {
         ? `写入失败后已恢复到配置前状态。下面日志可直接反馈给开发者排查。`
         : (rollbackFailed
           ? `写入失败，自动回滚未确认成功。保留 ${r.backup_name}, 可点击重试回滚并把日志反馈给开发者。`
-          : `配置失败发生在生成撤销点之前，未识别到可回滚备份。下面日志可直接反馈给开发者。`),
+          : (needsRelogin
+            ? `该官方账号的本地登录刷新链已失效，需要重新登录一次。未写入 Codex 配置。`
+            : `配置失败发生在生成撤销点之前，未识别到可回滚备份。下面日志可直接反馈给开发者。`)),
       {
         tag: rollbackOk ? '[ROLLBACK]' : '[ERR]',
         log,
         undo: rollbackFailed,
         undoLabel: '重试回滚',
+        relogin: needsRelogin,
+        reloginAccount: state.currentCodexAccount,
       }
     );
     setStatus('✗ 配置失败', 'err');
@@ -1370,6 +2043,11 @@ function renderInjectState(title, steps, options = {}) {
 }
 
 async function applyInject() {
+  // Share the in-flight flag with applyConfigTarget so the two mutating inject
+  // flows can't interleave and clobber state.lastInjectBackup (which would point
+  // the undo button at the wrong backup).
+  if (state.configTargetRunning) return;
+  state.configTargetRunning = true;
   const confirmBtn = $('#btn-inject-confirm');
   confirmBtn.disabled = true;
   confirmBtn.textContent = '执行中…';
@@ -1443,12 +2121,15 @@ async function applyInject() {
       { state: 'err', title: '调用失败', detail: err && err.message ? err.message : String(err) },
       { state: 'pending', title: '撤销点', detail: '未完成, 不提供撤销' },
     ]);
+  } finally {
+    state.configTargetRunning = false;
   }
 }
 
 async function undoInject() {
   const backupName = state.lastInjectBackup;
-  if (!backupName) return;
+  if (!backupName || state.configTargetRunning) return;
+  state.configTargetRunning = true;
   const undoBtn = $('#btn-inject-undo');
   undoBtn.disabled = true;
   $('#btn-inject-confirm').disabled = true;
@@ -1483,6 +2164,8 @@ async function undoInject() {
     renderInjectState('撤销调用失败', [
       { state: 'err', title: '调用失败', detail: err && err.message ? err.message : String(err) },
     ]);
+  } finally {
+    state.configTargetRunning = false;
   }
 }
 
@@ -1714,9 +2397,6 @@ function buildKeyRow(k, defaultKey, codexKey) {
     ],
   }));
   tr.appendChild(el('td', { className: 'mono', text: k.key_masked || '—' }));
-  tr.appendChild(el('td', {
-    children: [el('span', { className: `tag ${k.status === 'active' ? 'ok' : 'dim'}`, text: k.status || '?' })],
-  }));
   const groupTd = el('td');
   if (isTestKey) {
     groupTd.appendChild(el('span', { className: 'key-test-auto', text: '测试时自动切换' }));
@@ -1742,7 +2422,7 @@ function renderKeys(keys, _groups, defaultKey, codexKey = state.codexKey) {
   const frag = document.createDocumentFragment();
   if (!keys.length) {
     frag.appendChild(el('tr', {
-      children: [el('td', { text: '暂无 key', attrs: { colspan: '5' } })],
+      children: [el('td', { text: '暂无 key', attrs: { colspan: '4' } })],
     }));
   } else {
     for (const k of keys) frag.appendChild(buildKeyRow(k, defaultKey, codexKey));
@@ -1956,8 +2636,10 @@ function updateBatchTestButton() {
   const n = getSelectedGroupIds().length;
   const hasModels = state.groupModelColumns.length > 0 && state.groupModelColumns.every(Boolean);
   if (btn) {
-    btn.disabled = n === 0 || !hasModels;
-    btn.textContent = n > 0 ? `测试 ${n}` : '测试';
+    btn.disabled = state.groupTestRunning || n === 0 || !hasModels;
+    btn.textContent = state.groupTestRunning
+      ? '测试中…'
+      : (n > 0 ? `测试 ${n}` : '测试');
   }
 }
 
@@ -1973,41 +2655,55 @@ function toggleAllGroups() {
 }
 
 async function testSelectedGroups() {
+  if (state.groupTestRunning) return;
   const ids = getSelectedGroupIds();
   const columns = uniqueModels(state.groupModelColumns);
   if (!ids.length || !columns.length) return;
+  state.groupTestRunning = true;
   // SERIAL: server-side "current default group" is per-account state;
   // parallel calls would all race on the switch and end up hitting whichever
   // group landed last. Must do switch → send → await → next, one at a time.
-  for (const id of ids) {
-    state.groupResults[id] = Object.fromEntries(columns.map((model) => [model, { running: true }]));
-  }
-  renderGroups(state.groups, [], state.defaultKey);
-  let done = 0;
-  for (const id of ids) {
-    setStatus(`串行测试 ${done + 1}/${ids.length}…`, 'warn');
-    try {
-      const r = await window.pywebview.api.test_group(id, columns);
-      if (!r.ok) {
-        state.groupResults[id] = Object.fromEntries(
-          columns.map((model) => [model, { ok: false, status: 'err', summary: r.error }])
-        );
-      } else {
-        state.groupResults[id] = r.results || {};
-        if (r.default_key) state.defaultKey = r.default_key;
-        if (r.codex_key) state.codexKey = r.codex_key;
-        if (r.keys) state.keys = r.keys;
-      }
-    } catch (err) {
-      state.groupResults[id] = Object.fromEntries(
-        columns.map((model) => [model, { ok: false, status: 'err', summary: String(err) }])
-      );
+  try {
+    for (const id of ids) {
+      state.groupResults[id] = Object.fromEntries(columns.map((model) => [model, { running: true }]));
     }
-    done++;
-    renderGroups(state.groups, [], state.defaultKey);  // 每个完成立刻刷
-    renderKeys(state.keys, state.groups, state.defaultKey, state.codexKey);
+    renderGroups(state.groups, [], state.defaultKey);
+    let done = 0;
+    for (const id of ids) {
+      setStatus(`串行测试 ${done + 1}/${ids.length}…`, 'warn');
+      try {
+        const r = await window.pywebview.api.test_group(id, columns);
+        if (!r.ok) {
+          state.groupResults[id] = Object.fromEntries(
+            columns.map((model) => [model, { ok: false, status: 'err', summary: r.error }])
+          );
+        } else {
+          state.groupResults[id] = r.results || {};
+          if (r.restore_error) {
+            for (const model of columns) {
+              if (state.groupResults[id][model]) {
+                state.groupResults[id][model].summary = `${state.groupResults[id][model].summary || ''} · 恢复分组失败: ${r.restore_error}`;
+              }
+            }
+          }
+          if (r.default_key) state.defaultKey = r.default_key;
+          if (r.codex_key) state.codexKey = r.codex_key;
+          if (r.keys) state.keys = r.keys;
+        }
+      } catch (err) {
+        state.groupResults[id] = Object.fromEntries(
+          columns.map((model) => [model, { ok: false, status: 'err', summary: String(err) }])
+        );
+      }
+      done++;
+      renderGroups(state.groups, [], state.defaultKey);  // 每个完成立刻刷
+      renderKeys(state.keys, state.groups, state.defaultKey, state.codexKey);
+    }
+    setStatus(`✓ 完成 ${done}/${ids.length} 个分组`, 'ok');
+  } finally {
+    state.groupTestRunning = false;
+    renderGroups(state.groups, [], state.defaultKey);
   }
-  setStatus(`✓ 完成 ${done}/${ids.length} 个分组`, 'ok');
 }
 
 // ---- async actions ----
@@ -2178,7 +2874,7 @@ async function runHealthCheck() {
   }));
   $('#health-summary').textContent = '检测中…';
   try {
-    const r = await window.pywebview.api.check_health();
+    const r = (await window.pywebview.api.check_health()) || {};
     const frag = document.createDocumentFragment();
     for (const c of r.checks || []) frag.appendChild(buildCheckRow(c));
     body.replaceChildren(frag);
@@ -2210,7 +2906,12 @@ async function runHealthCheck() {
 
 // ---- wiring ----
 
-window.addEventListener('pywebviewready', () => {
+let bootstrapStarted = false;
+
+function startBootstrapOnce() {
+  if (bootstrapStarted) return;
+  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.bootstrap) return;
+  bootstrapStarted = true;
   setStatus('桥就绪, bootstrap…', 'warn');
   // macOS: kill native white titlebar, blend with our dark header
   if (window.pywebview && window.pywebview.api && window.pywebview.api.customize_chrome) {
@@ -2220,6 +2921,28 @@ window.addEventListener('pywebviewready', () => {
   bootstrap().finally(() => {
     initVersionChip();
   });
+}
+
+window.addEventListener('pywebviewready', startBootstrapOnce);
+
+window.addEventListener('DOMContentLoaded', () => {
+  startBootstrapOnce();
+  let tries = 0;
+  const timer = setInterval(() => {
+    if (bootstrapStarted) {
+      clearInterval(timer);
+      return;
+    }
+    startBootstrapOnce();
+    tries++;
+    if (tries >= 80) {
+      clearInterval(timer);
+      if (!bootstrapStarted) {
+        showError('桥未就绪', 'pywebview bridge 没有注入。请重启 app；若仍失败，检查 Content-Security-Policy。');
+        setStatus('桥未就绪', 'err');
+      }
+    }
+  }, 250);
 });
 
 // ---- header drag (WKWebView doesn't honor -webkit-app-region; bridge to AppKit) ----
@@ -2296,6 +3019,9 @@ async function installAppUpdate() {
 // ---- sidebar toggle ----
 
 const SIDEBAR_KEY = 'sub2cli.sidebar.collapsed';
+const SIDEBAR_WIDTH_KEY = 'sub2cli.sidebar.width';
+const SIDEBAR_MIN_WIDTH = 184;
+const SIDEBAR_MAX_WIDTH = 420;
 
 function clearSidebarSplit() {
   const relay = document.querySelector('.relay-zone');
@@ -2305,9 +3031,33 @@ function clearSidebarSplit() {
   try { localStorage.removeItem('sub2cli.sidebar.relayRatio'); } catch {}
 }
 
+function clampSidebarWidth(width) {
+  const viewportMax = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, Math.floor(window.innerWidth * 0.42)));
+  return Math.min(viewportMax, Math.max(SIDEBAR_MIN_WIDTH, Math.round(width)));
+}
+
+function readSidebarWidth() {
+  const raw = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+  return Number.isFinite(raw) && raw > 0 ? clampSidebarWidth(raw) : 240;
+}
+
+function applySidebarWidth(width, { persist = true } = {}) {
+  const next = clampSidebarWidth(width);
+  document.documentElement.style.setProperty('--sidebar-width', `${next}px`);
+  const resizer = $('#sidebar-width-resizer');
+  if (resizer) {
+    resizer.setAttribute('aria-valuemin', String(SIDEBAR_MIN_WIDTH));
+    resizer.setAttribute('aria-valuemax', String(clampSidebarWidth(SIDEBAR_MAX_WIDTH)));
+    resizer.setAttribute('aria-valuenow', String(next));
+  }
+  if (persist) localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
+  return next;
+}
+
 function applySidebarState() {
   const collapsed = localStorage.getItem(SIDEBAR_KEY) === '1';
   document.body.classList.toggle('sidebar-collapsed', collapsed);
+  if (!collapsed) applySidebarWidth(readSidebarWidth(), { persist: false });
   requestAnimationFrame(clearSidebarSplit);
 }
 applySidebarState();
@@ -2319,6 +3069,41 @@ $('#btn-sidebar-toggle').addEventListener('click', () => {
 
 function initSidebarResizer() {
   clearSidebarSplit();
+  const resizer = $('#sidebar-width-resizer');
+  const workspace = document.querySelector('.workspace');
+  if (!resizer || !workspace) return;
+  applySidebarWidth(readSidebarWidth(), { persist: false });
+  let active = false;
+  let lastWidth = readSidebarWidth();
+
+  const updateFromPointer = (event) => {
+    const rect = workspace.getBoundingClientRect();
+    lastWidth = applySidebarWidth(event.clientX - rect.left, { persist: false });
+  };
+
+  const finish = () => {
+    if (!active) return;
+    active = false;
+    document.body.classList.remove('sidebar-width-resizing');
+    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(lastWidth));
+    window.removeEventListener('pointermove', updateFromPointer);
+    window.removeEventListener('pointerup', finish);
+    window.removeEventListener('pointercancel', finish);
+    try { resizer.releasePointerCapture(resizer._sub2cliPointerId); } catch {}
+  };
+
+  resizer.addEventListener('pointerdown', (event) => {
+    if (document.body.classList.contains('sidebar-collapsed')) return;
+    event.preventDefault();
+    active = true;
+    resizer._sub2cliPointerId = event.pointerId;
+    try { resizer.setPointerCapture(event.pointerId); } catch {}
+    document.body.classList.add('sidebar-width-resizing');
+    updateFromPointer(event);
+    window.addEventListener('pointermove', updateFromPointer);
+    window.addEventListener('pointerup', finish);
+    window.addEventListener('pointercancel', finish);
+  });
 }
 initSidebarResizer();
 
@@ -2363,7 +3148,12 @@ $('#health-modal').addEventListener('click', (e) => {
 $('#btn-inject').addEventListener('click', openConfigTargetModal);
 $('#btn-config-target-close').addEventListener('click', closeConfigTargetModal);
 $('#btn-config-relay').addEventListener('click', startRelayConfig);
+$('#btn-config-custom').addEventListener('click', startCustomConfig);
 $('#btn-config-official').addEventListener('click', startOfficialConfig);
+['choice-relay', 'choice-custom', 'choice-codex'].forEach((id) => {
+  const select = $('#' + id);
+  if (select) select.addEventListener('change', updateConfigChoiceMeta);
+});
 $('#config-target-modal').addEventListener('click', (e) => {
   if (e.target === $('#config-target-modal')) closeConfigTargetModal();
 });
@@ -2375,7 +3165,12 @@ $('#inject-body').addEventListener('wheel', (e) => {
   if (scrollInjectBody(e.deltaY)) e.preventDefault();
 }, { passive: false });
 $('#inject-body').addEventListener('scroll', updateInjectScrollbar);
-window.addEventListener('resize', updateInjectScrollbar);
+window.addEventListener('resize', () => {
+  updateInjectScrollbar();
+  if (!document.body.classList.contains('sidebar-collapsed')) {
+    applySidebarWidth(readSidebarWidth(), { persist: false });
+  }
+});
 
 $('#btn-account').addEventListener('click', (e) => {
   e.stopPropagation();
@@ -2431,8 +3226,6 @@ document.addEventListener('keydown', (e) => {
 clearModeState();
 
 $('#btn-test-selected-groups').addEventListener('click', testSelectedGroups);
-$('#btn-save-config').addEventListener('click', () => setStatus('✓ 配置已保存', 'ok'));
-$('#btn-use-official').addEventListener('click', chooseOfficialAccount);
 
 // ---- add-relay modal (probe-first stepped flow) ----
 
@@ -2585,4 +3378,24 @@ $('#add-relay-modal').addEventListener('click', (e) => {
     if (e.key === 'Enter') actionAddRelay();
     else if (e.key === 'Escape') closeAddRelayModal();
   });
+});
+
+// ---- custom API: sidebar + add modal + dashboard bindings ----
+$('#btn-add-custom-api').addEventListener('click', openAddCustomApiModal);
+$('#btn-add-custom-close').addEventListener('click', closeAddCustomApiModal);
+$('#btn-add-custom-cancel').addEventListener('click', closeAddCustomApiModal);
+$('#btn-add-custom-submit').addEventListener('click', submitAddCustomApi);
+$('#add-custom-api-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'add-custom-api-modal') closeAddCustomApiModal();
+});
+['add-custom-url', 'add-custom-key', 'add-custom-name'].forEach((id) => {
+  $('#' + id).addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submitAddCustomApi();
+    else if (e.key === 'Escape') closeAddCustomApiModal();
+  });
+});
+$('#btn-custom-add-model').addEventListener('click', addCustomModelRow);
+$('#btn-custom-test-all').addEventListener('click', () => testCustomApiModels(state.customApiColumns));
+$('#btn-custom-refresh-models').addEventListener('click', () => {
+  if (state.currentCustomApi) loadCustomApiModels(state.currentCustomApi.id);
 });

@@ -241,6 +241,7 @@ docs/images/     README screenshots
 /settings/public
 /subscriptions
 /redeem/history
+/responses
 /chat/completions
 /images/generations
 ```

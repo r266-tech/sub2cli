@@ -72,6 +72,7 @@ MODEL_NON_TEXT_HINTS_RE = re.compile(
 )
 MODEL_SMALL_HINTS_RE = re.compile(r"(^|[-_/])(mini|nano|small|lite|spark)($|[-_/])", re.I)
 DEFAULT_FALLBACK_MODEL = "gpt-5.5"
+DEFAULT_IMAGE_PROBE_MODEL = "gpt-image-2"
 
 
 # ==================== ANSI 颜色 ====================
@@ -93,6 +94,20 @@ def color(s: str, c: str) -> str:
     return f"{c}{s}{C_RESET}"
 
 
+_CONTROL_CHARS_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def sanitize_relay_text(value: object, *, limit: int = 200) -> str:
+    """Strip control chars + ANSI/CSI escapes from relay-supplied strings before
+    printing to the TTY. A hostile relay can otherwise emit \\r/ESC/OSC sequences
+    to spoof results, reposition the cursor, or abuse terminal title/clipboard
+    escapes. Order matters: remove ESC-sequences first, then stray control bytes.
+    """
+    text = "" if value is None else str(value)
+    text = _CONTROL_CHARS_RE.sub("", text)
+    return text[:limit]
+
+
 # ==================== Sub2Context ====================
 
 class TokenError(RuntimeError):
@@ -106,6 +121,29 @@ def _normalize_domain(value: str) -> str:
     if not re.match(r"^https?://", value):
         value = "https://" + value
     return value
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for localhost / 127.0.0.0/8 / ::1 — where cleartext http is benign."""
+    h = (host or "").split(":")[0].strip("[]").lower()
+    if h in ("localhost", "::1"):
+        return True
+    if h.startswith("127."):
+        return True
+    return False
+
+
+def _warn_insecure_relay(domain: str) -> None:
+    """Warn when a bearer token would be sent over cleartext http to a
+    non-loopback host. Loopback http (self-hosted localhost relay) is allowed.
+    """
+    parsed = urlparse(_normalize_domain(domain))
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname or ""):
+        print(
+            f"  ⚠️  警告: {parsed.hostname} 使用明文 http，relay token 将以明文发送。"
+            f"建议改用 https。",
+            file=sys.stderr,
+        )
 
 
 def _api_base_for_domain(domain: str) -> str:
@@ -134,7 +172,10 @@ class Sub2Context:
         host = parsed.netloc or domain.replace("https://", "").replace("http://", "")
         self.domain = domain
         self.site = host
+        # Bare hostname (no port) for label-boundary tab matching in CDP.
+        self.site_host = (parsed.hostname or host.split(":")[0]).lower()
         self.api_base = _api_base_for_domain(domain)
+        _warn_insecure_relay(domain)
         self._token = token
         self.config_path = config_path or default_config_path()
         self.cdp_host = cdp_host or DEFAULT_CDP_HOST
@@ -171,13 +212,27 @@ class Sub2Context:
             raise TokenError(
                 f"Edge CDP unreachable at {self.cdp_host}:{self.cdp_port} ({exc})"
             ) from exc
+        def _tab_host_matches(tab_url: str) -> bool:
+            # Compare hostnames on a label boundary, not a naked substring, so
+            # `codex2api.com.evil.tld` and `evil.tld/?x=codex2api.com` do NOT
+            # match and leak the relay bearer token to the wrong tab.
+            try:
+                h = (urlparse(tab_url).hostname or "").lower()
+            except ValueError:
+                return False
+            return bool(h) and (h == self.site_host or h.endswith("." + self.site_host))
+
         target = next(
-            (t for t in tabs if t.get("type") == "page" and self.site in t.get("url", "")),
+            (
+                t
+                for t in tabs
+                if t.get("type") == "page" and _tab_host_matches(t.get("url", ""))
+            ),
             None,
         )
         if not target:
             raise TokenError(
-                f"no {self.site} tab open in Edge — log in there first "
+                f"no {self.site_host} tab open in Edge — log in there first "
                 f"(or set SUB2CLI_TOKEN env)"
             )
         try:
@@ -269,8 +324,12 @@ class Sub2Context:
                 f"{self.api_base}/redeem/history", headers=self._headers(), timeout=8
             )
             if r.status_code == 200:
-                return (r.json().get("data") or [])[:limit]
-        except requests.RequestException:
+                data = r.json().get("data")
+                # Some relays wrap it as {"data": {"items": [...]}}; guard both.
+                if isinstance(data, dict):
+                    data = data.get("items")
+                return data[:limit] if isinstance(data, list) else []
+        except (requests.RequestException, ValueError, AttributeError, TypeError):
             pass
         return []
 
@@ -285,7 +344,7 @@ class Sub2Context:
             if r.status_code in (200, 201):
                 body = r.json() if r.content else {}
                 return body.get("data") if isinstance(body, dict) else None
-        except requests.RequestException:
+        except (requests.RequestException, ValueError):
             pass
         return None
 
@@ -338,6 +397,10 @@ def models_endpoint(base_url: str) -> str:
     return openai_api_endpoint(base_url, "models")
 
 
+def responses_endpoint(base_url: str) -> str:
+    return openai_api_endpoint(base_url, "responses")
+
+
 def parse_models_payload(payload: object) -> list[str]:
     found: list[str] = []
 
@@ -352,22 +415,28 @@ def parse_models_payload(payload: object) -> list[str]:
                 walk(item)
             return
         if isinstance(value, dict):
+            # Prefer descending into a model container first: some relays return
+            # an envelope like {"name": "default", "data": [...]} where the stray
+            # top-level name/id is NOT a model id. Only treat id/model/name as a
+            # leaf model id when there's no nested container to descend into.
+            nested_keys = [k for k in ("data", "models", "items")
+                           if isinstance(value.get(k), (list, dict))]
+            if nested_keys:
+                for key in nested_keys:
+                    walk(value[key])
+                return
             for key in ("id", "model", "name"):
                 raw = value.get(key)
                 if isinstance(raw, str) and raw.strip():
                     found.append(raw.strip())
-                    return
-            for key in ("data", "models", "items"):
-                nested = value.get(key)
-                if isinstance(nested, (list, dict)):
-                    walk(nested)
                     return
 
     walk(payload)
     seen: set[str] = set()
     result: list[str] = []
     for item in found:
-        if item not in seen:
+        item = sanitize_relay_text(item, limit=120)
+        if item and item not in seen:
             result.append(item)
             seen.add(item)
     return result
@@ -410,6 +479,15 @@ def model_is_image(model: str) -> bool:
     return bool(MODEL_KIND_IMAGE_RE.search(model or ""))
 
 
+def preferred_image_model(models: list[str] | None, fallback: str = DEFAULT_IMAGE_PROBE_MODEL) -> str:
+    usable = [m for m in (models or []) if isinstance(m, str) and m.strip()]
+    for model in usable:
+        if model == fallback:
+            return model
+    images = [m for m in usable if model_is_image(m)]
+    return sorted(images, key=model_version_key, reverse=True)[0] if images else fallback
+
+
 def normalize_group_model_columns(columns: object, available_models: list[str] | None = None) -> list[str]:
     available = [m for m in (available_models or []) if isinstance(m, str) and m.strip()]
     requested: list[str] = []
@@ -422,6 +500,12 @@ def normalize_group_model_columns(columns: object, available_models: list[str] |
             result.append(model)
     if result and had_requested_list:
         return result
+    text_model = best_default_model(available, DEFAULT_FALLBACK_MODEL)
+    if text_model and text_model not in result:
+        result.append(text_model)
+    image_model = preferred_image_model(available, "")
+    if image_model and image_model not in result:
+        result.append(image_model)
     sorted_available = sorted(available, key=model_version_key, reverse=True)
     for model in sorted_available:
         if len(result) >= DEFAULT_GROUP_MODEL_COLUMNS:
@@ -460,42 +544,149 @@ def probe_group_models(
     """Read /models per group by temporarily moving the probe key, then restore it."""
     keys = keys if keys is not None else ctx.fetch_keys()
     groups = groups if groups is not None else ctx.fetch_groups()
-    default_key = key or find_default_key(keys, cfg)
-    if not default_key:
+    probe_key = key or find_default_key(keys, cfg)
+    if not probe_key:
         return {}, [], "未设置测试 key"
-    key_id = default_key.get("id")
-    original_gid = default_key.get("group_id")
+    key_id = probe_key.get("id")
+    if key_id is None:
+        return {}, [], "测试 key 缺少 id"
+    try:
+        key_id_int = int(key_id)
+    except (TypeError, ValueError):
+        return {}, [], f"测试 key id 无效: {key_id}"
+    original_gid = probe_key.get("group_id")
     ep_url = cfg.get("default_endpoint_url") or normalize_v1(ctx.domain)
     by_group: dict[int, list[str]] = {}
     all_models: list[str] = []
     first_error: str | None = None
-    current_key = default_key
+    current_key = probe_key
+    current_gid = current_key.get("group_id")
     try:
         for group in groups:
             gid = group.get("id")
             if gid is None:
                 continue
-            gid_int = int(gid)
-            if current_key.get("group_id") != gid_int:
-                ok, err = ctx.update_key_group(int(key_id), gid_int)
+            try:
+                gid_int = int(gid)
+            except (TypeError, ValueError):
+                first_error = first_error or f"分组 id 无效: {gid}"
+                continue
+            if current_gid != gid_int:
+                ok, err = ctx.update_key_group(key_id_int, gid_int)
                 if not ok:
                     first_error = first_error or f"{group.get('name') or gid_int}: {err}"
                     continue
+                current_gid = gid_int
                 keys = ctx.fetch_keys()
-                current_key = find_default_key(keys, cfg) or current_key
+                current_key = find_key_by_id(keys, key_id_int) or {
+                    **current_key,
+                    "group_id": gid_int,
+                }
             models, err = fetch_models(ep_url, current_key.get("key", ""), timeout=timeout)
             if err:
                 first_error = first_error or f"{group.get('name') or gid_int}: {err}"
             by_group[gid_int] = models
             all_models = merge_model_lists(all_models, models)
     finally:
-        if original_gid is not None and key_id is not None and current_key.get("group_id") != original_gid:
-            ctx.update_key_group(int(key_id), int(original_gid))
+        if original_gid is not None and current_gid != original_gid:
+            try:
+                ctx.update_key_group(key_id_int, int(original_gid))
+            except (TypeError, ValueError):
+                pass
     return by_group, all_models, first_error
 
 
-def test_model(base_url: str, api_key: str, model: str) -> dict:
-    return test_image(base_url, api_key, model=model) if model_is_image(model) else test_chat(base_url, api_key, model=model)
+def _response_error_summary(body: object, text: str, limit: int = 120) -> str:
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            msg = error.get("message") or error.get("code") or error.get("type")
+            if msg:
+                return str(msg)[:limit]
+        for key in ("message", "detail"):
+            msg = body.get(key)
+            if msg:
+                return str(msg)[:limit]
+    return str(text or "")[:limit]
+
+
+def _looks_like_responses_payload(body: object) -> bool:
+    if not isinstance(body, dict):
+        return False
+    status = str(body.get("status") or "").lower()
+    if status in {"failed", "cancelled", "canceled", "incomplete"}:
+        return False
+    if body.get("object") == "response":
+        return True
+    if isinstance(body.get("output"), list):
+        return True
+    resp_id = str(body.get("id") or "")
+    return resp_id.startswith("resp_") and bool(body.get("status"))
+
+
+def _looks_like_image_payload(body: object) -> bool:
+    if not isinstance(body, dict):
+        return False
+    data = body.get("data")
+    if not isinstance(data, list) or not data:
+        return False
+    for item in data:
+        if isinstance(item, dict) and (item.get("url") or item.get("b64_json")):
+            return True
+    return False
+
+
+def test_model(base_url: str, api_key: str, model: str, *, text_probe: str = "chat") -> dict:
+    if model_is_image(model):
+        return test_image(base_url, api_key, model=model)
+    if text_probe == "responses":
+        return test_codex(base_url, api_key, model=model)
+    return test_chat(base_url, api_key, model=model)
+
+
+def test_codex(base_url: str, api_key: str, model: str = DEFAULT_FALLBACK_MODEL) -> dict:
+    url = responses_endpoint(base_url)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {
+        "model": model,
+        "input": "hi",
+        "max_output_tokens": 1,
+        "stream": False,
+        "store": False,
+    }
+    t0 = time.perf_counter()
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        dt = int((time.perf_counter() - t0) * 1000)
+        try:
+            body = r.json()
+        except ValueError:
+            body = {"raw": r.text[:200]}
+        if r.status_code == 200:
+            if _looks_like_responses_payload(body):
+                return {"ok": True, "status": 200, "latency_ms": dt, "summary": "responses ok"}
+            return {
+                "ok": False,
+                "status": 200,
+                "latency_ms": dt,
+                "summary": "200 but not Responses API payload",
+            }
+        return {
+            "ok": False,
+            "status": r.status_code,
+            "latency_ms": dt,
+            "summary": _response_error_summary(body, r.text, limit=120),
+        }
+    except requests.RequestException as exc:
+        return {
+            "ok": False, "status": -1,
+            "latency_ms": int((time.perf_counter() - t0) * 1000),
+            "summary": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def test_chat(base_url: str, api_key: str, model: str = "gpt-5.5") -> dict:
@@ -521,8 +712,12 @@ def test_chat(base_url: str, api_key: str, model: str = "gpt-5.5") -> dict:
             body = {"raw": r.text[:200]}
         if r.status_code == 200:
             return {"ok": True, "status": 200, "latency_ms": dt, "summary": "ok"}
-        det = body.get("error", {}).get("message") or body.get("message") or body.get("detail") or r.text[:80]
-        return {"ok": False, "status": r.status_code, "latency_ms": dt, "summary": str(det)[:100]}
+        return {
+            "ok": False,
+            "status": r.status_code,
+            "latency_ms": dt,
+            "summary": _response_error_summary(body, r.text, limit=100),
+        }
     except requests.RequestException as exc:
         return {
             "ok": False, "status": -1,
@@ -547,10 +742,14 @@ def test_image(base_url: str, api_key: str, model: str = "gpt-image-2") -> dict:
             body = r.json()
         except ValueError:
             body = {"raw": r.text[:200]}
-        if r.status_code == 200 and (body.get("data") or body.get("created")):
+        if r.status_code == 200 and _looks_like_image_payload(body):
             return {"ok": True, "status": 200, "latency_ms": dt, "summary": "ok"}
-        det = body.get("error", {}).get("message") or body.get("message") or body.get("detail") or r.text[:80]
-        return {"ok": False, "status": r.status_code, "latency_ms": dt, "summary": str(det)[:120]}
+        return {
+            "ok": False,
+            "status": r.status_code,
+            "latency_ms": dt,
+            "summary": _response_error_summary(body, r.text, limit=120),
+        }
     except requests.RequestException as exc:
         return {
             "ok": False, "status": -1,
@@ -742,14 +941,22 @@ def auto_pick_endpoint(eps: list[dict]) -> dict | None:
         return None
     if len(eps) == 1:
         return eps[0]
-    best = None
-    best_lat = float("inf")
+    best_200 = None
+    best_200_lat = float("inf")
+    best_ok = None
+    best_ok_lat = float("inf")
     for ep in eps:
         r = probe_endpoint(ep.get("endpoint", ""))
-        if r["ok"] and r["latency_ms"] < best_lat:
-            best_lat = r["latency_ms"]
-            best = ep
-    return best or eps[0]
+        # Prefer an endpoint that actually returned 200; only fall back to a
+        # merely reachable one (e.g. 401 needs-auth) when no 200 exists, so an
+        # auth-gated URL doesn't win the default purely on latency.
+        if r.get("status") == 200 and r["latency_ms"] < best_200_lat:
+            best_200_lat = r["latency_ms"]
+            best_200 = ep
+        if r["ok"] and r["latency_ms"] < best_ok_lat:
+            best_ok_lat = r["latency_ms"]
+            best_ok = ep
+    return best_200 or best_ok or eps[0]
 
 
 def ensure_defaults(
@@ -822,8 +1029,13 @@ def ensure_defaults(
 
 # ==================== 输入辅助 ====================
 
-def read_input(prompt: str) -> str | None:
-    """读一行，再 200ms 内 drain 任何粘进来的后续行。EOF 返回 None。"""
+def read_input(prompt: str, *, single_line: bool = False) -> str | None:
+    """读一行，再 200ms 内 drain 任何粘进来的后续行。EOF 返回 None。
+
+    single_line=True: 只返回第一行，丢弃 (并警告) 后续粘进来的行。用于像 url
+    这种单值 prompt，避免把 URL+apikey 一起粘进来时 key 被拼进 url 值，进而
+    出现在 `add-api <url>` 的 argv 里 (在 ps 可见，绕过 --api-key-stdin)。
+    """
     try:
         first = input(prompt)
     except EOFError:
@@ -842,6 +1054,13 @@ def read_input(prompt: str) -> str | None:
             break
         chunks.append(line.rstrip("\n"))
         deadline = time.time() + 0.1
+    if single_line:
+        if len(chunks) > 1:
+            print(
+                color("  ⚠️  检测到多行粘贴，已忽略多余行 (单值输入)", C_YELLOW),
+                file=sys.stderr,
+            )
+        return chunks[0]
     return "\n".join(chunks)
 
 
@@ -897,7 +1116,12 @@ def read_key() -> str:
         if ch in (b"b", b"B", b"\x7f"):
             return "back"
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        # Best-effort restore: if the fd was closed/redirected mid-call, don't
+        # mask the original error with a tcsetattr OSError.
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except (termios.error, OSError):
+            pass
     return ""
 
 
@@ -1031,10 +1255,12 @@ def print_history(rows: list[dict]) -> None:
         print(color("  （无）", C_DIM))
         return
     for r in rows:
-        ts = (r.get("used_at") or "")[:19].replace("T", " ")
+        if not isinstance(r, dict):
+            continue
+        ts = str(r.get("used_at") or "")[:19].replace("T", " ")
         t = r.get("type") or "?"
         v = r.get("value")
-        code = (r.get("code") or "")[:10] + "…"
+        code = str(r.get("code") or "")[:10] + "…"
         if t == "balance":
             v_s = f"+${v:.2f}" if isinstance(v, (int, float)) else "?"
         elif t == "concurrency":
@@ -1227,7 +1453,7 @@ def cmd_groups(ctx: Sub2Context, cfg: dict) -> dict:
         for model in model_columns:
             results[gid][model] = {"running": True}
             render()
-            results[gid][model] = test_model(ep_url, api_key, model=model)
+            results[gid][model] = test_model(ep_url, api_key, model=model, text_probe="responses")
             render()
         in_progress_gid = None
         render()
@@ -1312,6 +1538,40 @@ def cmd_key(ctx: Sub2Context, cfg: dict, arg: str | None) -> dict:
     return cfg
 
 
+def _schedule_clipboard_clear(secret: str, *, delay: int = 90) -> None:
+    """Best-effort: clear the clipboard after `delay`s, but only if it still
+    holds our secret (don't clobber something the user copied afterward).
+
+    Spawns a detached child so the REPL isn't blocked; failures are silent.
+    """
+    script = (
+        "import subprocess,sys,time\n"
+        "secret=sys.stdin.read()\n"
+        f"time.sleep({int(delay)})\n"
+        "try:\n"
+        "    cur=subprocess.run(['pbpaste'],capture_output=True,text=True,timeout=3).stdout\n"
+        "    if cur==secret:\n"
+        "        subprocess.run(['pbcopy'],input='',text=True,timeout=3)\n"
+        "except Exception:\n"
+        "    pass\n"
+    )
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        # Write the secret to the child's stdin and close it so its
+        # sys.stdin.read() returns; do NOT wait() (child sleeps `delay`s).
+        if proc.stdin is not None:
+            proc.stdin.write(secret.encode())
+            proc.stdin.close()
+    except Exception:
+        pass
+
+
 def cmd_export(ctx: Sub2Context, cfg: dict) -> None:
     keys = ctx.fetch_keys()
     k = find_codex_key(keys, cfg)
@@ -1327,12 +1587,19 @@ def cmd_export(ctx: Sub2Context, cfg: dict) -> None:
         f"# 来源: sub2cli · key={k.get('name')} · 分组 {g.get('name','?')} "
         f"({g.get('rate_multiplier')}x) · 线路 {cfg.get('default_endpoint_name','?')}\n"
     )
+    print(color("⚠️  以下片段含明文 API key，会进入终端回滚缓冲与剪贴板。", C_YELLOW))
+    confirm = (read_input("  确认导出明文 key? (y/N) > ", single_line=True) or "").strip().lower()
+    if confirm not in ("y", "yes"):
+        print(color("  已取消", C_DIM))
+        print()
+        return
     print(color("shell 片段:", C_BOLD))
     for ln in snippet.splitlines():
         print(f"  {ln}")
     try:
         subprocess.run(["pbcopy"], input=snippet, text=True, check=True, timeout=3)
-        print(color("  ✓ 已复制到剪贴板", C_GREEN))
+        print(color("  ✓ 已复制到剪贴板（90 秒后自动清空）", C_GREEN))
+        _schedule_clipboard_clear(snippet, delay=90)
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         print(color("  (剪贴板复制失败，自己粘上方文本)", C_DIM))
     print()
@@ -1438,7 +1705,7 @@ def cmd_inject_codex(ctx: Sub2Context, cfg: dict) -> None:
 
     print(color("输入新的 url 和 apikey (空回车取消):", C_BOLD))
     try:
-        new_url = (read_input("  url   > ") or "").strip()
+        new_url = (read_input("  url   > ", single_line=True) or "").strip()
     except KeyboardInterrupt:
         print()
         return
@@ -1758,67 +2025,83 @@ def main() -> int:
             print(color("bye", C_DIM))
             return 0
 
-        last_idx = next((i for i, (_, v) in enumerate(options) if v == choice), 0)
-        clear_screen()
-        banner_fn()
-        print()
+        try:
+            last_idx = next((i for i, (_, v) in enumerate(options) if v == choice), 0)
+            clear_screen()
+            banner_fn()
+            print()
 
-        if choice == "refresh":
-            new_user = state["ctx"].fetch_user()
-            if new_user:
-                state["user"] = new_user
-            state["cfg"], state["default_key"], state["default_ep"] = ensure_defaults(
-                state["ctx"], state["cfg"], verbose=False
-            )
-            refresh_default_key()
-            print(color("  ✓ 已刷新", C_GREEN))
+            if choice == "refresh":
+                new_user = state["ctx"].fetch_user()
+                if new_user:
+                    state["user"] = new_user
+                state["cfg"], state["default_key"], state["default_ep"] = ensure_defaults(
+                    state["ctx"], state["cfg"], verbose=False
+                )
+                refresh_default_key()
+                print(color("  ✓ 已刷新", C_GREEN))
+                pause()
+                continue
+
+            if choice == "relay":
+                state = cmd_select_relay(state)
+                pause()
+                continue
+
+            if choice == "ep":
+                state["cfg"] = cmd_endpoints(state["ctx"], state["cfg"])
+                refresh_default_ep()
+                pause()
+
+            elif choice == "groups":
+                state["cfg"] = cmd_groups(state["ctx"], state["cfg"])
+                refresh_default_key()  # 切 group 后测试 key 的 group_id 变了
+                pause()
+
+            elif choice == "key":
+                state["cfg"] = cmd_key(state["ctx"], state["cfg"], None)
+                refresh_default_key()
+                pause()
+
+            elif choice == "history":
+                print(color("最近兑换历史:", C_BOLD))
+                print_history(state["ctx"].fetch_history(10))
+                pause()
+
+            elif choice == "inject":
+                cmd_inject_codex(state["ctx"], state["cfg"])
+                pause()
+
+            elif choice == "reveal":
+                cmd_reveal(state["ctx"], state["cfg"])
+                pause()
+
+            elif choice == "setup":
+                state["ctx"], state["cfg"] = run_wizard(
+                    state["ctx"].config_path,
+                    state["ctx"].cdp_host,
+                    state["ctx"].cdp_port,
+                )
+                state["user"] = state["ctx"].fetch_user()
+                refresh_default_key()
+                refresh_default_ep()
+                pause("配置已更新")
+        except KeyboardInterrupt:
+            # Ctrl-C during an in-flight network scan: abort the command,
+            # restore the menu, keep the REPL alive (do not crash with a
+            # traceback, which could also leave the test key parked in a group).
+            print(color("\n  已中断", C_YELLOW))
             pause()
             continue
-
-        if choice == "relay":
-            state = cmd_select_relay(state)
-            pause()
-            continue
-
-        if choice == "ep":
-            state["cfg"] = cmd_endpoints(state["ctx"], state["cfg"])
-            refresh_default_ep()
-            pause()
-
-        elif choice == "groups":
-            state["cfg"] = cmd_groups(state["ctx"], state["cfg"])
-            refresh_default_key()  # 切 group 后测试 key 的 group_id 变了
-            pause()
-
-        elif choice == "key":
-            state["cfg"] = cmd_key(state["ctx"], state["cfg"], None)
-            refresh_default_key()
-            pause()
-
-        elif choice == "history":
-            print(color("最近兑换历史:", C_BOLD))
-            print_history(state["ctx"].fetch_history(10))
-            pause()
-
-        elif choice == "inject":
-            cmd_inject_codex(state["ctx"], state["cfg"])
-            pause()
-
-        elif choice == "reveal":
-            cmd_reveal(state["ctx"], state["cfg"])
-            pause()
-
-        elif choice == "setup":
-            state["ctx"], state["cfg"] = run_wizard(
-                state["ctx"].config_path,
-                state["ctx"].cdp_host,
-                state["ctx"].cdp_port,
-            )
-            state["user"] = state["ctx"].fetch_user()
-            refresh_default_key()
-            refresh_default_ep()
-            pause("配置已更新")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Top-level safety net: a Ctrl-C outside the dispatch handler (e.g. during
+        # the wizard or initial token fetch) should exit cleanly, not dump a
+        # traceback. read_key()'s own finally restores the terminal; print a
+        # newline so the shell prompt isn't glued to our last output.
+        print()
+        sys.exit(130)
