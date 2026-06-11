@@ -19,7 +19,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.2`
+Current desktop version: `v0.2.3`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -63,7 +63,7 @@ open sub2cli -> test -> select -> 配置 Codex
 | Endpoint checks | Ping every endpoint exposed by the relay and select the fastest/desired URL. |
 | Group checks | Batch-test selected groups against user-selected model columns read from the current relay. |
 | Codex config | Write `~/.codex/config.toml` and `~/.codex/auth.json`, restart/reopen Codex App when needed, and keep rollback backups. |
-| Codex App enhancements | Relay mode opens Codex with a small CDP injector that unlocks the plugin entry, adds a standard/fast service-tier toggle, and exposes relay models read from the current URL/API key in the app. |
+| Codex App launch | Reopen Codex App after config changes using the native app launch path, without runtime renderer injection or App UI patches. |
 | CLI path | Use the same config engine from terminal, without the desktop GUI. |
 
 ## Agent Note
@@ -174,11 +174,7 @@ sub2cli-inject rollback latest
 
 `sub2cli-inject` rejects positional API keys intentionally. Use `--api-key-stdin` or the hidden prompt.
 
-Relay channels also enable a lightweight Codex App enhancement layer by default. When Codex is relaunched after `add-api` or `use`, sub2cli starts it with `--remote-debugging-port=9229`, injects the plugin/model/service-tier patch, and refreshes the model list from `<base_url>/v1/models`. Disable this with:
-
-```bash
-SUB2CLI_CODEX_ENHANCEMENTS=0 sub2cli-inject use <slot>
-```
+When Codex is relaunched after `add-api` or `use`, sub2cli only updates local Codex config files and opens the app through the native macOS app launch path.
 
 ## Requirements
 
@@ -255,7 +251,7 @@ docs/images/     README screenshots
 ~/Library/Application Support/Codex profile slot
 ```
 
-For relay slots, `provider-slots.json` also caches the last model list returned by `/v1/models`; the active Codex App injection refreshes it best-effort on launch.
+For relay slots, `provider-slots.json` also caches the last model list returned by `/v1/models` for config selection and diagnostics.
 
 ## Build Desktop DMG
 
@@ -276,6 +272,13 @@ desktop/dist/sub2cli-<version>.dmg
 The current release is unsigned and not notarized.
 
 ## Release Notes
+
+### v0.2.3
+
+- hardened desktop startup, account removal, and model probe behavior
+- removed runtime Codex App renderer injection; sub2cli now reopens Codex through the native app launch path
+- kept relay config summaries in sync when switching the default endpoint or Codex key
+- added source installer checksum manifest support for safer GitHub installs
 
 ### v0.2.2
 

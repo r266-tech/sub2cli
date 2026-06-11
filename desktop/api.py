@@ -53,6 +53,7 @@ CODEX_APP_SUPPORT_PATH = CODEX_PROVIDER_HOME_PATH / "Library" / "Application Sup
 CODEXBAR_MANAGED_ACCOUNTS_PATH = (
     CODEX_APP_SUPPORT_PATH / "CodexBar" / "managed-codex-accounts.json"
 )
+CODEXBAR_MANAGED_HOMES_PATH = CODEX_APP_SUPPORT_PATH / "CodexBar" / "managed-codex-homes"
 CODEX_LOCK_PATH = CODEX_HOME_PATH / ".sub2cli-inject.lock"
 UPDATE_CACHE_DIR = Path.home() / "Library" / "Caches" / "sub2cli" / "updates"
 UPDATE_LOG_PATH = Path.home() / "Library" / "Logs" / "sub2cli-updater.log"
@@ -1343,6 +1344,62 @@ def _safe_remove_tree(path: Path, root: Path) -> bool:
         shutil.rmtree(path)
         return True
     return False
+
+
+def _safe_remove_codex_auth_file(path: Path | None) -> bool:
+    if not path or path.name == "auth.json":
+        return False
+    if not re.fullmatch(r"auth\.[A-Za-z0-9][A-Za-z0-9_-]{0,30}\.json", path.name):
+        return False
+    return _safe_remove_file(path, CODEX_HOME_PATH)
+
+
+def _remove_codexbar_managed_account(account: dict, removed: list[str]) -> bool:
+    data = _read_json_file(CODEXBAR_MANAGED_ACCOUNTS_PATH)
+    raw_accounts = data.get("accounts") if isinstance(data, dict) else []
+    if not isinstance(raw_accounts, list):
+        return False
+
+    managed_home = _expanded_path(account.get("managed_home"))
+    email = (account.get("email") or "").strip().lower()
+    account_id = (account.get("account_id") or "").strip().lower()
+    before = len(raw_accounts)
+    kept = []
+    removed_homes: list[Path] = []
+    for entry in raw_accounts:
+        if not isinstance(entry, dict):
+            kept.append(entry)
+            continue
+        entry_home = Path(entry.get("managedHomePath") or "").expanduser()
+        entry_email = (entry.get("email") or "").strip().lower()
+        entry_ids = {
+            (entry.get("providerAccountID") or "").strip().lower(),
+            (entry.get("workspaceAccountID") or "").strip().lower(),
+        }
+        matches_home = bool(managed_home and entry_home == managed_home)
+        matches_identity = bool(
+            (account_id and account_id in entry_ids)
+            or (email and entry_email and email == entry_email)
+        )
+        if matches_home or matches_identity:
+            if entry_home:
+                removed_homes.append(entry_home)
+            continue
+        kept.append(entry)
+
+    if len(kept) == before:
+        return False
+
+    data["accounts"] = kept
+    _write_json_file(CODEXBAR_MANAGED_ACCOUNTS_PATH, data)
+    removed.append(_home_path(CODEXBAR_MANAGED_ACCOUNTS_PATH))
+    for home in removed_homes:
+        try:
+            if _safe_remove_tree(home, CODEXBAR_MANAGED_HOMES_PATH):
+                removed.append(_home_path(home))
+        except OSError:
+            pass
+    return True
 
 
 def _ensure_codex_account_slot(slot: str) -> tuple[dict | None, str | None]:
@@ -2921,72 +2978,6 @@ class JsApi:
         url, api_key, _label, models = target
         return self._run_inject_add_api(url, api_key, models, dry_run=False)
 
-    def ensure_codex_app(self) -> dict:
-        """Keep the current Codex App process on the enhanced sub2cli launch path."""
-        inject_bin = self._resolve_inject_bin()
-        if not inject_bin:
-            return {"ok": False, "error": "找不到 sub2cli-inject 二进制"}
-        try:
-            proc = subprocess.run(
-                [inject_bin, "ensure-app"],
-                capture_output=True,
-                text=True,
-                env=_inject_subprocess_env(),
-                timeout=INJECT_APPLY_TIMEOUT,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = _coerce_proc_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
-            stderr = _coerce_proc_text(getattr(exc, "stderr", None))
-            return {
-                "ok": False,
-                "error": f"刷新 Codex App 增强超过 {INJECT_APPLY_TIMEOUT} 秒仍未完成",
-                "stdout": stdout,
-                "stderr": stderr,
-                "returncode": None,
-            }
-        except Exception as exc:
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        output = f"{proc.stdout}\n{proc.stderr}"
-        return {
-            "ok": proc.returncode == 0,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "returncode": proc.returncode,
-            "restarted": "正在重新打开" in output or "已重新打开" in output,
-        }
-
-    def restore_codex_app(self) -> dict:
-        """Restart Codex App without sub2cli runtime enhancements."""
-        inject_bin = self._resolve_inject_bin()
-        if not inject_bin:
-            return {"ok": False, "error": "找不到 sub2cli-inject 二进制"}
-        try:
-            proc = subprocess.run(
-                [inject_bin, "restore-app"],
-                capture_output=True,
-                text=True,
-                env=_inject_subprocess_env(),
-                timeout=INJECT_APPLY_TIMEOUT,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = _coerce_proc_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
-            stderr = _coerce_proc_text(getattr(exc, "stderr", None))
-            return {
-                "ok": False,
-                "error": f"恢复原生 Codex App 超过 {INJECT_APPLY_TIMEOUT} 秒仍未完成",
-                "stdout": stdout,
-                "stderr": stderr,
-                "returncode": None,
-            }
-        except Exception as exc:
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        return {
-            "ok": proc.returncode == 0,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "returncode": proc.returncode,
-        }
-
     def inject_rollback(self, backup_name: str) -> dict:
         """Undo the most recent GUI injection by restoring its backup."""
         backup_name = (backup_name or "").strip()
@@ -3485,6 +3476,7 @@ class JsApi:
                 "site": (sub2cli_lib._normalize_domain(domain)
                          .replace("https://", "").replace("http://", "")
                          .rstrip("/")),
+                "codex_key_name": r.get("codex_key_name"),
                 "default_key_name": r.get("codex_key_name") or r.get("default_key_name"),
                 "default_endpoint_name": r.get("default_endpoint_name"),
                 "is_current": (domain == current),
@@ -3578,14 +3570,46 @@ class JsApi:
             with CodexStateLock():
                 data = _read_json_file(PROVIDER_SLOTS_PATH)
                 slots = data.setdefault("slots", {})
+                snapshot = _discover_codex_accounts(data, official_override=slot)
+                account = next((a for a in snapshot.get("accounts", []) if a.get("slot") == slot), None)
                 existing = slots.get(slot)
-                if not existing or existing.get("mode") != "oauth":
-                    return {"ok": False, "error": f"未保存的官方账号: {slot}"}
-                if data.get("current") == slot:
+                if data.get("current") == slot or (account and account.get("is_current_provider")):
                     return {"ok": False, "error": "该官方账号当前正在 Codex 使用中，请先切到中转或其他账号后再删除。"}
 
-                auth_path = _expanded_path(existing.get("auth_file"))
-                slots.pop(slot, None)
+                provider_changed = False
+                if existing:
+                    if existing.get("mode") != "oauth":
+                        return {"ok": False, "error": f"slot {slot!r} 不是官方账号"}
+                    auth_path = _expanded_path(existing.get("auth_file"))
+                    slots.pop(slot, None)
+                    provider_changed = True
+                    try:
+                        if _safe_remove_codex_auth_file(auth_path):
+                            removed.append(_home_path(auth_path))
+                    except OSError:
+                        pass
+                elif not account:
+                    return {"ok": False, "error": f"未找到官方账号: {slot}"}
+
+                source_kind = (account or {}).get("source_kind") or ""
+                removed_source = False
+                if source_kind == "codexbar-managed" or (account or {}).get("managed_home"):
+                    removed_source = _remove_codexbar_managed_account(account or {}, removed)
+                elif source_kind == "auth-file":
+                    try:
+                        source_auth_path = _expanded_path((account or {}).get("source_auth_file"))
+                        if _safe_remove_codex_auth_file(source_auth_path):
+                            removed.append(_home_path(source_auth_path))
+                            removed_source = True
+                    except OSError:
+                        pass
+                elif source_kind == "live-auth" and not existing:
+                    return {"ok": False, "error": "该账号来自当前 ~/.codex/auth.json，不能从官号列表直接删除。请先切到其他渠道或退出 Codex 登录。"}
+                elif not existing:
+                    return {"ok": False, "error": f"该账号来自 {source_kind or '未知来源'}，不能删除。"}
+                if not existing and not removed_source:
+                    return {"ok": False, "error": f"未能删除官方账号来源: {source_kind or '未知来源'}"}
+
                 replacement = next(
                     (name for name, cfg in slots.items() if (cfg or {}).get("mode") == "oauth"),
                     None,
@@ -3595,16 +3619,12 @@ class JsApi:
                         data["preferred_official_slot"] = replacement
                     else:
                         data.pop("preferred_official_slot", None)
+                    provider_changed = True
                 if data.get("app_history_slot") == slot:
                     data["app_history_slot"] = replacement
-                _write_json_file(PROVIDER_SLOTS_PATH, data)
-
-                if auth_path and auth_path.name != "auth.json":
-                    try:
-                        if _safe_remove_file(auth_path, CODEX_HOME_PATH):
-                            removed.append(_home_path(auth_path))
-                    except OSError:
-                        pass
+                    provider_changed = True
+                if provider_changed:
+                    _write_json_file(PROVIDER_SLOTS_PATH, data)
                 login_home = CODEX_HOME_PATH / "sub2cli-account-homes" / slot
                 try:
                     if _safe_remove_tree(login_home, CODEX_HOME_PATH / "sub2cli-account-homes"):

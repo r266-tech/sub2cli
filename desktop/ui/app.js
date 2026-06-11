@@ -374,59 +374,6 @@ async function refresh() {
   }
 }
 
-async function ensureCodexAppEnhanced() {
-  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.ensure_codex_app) return;
-  if (state.configTargetRunning) return;
-  state.configTargetRunning = true;
-  state.currentInjectTarget = 'relay';
-  setConfigTargetBusy('relay', '注入中…');
-  setStatus('正在注入 Codex App 增强…', 'warn');
-  renderConfigTargetResult(
-    'running',
-    '正在注入 Codex App 增强',
-    '正在重启 Codex 并加载 fast / 模型列表 / 插件入口。'
-  );
-  try {
-    const r = await window.pywebview.api.ensure_codex_app();
-    const log = planLog([
-      r && r.ok ? '[READY] Codex App enhance injected.' : '[ERR] Codex App enhance failed.',
-      r && r.error ? `[ERR] reason: ${r.error}` : null,
-      r && r.returncode !== undefined ? `[INFO] returncode: ${r.returncode ?? 'timeout'}` : null,
-      r && r.restarted !== undefined ? `[INFO] restarted: ${r.restarted ? 'yes' : 'no'}` : null,
-      r && r.stdout ? `[INFO] stdout:\n${r.stdout}` : null,
-      r && r.stderr ? `[INFO] stderr:\n${r.stderr}` : null,
-    ]);
-    if (r && r.ok) {
-      renderConfigTargetResult(
-        'ok',
-        '注入完成',
-        r.restarted ? 'Codex 已重启并加载增强。' : 'Codex 增强已确认。下次手动重启后需要再次注入。',
-        { log }
-      );
-      setStatus(r.restarted ? '✓ Codex App 增强已重启注入' : '✓ Codex App 增强已注入', 'ok');
-      return;
-    }
-    renderConfigTargetResult(
-      'err',
-      '注入失败',
-      (r && (r.error || r.stderr)) || 'Codex App 增强未就绪。',
-      { tag: '[ERR]', log }
-    );
-    setStatus('✗ 注入失败', 'err');
-  } catch (err) {
-    renderConfigTargetResult(
-      'err',
-      '注入调用失败',
-      err && err.message ? err.message : String(err),
-      { log: planLog([`[ERR] exception: ${err && err.stack ? err.stack : String(err)}`]) }
-    );
-    setStatus('注入失败', 'err');
-  } finally {
-    state.configTargetRunning = false;
-    resetConfigTargetButtons();
-  }
-}
-
 function applyBootstrap(data) {
   state.bootstrapped = true;
   state.lastDomain = data.domain || data.site || null;
@@ -485,6 +432,14 @@ function updateContextLabels() {
   if (popRelay) popRelay.textContent = relay;
   if (popCodex) popCodex.textContent = codex;
   updateConfigChoiceMeta();
+}
+
+function syncCurrentRelaySummary(patch) {
+  if (!state.lastDomain || !patch) return;
+  state.relays = (state.relays || []).map((relay) => {
+    if (!relay || relay.domain !== state.lastDomain) return relay;
+    return { ...relay, ...patch, is_current: true };
+  });
 }
 
 // ---- sidebar (multi-relay) ----
@@ -1371,7 +1326,7 @@ async function submitAddCodexAccount() {
 
 async function removeCodexAccount(acc = state.currentCodexAccount) {
   if (!acc || !acc.slot) {
-    setStatus('请先选择官方账号', 'warn');
+    showError('删除官方账号失败', '请先选择官方账号');
     return;
   }
   const label = acc.email || acc.display_name || acc.slot;
@@ -1380,7 +1335,7 @@ async function removeCodexAccount(acc = state.currentCodexAccount) {
   try {
     const r = await window.pywebview.api.remove_codex_account(acc.slot);
     if (!r || !r.ok) {
-      setStatus((r && r.error) || '删除失败', 'err');
+      showError('删除官方账号失败', (r && r.error) || '删除失败');
       return;
     }
     state.codexAccounts = applyStoredOrder(r.accounts || [], CODEX_ORDER_KEY, codexAccountKey);
@@ -1390,7 +1345,7 @@ async function removeCodexAccount(acc = state.currentCodexAccount) {
     if (state.viewMode === 'official') renderOfficialDashboard(state.currentCodexAccount);
     setStatus(`✓ 已删除官方账号 ${label}`, 'ok');
   } catch (err) {
-    setStatus(err && err.message ? err.message : String(err), 'err');
+    showError('删除官方账号失败', err && err.message ? err.message : String(err));
   }
 }
 
@@ -1493,7 +1448,16 @@ function updateConfigChoiceMeta() {
   const relayMeta = $('#choice-relay-meta');
   if (relayMeta) {
     if (relay) {
-      relayMeta.textContent = `Codex key: ${relay.default_key_name || '未选 key'} · 端点: ${relay.default_endpoint_name || '默认端点'}`;
+      const currentRelaySelected = relay.domain === state.lastDomain;
+      const currentKeyName = state.codexKey && state.codexKey.name;
+      const currentEndpointName = state.defaultEndpoint && state.defaultEndpoint.name;
+      const keyName = currentRelaySelected && currentKeyName
+        ? currentKeyName
+        : (relay.codex_key_name || relay.default_key_name || '未选 key');
+      const endpointName = currentRelaySelected && currentEndpointName
+        ? currentEndpointName
+        : (relay.default_endpoint_name || '默认端点');
+      relayMeta.textContent = `Codex key: ${keyName} · 端点: ${endpointName}`;
     } else {
       relayMeta.textContent = '请先在左侧「中转」新增或选择';
     }
@@ -1582,18 +1546,13 @@ async function startRelayConfig() {
     try {
       const r = await window.pywebview.api.relay_config_status();
       if (r && r.ok && r.already_current) {
-        const shouldEnhance = window.confirm('已经是该渠道，是否需要重新注入增强扩展？');
-        if (shouldEnhance) {
-          ensureCodexAppEnhanced();
-        } else {
-          renderConfigTargetResult(
-            'ok',
-            '已经是该渠道',
-            `${r.label || configTargetDetail('relay')}。未重新配置。`,
-            { tag: '[READY]' }
-          );
-          setStatus('✓ 已经是该渠道', 'ok');
-        }
+        renderConfigTargetResult(
+          'ok',
+          '已经是该渠道',
+          `${r.label || configTargetDetail('relay')}。未重新配置。`,
+          { tag: '[READY]' }
+        );
+        setStatus('✓ 已经是该渠道', 'ok');
         return;
       }
     } catch (_err) {
@@ -2741,6 +2700,11 @@ async function setDefaultEndpoint(name) {
       return;
     }
     state.defaultEndpoint = r.default_endpoint;
+    if (state.defaultEndpoint) {
+      syncCurrentRelaySummary({
+        default_endpoint_name: state.defaultEndpoint.name,
+      });
+    }
     renderEndpoints(state.endpoints, state.defaultEndpoint);
     updateContextLabels();
     setStatus('✓ 已切端点', 'ok');
@@ -2759,6 +2723,12 @@ async function selectCodexKey(keyId) {
     }
     state.codexKey = r.codex_key || null;
     if (r.keys) state.keys = r.keys;
+    if (state.codexKey) {
+      syncCurrentRelaySummary({
+        codex_key_name: state.codexKey.name,
+        default_key_name: state.codexKey.name,
+      });
+    }
     renderKeys(state.keys, state.groups, state.defaultKey, state.codexKey);
     updateContextLabels();
     setStatus('✓ 已切 Codex key', 'ok');
