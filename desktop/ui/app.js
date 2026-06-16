@@ -32,6 +32,16 @@ const state = {
   customApiColumns: [],    // model names the user picked to test
   customApiResults: {},    // model -> {ok, latency_ms, status, running}
   customApiModelError: null,
+  routePools: [],
+  currentRoutePoolId: null,
+  routePoolDraft: null,
+  routePoolCandidates: { relay_keys: [], relay_endpoints: [], custom_apis: [] },
+  routePoolStatus: null,
+  routePoolMessage: '',
+  routePoolStatusRefreshInFlight: false,
+  routePoolLastStatusAt: 0,
+  routePoolRunning: false,
+  routePoolEditorOpen: false,
   currentInjectTarget: 'relay',
   configTargetRunning: false,
   retryRelayDomain: null,
@@ -45,6 +55,8 @@ const PROJECT_URL = 'https://github.com/r266-tech/sub2cli';
 const RELAY_ORDER_KEY = 'sub2cli.sidebar.relayOrder';
 const CODEX_ORDER_KEY = 'sub2cli.sidebar.codexOrder';
 let latestUpdateInfo = null;
+let routePoolStatusTimer = null;
+let routePoolContextRouteId = null;
 
 // ---- screen routing ----
 
@@ -403,6 +415,7 @@ function applyBootstrap(data) {
   refreshSidebar();  // sidebar is independent of bootstrap data
   refreshCodexAccounts();
   refreshCustomApis();
+  refreshRoutePools();
   updateContextLabels();
   updateAccountChip((data.user && data.user.email) || null);
 }
@@ -701,16 +714,1113 @@ async function selectCodexAccount(slot) {
 function showRelayDashboard() {
   state.viewMode = 'relay';
   renderMainMode();
+  stopRoutePoolStatusRefresh();
+}
+
+function showRoutePoolDashboard() {
+  state.viewMode = 'pool';
+  renderMainMode();
+  startRoutePoolStatusRefresh();
+  refreshRoutePools();
 }
 
 function renderMainMode() {
   const relay = $('#relay-dashboard');
   const official = $('#official-dashboard');
   const custom = $('#custom-api-dashboard');
+  const pool = $('#route-pool-dashboard');
   if (!relay || !official) return;
   relay.classList.toggle('hidden', state.viewMode !== 'relay');
   official.classList.toggle('hidden', state.viewMode !== 'official');
   if (custom) custom.classList.toggle('hidden', state.viewMode !== 'custom');
+  if (pool) pool.classList.toggle('hidden', state.viewMode !== 'pool');
+  const poolBtn = $('#btn-manage-pool');
+  if (poolBtn) poolBtn.classList.toggle('active', state.viewMode === 'pool');
+  if (state.viewMode === 'pool') startRoutePoolStatusRefresh();
+  else stopRoutePoolStatusRefresh();
+}
+
+// ---- route pools ----
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value == null ? null : value));
+}
+
+function defaultRoutePoolPolicy() {
+  return {
+    fail_consecutive: 2,
+    recovery_successes: 2,
+    cooldown_seconds: [60, 120, 300],
+    min_dwell_seconds: 60,
+    probe_interval_seconds: 90,
+    current_probe_interval_seconds: 0,
+    rate_limit_cooldown_seconds: 120,
+  };
+}
+
+function newRoutePoolDraft() {
+  return {
+    id: 'default-pool',
+    name: '连接池',
+    description: '',
+    model: '',
+    policy: defaultRoutePoolPolicy(),
+    routes: [],
+  };
+}
+
+function activeRoutePoolDraft() {
+  if (!state.routePoolDraft) state.routePoolDraft = newRoutePoolDraft();
+  if (!state.routePoolDraft.policy) state.routePoolDraft.policy = defaultRoutePoolPolicy();
+  if (!Array.isArray(state.routePoolDraft.routes)) state.routePoolDraft.routes = [];
+  return state.routePoolDraft;
+}
+
+function routePoolNextPriority() {
+  const draft = activeRoutePoolDraft();
+  const max = draft.routes.reduce((m, route) => Math.max(m, Number(route.priority) || 0), 0);
+  return max + 10;
+}
+
+function renumberRoutePoolRoutes(routes) {
+  (routes || []).forEach((route, index) => {
+    route.priority = (index + 1) * 10;
+  });
+}
+
+function installRoutePoolTableDnD(tbody) {
+  if (!tbody || tbody.dataset.routePoolSortableReady === '1') return;
+  tbody.dataset.routePoolSortableReady = '1';
+  tbody.addEventListener('dragover', (e) => {
+    const dragging = tbody.querySelector('tr.pool-route-row.dragging');
+    if (!dragging) return;
+    e.preventDefault();
+    const rows = [...tbody.querySelectorAll('tr.pool-route-row:not(.dragging)')];
+    const after = rows.reduce((closest, child) => {
+      const box = child.getBoundingClientRect();
+      const offset = e.clientY - box.top - box.height / 2;
+      if (offset < 0 && offset > closest.offset) return { offset, element: child };
+      return closest;
+    }, { offset: Number.NEGATIVE_INFINITY, element: null }).element;
+    if (after == null) tbody.appendChild(dragging);
+    else tbody.insertBefore(dragging, after);
+  });
+  tbody.addEventListener('drop', (e) => {
+    const dragging = tbody.querySelector('tr.pool-route-row.dragging');
+    if (!dragging) return;
+    e.preventDefault();
+    const draft = activeRoutePoolDraft();
+    const byId = new Map(draft.routes.map((route) => [route.id, route]));
+    const ordered = [...tbody.querySelectorAll('tr.pool-route-row')]
+      .map((row) => byId.get(row.dataset.routeId))
+      .filter(Boolean);
+    if (ordered.length !== draft.routes.length) return;
+    draft.routes = ordered;
+    renumberRoutePoolRoutes(draft.routes);
+    renderRoutePoolDashboard();
+  });
+}
+
+function routePoolRouteId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.max(1, activeRoutePoolDraft().routes.length + 1)}`;
+}
+
+function routePoolEndpointRows() {
+  const candidates = state.routePoolCandidates || {};
+  const endpoints = [...(candidates.relay_endpoints || [])];
+  const current = candidates.current_endpoint_url || (state.defaultEndpoint && state.defaultEndpoint.endpoint);
+  if (current && !endpoints.some((ep) => ep.endpoint === current)) {
+    endpoints.unshift({
+      name: candidates.current_endpoint_name || '默认',
+      endpoint: current,
+    });
+  }
+  return endpoints;
+}
+
+function routePoolRelaySources() {
+  const candidates = state.routePoolCandidates || {};
+  const sources = Array.isArray(candidates.relay_sources) ? candidates.relay_sources : [];
+  if (sources.length) return sources;
+  const fallbackDomain = candidates.relay_domain || state.lastDomain || '';
+  if (!fallbackDomain) return [];
+  return [{
+    domain: fallbackDomain,
+    site: fallbackDomain.replace(/^https?:\/\//, '').replace(/\/$/, ''),
+    is_current: true,
+    keys: candidates.relay_keys || [],
+    endpoints: routePoolEndpointRows(),
+  }];
+}
+
+function selectedRoutePoolRelaySource() {
+  const sources = routePoolRelaySources();
+  const selected = selectValue('#route-pool-relay-domain')
+    || (state.routePoolCandidates && state.routePoolCandidates.relay_domain)
+    || state.lastDomain
+    || '';
+  return sources.find((source) => source.domain === selected) || sources[0] || null;
+}
+
+function upsertRoutePoolRelaySource(source) {
+  if (!source || !source.domain) return;
+  const candidates = state.routePoolCandidates || {};
+  const sources = Array.isArray(candidates.relay_sources) ? [...candidates.relay_sources] : [];
+  const idx = sources.findIndex((item) => item.domain === source.domain);
+  if (idx >= 0) sources[idx] = { ...sources[idx], ...source };
+  else sources.push(source);
+  candidates.relay_sources = sources;
+  state.routePoolCandidates = candidates;
+}
+
+async function loadRoutePoolRelaySource(domain) {
+  const relaySource = routePoolRelaySources().find((source) => source.domain === domain);
+  if (!relaySource || relaySource.loaded || relaySource.loading) return;
+  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.route_pool_relay_source) return;
+  upsertRoutePoolRelaySource({ ...relaySource, loading: true, error: '加载中...' });
+  renderRoutePoolSourceControls();
+  try {
+    const r = await window.pywebview.api.route_pool_relay_source(relaySource.domain);
+    if (r && r.source) {
+      upsertRoutePoolRelaySource({ ...r.source, loading: false });
+    } else {
+      upsertRoutePoolRelaySource({
+        ...relaySource,
+        loading: false,
+        error: (r && r.error) || '中转站读取失败',
+      });
+    }
+  } catch (err) {
+    upsertRoutePoolRelaySource({
+      ...relaySource,
+      loading: false,
+      error: err && err.message ? err.message : String(err),
+    });
+  }
+  renderRoutePoolSourceControls();
+}
+
+async function loadSelectedRoutePoolRelaySource() {
+  const relaySource = selectedRoutePoolRelaySource();
+  if (!relaySource) return;
+  await loadRoutePoolRelaySource(relaySource.domain);
+}
+
+function handleRoutePoolSourceTypeChange() {
+  renderRoutePoolSourceControls();
+  if ((selectValue('#route-pool-source-type') || 'custom') === 'relay') {
+    loadSelectedRoutePoolRelaySource();
+  }
+}
+
+function handleRoutePoolRelayDomainChange() {
+  renderRoutePoolSourceControls();
+  loadSelectedRoutePoolRelaySource();
+}
+
+function renderRoutePoolSelect() {
+  const select = $('#route-pool-select');
+  if (!select) return;
+  const rows = (state.routePools || []).map((pool) => ({
+    value: pool.id,
+    label: pool.name || pool.id,
+  }));
+  setSelectOptions(select, rows, state.currentRoutePoolId || '', '未保存');
+}
+
+function renderRoutePoolSourceControls() {
+  const candidates = state.routePoolCandidates || {};
+  const sourceType = selectValue('#route-pool-source-type') || 'custom';
+  const relaySources = routePoolRelaySources();
+  const currentRelayDomain = selectValue('#route-pool-relay-domain');
+  const preferredRelay = candidates.relay_domain || state.lastDomain || '';
+  const selectedRelayDomain = relaySources.some((source) => source.domain === currentRelayDomain)
+    ? currentRelayDomain
+    : preferredRelay;
+  const relayDomainRows = relaySources.map((source) => ({
+    value: source.domain,
+    label: `${source.site || source.domain}${source.is_current ? ' · 当前' : ''}`,
+  }));
+  setSelectOptions($('#route-pool-relay-domain'), relayDomainRows, selectedRelayDomain, '无中转站');
+
+  const relaySource = selectedRoutePoolRelaySource();
+  const relayRows = ((relaySource && relaySource.keys) || []).map((key) => ({
+    value: String(key.id),
+    label: `${key.name || key.id} · ${key.group_name || '未分组'} (${fmtRate(key.group_rate)})`,
+  }));
+  const relayEmpty = relaySource && relaySource.loading
+    ? '加载中...'
+    : relaySource && relaySource.error
+      ? relaySource.error
+      : relaySource && !relaySource.loaded
+        ? '选择后加载 key'
+        : '无 relay key';
+  setSelectOptions($('#route-pool-relay-key'), relayRows, '', relayEmpty);
+
+  const endpointRows = ((relaySource && relaySource.endpoints) || []).map((ep) => ({
+    value: ep.endpoint,
+    label: `${ep.name || 'endpoint'} · ${ep.endpoint}`,
+  }));
+  const selectedEndpoint = relaySource && relaySource.current_endpoint_url
+    ? relaySource.current_endpoint_url
+    : (state.defaultEndpoint && state.defaultEndpoint.endpoint) || '';
+  const endpointEmpty = relaySource && relaySource.loading
+    ? '加载中...'
+    : relaySource && relaySource.error
+      ? relaySource.error
+      : relaySource && !relaySource.loaded
+        ? '选择后加载 endpoint'
+        : '无 endpoint';
+  setSelectOptions($('#route-pool-relay-endpoint'), endpointRows, selectedEndpoint, endpointEmpty);
+
+  const customRows = (candidates.custom_apis || []).map((api) => ({
+    value: api.id,
+    label: customApiName(api),
+  }));
+  setSelectOptions($('#route-pool-custom-api'), customRows, state.currentCustomApi ? state.currentCustomApi.id : '', '无自定义 API');
+
+  const relayDomain = $('#route-pool-relay-domain');
+  const relayKey = $('#route-pool-relay-key');
+  const relayEndpoint = $('#route-pool-relay-endpoint');
+  const customApi = $('#route-pool-custom-api');
+  if (relayDomain) relayDomain.classList.toggle('hidden', sourceType !== 'relay');
+  if (relayKey) relayKey.classList.toggle('hidden', sourceType !== 'relay');
+  if (relayEndpoint) relayEndpoint.classList.toggle('hidden', sourceType !== 'relay');
+  if (customApi) customApi.classList.toggle('hidden', sourceType !== 'custom');
+}
+
+function renderRoutePoolEditor() {
+  const editor = $('#route-pool-editor');
+  if (editor) editor.classList.toggle('hidden', !state.routePoolEditorOpen);
+  const toggle = $('#btn-route-pool-toggle-add');
+  if (toggle) toggle.textContent = state.routePoolEditorOpen ? '取消' : '添加';
+  renderRoutePoolSourceControls();
+}
+
+function toggleRoutePoolEditor() {
+  state.routePoolEditorOpen = !state.routePoolEditorOpen;
+  renderRoutePoolEditor();
+}
+
+function routePoolRuntimeSnapshot() {
+  const status = state.routePoolStatus;
+  if (!status || !status.ok) return null;
+  const snap = status.snapshot || null;
+  if (!snap || !snap.ok) return null;
+  return snap;
+}
+
+function routePoolRuntimeState(route) {
+  const snap = routePoolRuntimeSnapshot();
+  const states = (snap && snap.states) || {};
+  const id = String(route && route.id ? route.id : '');
+  return {
+    currentRoute: snap ? String(snap.current_route || '') : '',
+    state: states[id] || null,
+    snapshot: snap,
+  };
+}
+
+function routePoolRuntimeStatus(route) {
+  const runtime = routePoolRuntimeState(route);
+  const current = runtime.currentRoute && route && String(route.id) === runtime.currentRoute;
+  const routeState = runtime.state || {};
+  const cooldown = Number(routeState.cooldown_remaining || 0);
+  const failures = Number(routeState.failures || 0);
+  const probeSuccesses = Number(routeState.probe_successes || 0);
+  const blocked = !!routeState.blocked;
+  const lastStatus = routeState.last_status;
+  const lastError = routeState.last_error || '';
+  let key = 'ready';
+  let label = 'READY';
+  let detail = '可用，未发现故障';
+  let symbol = '○';
+
+  if (!runtime.snapshot) {
+    key = 'unknown';
+    label = 'UNKNOWN';
+    detail = '本地代理状态未读取';
+    symbol = '?';
+  } else if (current) {
+    key = 'active';
+    label = 'ACTIVE';
+    detail = '当前正在使用';
+    symbol = '●';
+  } else if (blocked) {
+    key = 'blocked';
+    label = 'BLOCKED';
+    detail = '认证或权限阻断';
+    symbol = '▲';
+  } else if (cooldown > 0) {
+    key = 'cooldown';
+    label = `COOL ${cooldown}s`;
+    detail = failures ? `连续失败 ${failures} 次` : '冷却中';
+    symbol = '↻';
+  } else if (probeSuccesses > 0) {
+    key = 'recovering';
+    label = 'RECOVERING';
+    detail = `恢复探测 ${probeSuccesses} 次通过`;
+    symbol = '↻';
+  } else if (failures > 0 || lastStatus == null && lastError) {
+    key = 'failed';
+    label = failures ? `FAIL ${failures}` : 'FAILED';
+    detail = lastError || '最近请求失败';
+    symbol = '▲';
+  } else if (lastStatus === 200) {
+    key = 'healthy';
+    label = 'HEALTHY';
+    detail = '最近请求成功';
+    symbol = '●';
+  }
+
+  return {
+    key,
+    label,
+    detail,
+    symbol,
+    current,
+    cooldown,
+    failures,
+    blocked,
+    probeSuccesses,
+    lastStatus,
+    lastError,
+  };
+}
+
+function routePoolStatusCounts(routes) {
+  const counts = { active: 0, healthy: 0, degraded: 0, failed: 0 };
+  (routes || []).forEach((route) => {
+    const status = routePoolRuntimeStatus(route);
+    if (status.key === 'active') counts.active += 1;
+    if (['active', 'healthy', 'ready'].includes(status.key)) counts.healthy += 1;
+    if (['cooldown', 'recovering'].includes(status.key)) counts.degraded += 1;
+    if (['failed', 'blocked'].includes(status.key)) counts.failed += 1;
+  });
+  return counts;
+}
+
+function routePoolRouteDisplay(route, idx) {
+  const source = route.source_type === 'custom'
+    ? route.custom_api_name || route.label || route.custom_api_id || `API ${idx + 1}`
+    : route.label || route.key_name || route.relay_site || route.relay_domain || `route ${idx + 1}`;
+  const base = route.base_url || route.relay_domain || '';
+  const group = route.source_type === 'custom'
+    ? '默认'
+    : route.group_name || route.key_name || '未分组';
+  return { source, base, group };
+}
+
+function routePoolHealthText(status) {
+  if (status.key === 'unknown') return '等待 poolz';
+  if (status.current) return 'current';
+  if (status.blocked) return 'blocked 24h';
+  if (status.cooldown) return `cooldown ${status.cooldown}s`;
+  if (status.probeSuccesses) return `probe ${status.probeSuccesses}`;
+  if (status.failures) return `failures ${status.failures}`;
+  if (status.lastStatus) return `HTTP ${status.lastStatus}`;
+  return 'standby';
+}
+
+function routePoolStateChipText(status) {
+  const code = {
+    active: 'ACTIVE',
+    healthy: 'OK',
+    ready: 'READY',
+    recovering: 'REC',
+    cooldown: 'COOL',
+    blocked: 'BLOCK',
+    failed: 'FAIL',
+    unknown: 'UNK',
+  }[status.key] || status.label;
+  let metric = routePoolHealthText(status);
+  if (status.key === 'failed' && status.lastStatus) metric = String(status.lastStatus);
+  if (status.key === 'cooldown' && status.cooldown) metric = `${status.cooldown}s`;
+  if (status.key === 'recovering' && status.probeSuccesses) metric = `probe ${status.probeSuccesses}`;
+  return `${code} · ${metric}`;
+}
+
+function formatRoutePoolUptime(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  if (total < 60) return `${Math.round(total)}s`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  if (hours < 48) return restMinutes ? `${hours}h ${restMinutes}m` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const restHours = hours % 24;
+  return restHours ? `${days}d ${restHours}h` : `${days}d`;
+}
+
+function renderRoutePoolHud() {
+  const draft = activeRoutePoolDraft();
+  const routes = draft.routes || [];
+  const snap = routePoolRuntimeSnapshot();
+  const activeId = snap && snap.current_route ? String(snap.current_route) : '';
+  const activeIdx = routes.findIndex((route) => String(route.id) === activeId);
+  const activeRoute = activeIdx >= 0 ? routes[activeIdx] : null;
+  const activeStatus = activeRoute ? routePoolRuntimeStatus(activeRoute) : null;
+  const activeDisplay = activeRoute ? routePoolRouteDisplay(activeRoute, activeIdx) : null;
+  const counters = routePoolStatusCounts(routes);
+
+  const routeNode = $('#route-pool-active-route');
+  const detailNode = $('#route-pool-active-detail');
+  if (routeNode) {
+    routeNode.textContent = activeRoute
+      ? `${activeStatus.symbol} ${activeDisplay.source}`
+      : (snap ? '无 active route' : '本地代理未报告 active');
+    routeNode.className = `pool-hud-route ${activeStatus ? 'state-' + activeStatus.key : 'state-unknown'}`;
+  }
+  if (detailNode) {
+    const statusText = activeStatus ? activeStatus.label : (snap ? 'NO ACTIVE' : 'UNAVAILABLE');
+    const routeDetail = activeDisplay && activeDisplay.base ? ` · ${activeDisplay.base}` : '';
+    const proxyDetail = snap && snap.pid ? ` · pid ${snap.pid} · up ${formatRoutePoolUptime(snap.uptime_seconds)}` : '';
+    const stale = state.routePoolLastStatusAt ? ` · ${Math.max(0, Math.round((Date.now() - state.routePoolLastStatusAt) / 1000))}s ago` : '';
+    detailNode.textContent = `${statusText}${routeDetail}${proxyDetail}${stale}`;
+  }
+
+  const setCount = (id, value) => {
+    const node = $(id);
+    if (node) node.textContent = String(value);
+  };
+  setCount('#route-pool-count-active', counters.active);
+  setCount('#route-pool-count-healthy', counters.healthy);
+  setCount('#route-pool-count-degraded', counters.degraded);
+  setCount('#route-pool-count-failed', counters.failed);
+}
+
+function routePoolStatusText() {
+  const status = state.routePoolStatus;
+  const routeCount = activeRoutePoolDraft().routes.length;
+  const logs = status && Array.isArray(status.logs)
+    ? status.logs.filter((line) => line && isRoutePoolEventLog(line))
+    : [];
+  if (logs.length) return logs.slice(-120).join('\n');
+  if (!status) return '[INFO] 连接池日志未读取';
+  if (!status.ok) {
+    const error = status.error || '';
+    if (/Connection refused|Errno 61|poolz unavailable|urlopen error/i.test(error)) {
+      return routeCount
+        ? '[INFO] 连接池代理未启动\n点击「配置到 Codex」后会启动本地代理。'
+        : '[INFO] 连接池未启用\n先添加 route，再保存并配置到 Codex。';
+    }
+    return `[WARN] 连接池状态不可读\n${error || 'local proxy unavailable'}`;
+  }
+  const snap = status.snapshot || {};
+  if (!snap.ok) return `[WARN] ${snap.error || '当前 Codex 未切到连接池'}`;
+  const states = snap.states || {};
+  const lines = [`[READY] active=${snap.current_route || '(none)'}`];
+  for (const [id, route] of Object.entries(states)) {
+    const blocked = route.blocked ? 'blocked' : 'open';
+    const cooldown = route.cooldown_remaining ? ` cooldown=${route.cooldown_remaining}s` : '';
+    const failures = route.failures ? ` failures=${route.failures}` : '';
+    lines.push(`[${blocked.toUpperCase()}] ${id}${failures}${cooldown}`);
+  }
+  return lines.join('\n');
+}
+
+function isRoutePoolEventLog(line) {
+  return /\bpool (route|monitor)\b/i.test(String(line || ''));
+}
+
+function renderRoutePoolStatus(extraText) {
+  if (extraText !== undefined) state.routePoolMessage = extraText || '';
+  const node = $('#route-pool-status');
+  if (!node) return;
+  node.textContent = state.routePoolMessage || routePoolStatusText();
+  renderRoutePoolHud();
+}
+
+function routePoolSourceValue(type, id) {
+  return `${type}:${encodeURIComponent(String(id || ''))}`;
+}
+
+function parseRoutePoolSourceValue(value) {
+  const raw = String(value || '');
+  const sep = raw.indexOf(':');
+  if (sep < 0) return { type: '', id: '' };
+  return {
+    type: raw.slice(0, sep),
+    id: decodeURIComponent(raw.slice(sep + 1)),
+  };
+}
+
+function routePoolRouteSourceValue(route) {
+  if (route.source_type === 'custom') return routePoolSourceValue('custom', route.custom_api_id);
+  return routePoolSourceValue('relay', route.relay_domain || '');
+}
+
+function routePoolRelaySourceByDomain(domain) {
+  return routePoolRelaySources().find((source) => source.domain === domain) || null;
+}
+
+function routePoolCustomApiById(id) {
+  const candidates = state.routePoolCandidates || {};
+  return (candidates.custom_apis || []).find((api) => api.id === id) || null;
+}
+
+function routePoolSourceRows(route) {
+  const rows = [];
+  const seen = new Set();
+  for (const source of routePoolRelaySources()) {
+    const value = routePoolSourceValue('relay', source.domain);
+    seen.add(value);
+    rows.push({
+      value,
+      label: `中转 · ${source.site || source.domain}${source.is_current ? ' · 当前' : ''}`,
+    });
+  }
+  const candidates = state.routePoolCandidates || {};
+  for (const api of (candidates.custom_apis || [])) {
+    const value = routePoolSourceValue('custom', api.id);
+    seen.add(value);
+    rows.push({ value, label: `API · ${customApiName(api)}` });
+  }
+  const current = routePoolRouteSourceValue(route);
+  if (current && !seen.has(current)) {
+    rows.unshift({
+      value: current,
+      label: route.source_type === 'custom'
+        ? `API · ${route.custom_api_name || route.label || route.custom_api_id || '未知'}`
+        : `中转 · ${route.relay_site || route.relay_domain || route.label || '未知'}`,
+    });
+  }
+  return rows;
+}
+
+function routePoolEndpointForSource(source, route = {}) {
+  const endpoints = (source && source.endpoints) || [];
+  return endpoints.find((ep) => ep.endpoint === route.base_url)
+    || endpoints.find((ep) => ep.endpoint === source.current_endpoint_url)
+    || endpoints[0]
+    || null;
+}
+
+function applyRelayKeyToRoute(route, source, key) {
+  if (!route || !source || !key) return;
+  const endpoint = routePoolEndpointForSource(source, route);
+  const relayLabel = source.site || source.domain || route.relay_domain || '中转';
+  route.source_type = 'relay';
+  route.relay_domain = source.domain || route.relay_domain || '';
+  route.relay_site = source.site || route.relay_site || '';
+  route.key_id = key.id;
+  route.key_name = key.name || String(key.id);
+  route.key_masked = key.key_masked || '';
+  route.group_id = key.group_id;
+  route.group_name = key.group_name || '';
+  route.group_rate = key.group_rate;
+  route.endpoint_name = (endpoint && endpoint.name) || route.endpoint_name || '默认';
+  route.base_url = (endpoint && endpoint.endpoint) || route.base_url || '';
+  route.protocol = 'responses';
+  route.model = route.model || state.groupModelColumns[0] || state.models[0] || '';
+  route.label = `${relayLabel} · ${route.key_name} · ${route.group_name || '未分组'}`;
+}
+
+function applyRelaySourceDefaultsToRoute(route, source) {
+  const key = ((source && source.keys) || []).find((item) => String(item.id) === String(route.key_id))
+    || ((source && source.keys) || [])[0];
+  if (key) applyRelayKeyToRoute(route, source, key);
+}
+
+function applyCustomApiToRoute(route, api) {
+  if (!route || !api) return;
+  route.source_type = 'custom';
+  route.custom_api_id = api.id;
+  route.custom_api_name = customApiName(api);
+  route.base_url = api.base_url || '';
+  route.protocol = 'chat';
+  route.model = (api.model_columns && api.model_columns[0]) || '';
+  route.label = customApiName(api);
+  route.relay_domain = '';
+  route.relay_site = '';
+  route.key_id = '';
+  route.key_name = '';
+  route.group_id = '';
+  route.group_name = '';
+  route.group_rate = null;
+}
+
+async function updateRoutePoolRouteSource(route, value) {
+  const parsed = parseRoutePoolSourceValue(value);
+  if (parsed.type === 'custom') {
+    const api = routePoolCustomApiById(parsed.id);
+    if (api) applyCustomApiToRoute(route, api);
+    renderRoutePoolDashboard();
+    return;
+  }
+  if (parsed.type !== 'relay') return;
+  const source = routePoolRelaySourceByDomain(parsed.id);
+  route.source_type = 'relay';
+  route.relay_domain = parsed.id;
+  route.relay_site = source ? source.site || '' : '';
+  route.protocol = 'responses';
+  route.custom_api_id = '';
+  route.custom_api_name = '';
+  if (source && source.loaded) {
+    applyRelaySourceDefaultsToRoute(route, source);
+    renderRoutePoolDashboard();
+    return;
+  }
+  route.key_id = '';
+  route.key_name = '';
+  route.group_id = '';
+  route.group_name = '';
+  route.group_rate = null;
+  route.base_url = '';
+  route.label = `${route.relay_site || route.relay_domain || '中转'} · 未加载`;
+  renderRoutePoolDashboard();
+  await loadRoutePoolRelaySource(parsed.id);
+  const currentDraft = activeRoutePoolDraft();
+  const loaded = routePoolRelaySourceByDomain(parsed.id);
+  if (currentDraft.routes.includes(route) && loaded && loaded.loaded) {
+    applyRelaySourceDefaultsToRoute(route, loaded);
+    renderRoutePoolDashboard();
+  }
+}
+
+function routePoolGroupRows(route) {
+  if (route.source_type === 'custom') return [{ value: 'default', label: '默认' }];
+  const source = routePoolRelaySourceByDomain(route.relay_domain || '');
+  const rows = ((source && source.keys) || []).map((key) => ({
+    value: String(key.id),
+    label: `${key.group_name || '未分组'} · ${key.name || key.id} (${fmtRate(key.group_rate)})`,
+  }));
+  const current = route.key_id == null ? '' : String(route.key_id);
+  if (current && !rows.some((row) => row.value === current)) {
+    rows.unshift({
+      value: current,
+      label: `${route.group_name || '未分组'} · ${route.key_name || current} (${fmtRate(route.group_rate)})`,
+    });
+  }
+  return rows;
+}
+
+function updateRoutePoolRouteGroup(route, value) {
+  if (route.source_type !== 'relay') return;
+  const source = routePoolRelaySourceByDomain(route.relay_domain || '');
+  const key = ((source && source.keys) || []).find((item) => String(item.id) === String(value));
+  if (!key) return;
+  applyRelayKeyToRoute(route, source, key);
+  renderRoutePoolDashboard();
+}
+
+function closeRoutePoolContextMenu() {
+  const menu = $('#route-pool-context-menu');
+  if (menu) menu.classList.add('hidden');
+  document.querySelectorAll('.pool-route-row.context-open').forEach((row) => {
+    row.classList.remove('context-open');
+  });
+  routePoolContextRouteId = null;
+}
+
+function openRoutePoolContextMenu(event, route) {
+  const menu = $('#route-pool-context-menu');
+  if (!menu || !route) return;
+  event.preventDefault();
+  closeRoutePoolContextMenu();
+  routePoolContextRouteId = route.id;
+  const row = event.currentTarget;
+  if (row) row.classList.add('context-open');
+  menu.style.left = `${event.clientX}px`;
+  menu.style.top = `${event.clientY}px`;
+  menu.classList.remove('hidden');
+}
+
+function deleteRoutePoolContextRoute() {
+  if (!routePoolContextRouteId) return;
+  const draft = activeRoutePoolDraft();
+  const idx = draft.routes.findIndex((route) => route.id === routePoolContextRouteId);
+  closeRoutePoolContextMenu();
+  if (idx < 0) return;
+  draft.routes.splice(idx, 1);
+  renumberRoutePoolRoutes(draft.routes);
+  renderRoutePoolDashboard();
+}
+
+function renderRoutePoolRoutes() {
+  const tbody = $('#route-pool-body');
+  if (!tbody) return;
+  const draft = activeRoutePoolDraft();
+  installRoutePoolTableDnD(tbody);
+  const frag = document.createDocumentFragment();
+  draft.routes.forEach((route, idx) => {
+    const runtimeStatus = routePoolRuntimeStatus(route);
+    const display = routePoolRouteDisplay(route, idx);
+    const tr = document.createElement('tr');
+    tr.className = `pool-route-row pool-state-${runtimeStatus.key}${runtimeStatus.current ? ' current active-route' : ''}`;
+    tr.draggable = true;
+    tr.dataset.routeId = route.id;
+    tr.dataset.routeState = runtimeStatus.key;
+    tr.title = '右键删除 route';
+    tr.addEventListener('contextmenu', (e) => openRoutePoolContextMenu(e, route));
+    tr.addEventListener('dragstart', (e) => {
+      state.dragSorting = true;
+      tr.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', route.id || String(idx));
+    });
+    tr.addEventListener('dragend', () => {
+      tr.classList.remove('dragging');
+      setTimeout(() => { state.dragSorting = false; }, 120);
+    });
+
+    const stateBadge = el('div', {
+      className: `pool-state-badge state-${runtimeStatus.key}`,
+      attrs: {
+        title: runtimeStatus.lastError || runtimeStatus.detail,
+        'aria-label': `${runtimeStatus.label}: ${runtimeStatus.lastError || runtimeStatus.detail}`,
+      },
+      children: [
+        el('span', { className: 'pool-state-symbol', text: runtimeStatus.symbol }),
+        el('span', { className: 'pool-state-label', text: routePoolStateChipText(runtimeStatus) }),
+      ],
+    });
+    tr.appendChild(el('td', {
+      className: 'pool-state-cell',
+      children: [stateBadge],
+    }));
+
+    const sourceSelect = el('select', {
+      className: 'pool-route-select',
+      attrs: {
+        'aria-label': '切换 route 来源',
+        title: `${display.source}${display.base ? `\n${display.base}` : ''}`,
+      },
+    });
+    setSelectOptions(sourceSelect, routePoolSourceRows(route), routePoolRouteSourceValue(route), '无来源');
+    sourceSelect.addEventListener('contextmenu', (e) => e.stopPropagation());
+    sourceSelect.addEventListener('change', () => updateRoutePoolRouteSource(route, sourceSelect.value));
+    tr.appendChild(el('td', {
+      children: [sourceSelect],
+    }));
+
+    const groupSelect = el('select', {
+      className: 'pool-route-select',
+      attrs: {
+        'aria-label': '切换 route 分组',
+        title: display.group,
+      },
+    });
+    const source = routePoolRelaySourceByDomain(route.relay_domain || '');
+    if (route.source_type === 'relay' && source && !source.loaded && !source.loading) {
+      loadRoutePoolRelaySource(source.domain).then(() => {
+        if (state.viewMode === 'pool') renderRoutePoolDashboard();
+      });
+    }
+    const groupEmpty = source && source.loading
+      ? '加载中...'
+      : source && source.error
+        ? source.error
+        : '无分组';
+    setSelectOptions(
+      groupSelect,
+      routePoolGroupRows(route),
+      route.key_id == null ? 'default' : String(route.key_id),
+      groupEmpty,
+    );
+    groupSelect.disabled = route.source_type === 'custom' || groupSelect.disabled;
+    groupSelect.addEventListener('contextmenu', (e) => e.stopPropagation());
+    groupSelect.addEventListener('change', () => updateRoutePoolRouteGroup(route, groupSelect.value));
+    tr.appendChild(el('td', {
+      children: [groupSelect],
+    }));
+
+    frag.appendChild(tr);
+  });
+
+  if (!draft.routes.length) {
+    frag.appendChild(el('tr', {
+      children: [el('td', {
+        className: 'muted small',
+        text: '还没有 route，点击「添加」后选择 API 或中转。',
+        attrs: { colspan: '3' },
+      })],
+    }));
+  }
+  tbody.replaceChildren(frag);
+  const count = $('#route-pool-route-count');
+  if (count) count.textContent = `${draft.routes.length} ROUTES`;
+  renderRoutePoolHud();
+}
+
+function renderRoutePoolDashboard() {
+  const root = $('#route-pool-dashboard');
+  if (!root) return;
+  const draft = activeRoutePoolDraft();
+  renderRoutePoolSelect();
+  renderRoutePoolEditor();
+  renderRoutePoolRoutes();
+  renderRoutePoolStatus();
+  const saveBtn = $('#btn-route-pool-save');
+  if (saveBtn) saveBtn.disabled = state.routePoolRunning;
+  const restartBtn = $('#btn-route-pool-restart');
+  if (restartBtn) restartBtn.disabled = state.routePoolRunning;
+}
+
+function selectRoutePoolDraft(poolId) {
+  const pool = (state.routePools || []).find((item) => item.id === poolId);
+  state.currentRoutePoolId = pool ? pool.id : null;
+  state.routePoolDraft = pool ? cloneJson(pool) : newRoutePoolDraft();
+  renderRoutePoolDashboard();
+}
+
+async function refreshRoutePools({ preserveDraft = false } = {}) {
+  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.list_route_pools) return;
+  const previousDraft = preserveDraft && state.routePoolDraft ? cloneJson(state.routePoolDraft) : null;
+  const previousPoolId = preserveDraft ? state.currentRoutePoolId : null;
+  try {
+    const r = await window.pywebview.api.list_route_pools();
+    if (!r || !r.ok) {
+      renderRoutePoolStatus(`[ERR] ${(r && r.error) || '连接池读取失败'}`);
+      return;
+    }
+    state.routePools = r.pools || [];
+    state.currentRoutePoolId = r.current_id || state.currentRoutePoolId || (state.routePools[0] && state.routePools[0].id) || 'default-pool';
+    state.routePoolCandidates = r.candidates || { relay_keys: [], relay_endpoints: [], custom_apis: [] };
+    state.routePoolStatus = r.status || null;
+    state.routePoolLastStatusAt = Date.now();
+    state.routePoolMessage = '';
+    if (previousDraft) {
+      state.currentRoutePoolId = previousPoolId || state.currentRoutePoolId || 'default-pool';
+      state.routePoolDraft = previousDraft;
+    } else if (state.currentRoutePoolId) {
+      const pool = state.routePools.find((item) => item.id === state.currentRoutePoolId);
+      state.routePoolDraft = pool ? cloneJson(pool) : newRoutePoolDraft();
+    } else if (!state.routePoolDraft) {
+      state.routePoolDraft = newRoutePoolDraft();
+    }
+    if (state.viewMode === 'pool') renderRoutePoolDashboard();
+    const configModal = $('#config-target-modal');
+    if (configModal && !configModal.classList.contains('hidden')) renderConfigTargetChoices();
+  } catch (err) {
+    renderRoutePoolStatus(`[ERR] ${err && err.message ? err.message : String(err)}`);
+  }
+}
+
+async function refreshRoutePoolRuntimeStatus({ render = true } = {}) {
+  if (state.routePoolStatusRefreshInFlight) return;
+  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.route_pool_status) return;
+  state.routePoolStatusRefreshInFlight = true;
+  try {
+    const r = await window.pywebview.api.route_pool_status();
+    state.routePoolStatus = r || null;
+    state.routePoolLastStatusAt = Date.now();
+    state.routePoolMessage = '';
+    if (render && state.viewMode === 'pool') {
+      renderRoutePoolRoutes();
+      renderRoutePoolStatus();
+    }
+  } catch (err) {
+    state.routePoolStatus = {
+      ok: false,
+      error: err && err.message ? err.message : String(err),
+      logs: state.routePoolStatus && state.routePoolStatus.logs ? state.routePoolStatus.logs : [],
+    };
+    state.routePoolLastStatusAt = Date.now();
+    if (render && state.viewMode === 'pool') {
+      renderRoutePoolRoutes();
+      renderRoutePoolStatus();
+    }
+  } finally {
+    state.routePoolStatusRefreshInFlight = false;
+  }
+}
+
+function startRoutePoolStatusRefresh() {
+  if (routePoolStatusTimer) return;
+  routePoolStatusTimer = setInterval(() => {
+    if (state.viewMode === 'pool' && !state.routePoolRunning && !state.dragSorting) {
+      refreshRoutePoolRuntimeStatus({ render: true });
+    }
+  }, 3000);
+}
+
+function stopRoutePoolStatusRefresh() {
+  if (!routePoolStatusTimer) return;
+  clearInterval(routePoolStatusTimer);
+  routePoolStatusTimer = null;
+}
+
+function createRoutePoolDraft() {
+  state.currentRoutePoolId = null;
+  state.routePoolDraft = newRoutePoolDraft();
+  renderRoutePoolDashboard();
+}
+
+function updateRoutePoolHeaderDraft() {
+  const draft = activeRoutePoolDraft();
+  draft.id = draft.id || state.currentRoutePoolId || 'default-pool';
+  draft.name = '连接池';
+  draft.model = '';
+  renumberRoutePoolRoutes(draft.routes);
+}
+
+function addRelayRouteToPool() {
+  const candidates = state.routePoolCandidates || {};
+  const relaySource = selectedRoutePoolRelaySource();
+  const relayDomain = (relaySource && relaySource.domain) || selectValue('#route-pool-relay-domain') || candidates.relay_domain || state.lastDomain || '';
+  const keyId = selectValue('#route-pool-relay-key');
+  const endpointUrl = selectValue('#route-pool-relay-endpoint');
+  const key = ((relaySource && relaySource.keys) || []).find((item) => String(item.id) === String(keyId));
+  const endpoint = ((relaySource && relaySource.endpoints) || []).find((item) => item.endpoint === endpointUrl);
+  if (!key || !endpoint) {
+    setStatus('没有可添加的中转 route', 'warn');
+    renderRoutePoolStatus(`[WARN] ${relaySource && relaySource.error ? relaySource.error : '没有可添加的中转 route'}`);
+    return false;
+  }
+  const draft = activeRoutePoolDraft();
+  const relayLabel = (relaySource && (relaySource.site || relaySource.domain)) || relayDomain;
+  const route = {
+    id: routePoolRouteId('relay'),
+    label: `${relayLabel} · ${key.name || key.id} · ${key.group_name || '未分组'}`,
+    source_type: 'relay',
+    relay_domain: relayDomain,
+    relay_site: relaySource ? relaySource.site || '' : '',
+    key_id: key.id,
+    key_name: key.name || String(key.id),
+    key_masked: key.key_masked || '',
+    group_id: key.group_id,
+    group_name: key.group_name || '',
+    group_rate: key.group_rate,
+    endpoint_name: endpoint.name || '默认',
+    base_url: endpoint.endpoint,
+    priority: routePoolNextPriority(),
+    protocol: 'responses',
+    model: state.groupModelColumns[0] || state.models[0] || '',
+  };
+  draft.routes.push(route);
+  state.routePoolEditorOpen = false;
+  state.routePoolMessage = '';
+  renderRoutePoolDashboard();
+  return true;
+}
+
+function addSelectedRouteToPool() {
+  const sourceType = selectValue('#route-pool-source-type') || 'custom';
+  if (sourceType === 'custom') return addCustomRouteToPool();
+  return addRelayRouteToPool();
+}
+
+function addCustomRouteToPool() {
+  const candidates = state.routePoolCandidates || {};
+  const apiId = selectValue('#route-pool-custom-api');
+  const api = (candidates.custom_apis || []).find((item) => item.id === apiId);
+  if (!api) {
+    setStatus('没有可添加的自定义 API route', 'warn');
+    renderRoutePoolStatus('[WARN] 没有可添加的 API route');
+    return false;
+  }
+  const draft = activeRoutePoolDraft();
+  draft.routes.push({
+    id: routePoolRouteId('custom'),
+    label: customApiName(api),
+    source_type: 'custom',
+    custom_api_id: api.id,
+    custom_api_name: customApiName(api),
+    base_url: api.base_url || '',
+    priority: routePoolNextPriority(),
+    protocol: 'chat',
+    model: (api.model_columns && api.model_columns[0]) || draft.model || '',
+  });
+  state.routePoolEditorOpen = false;
+  state.routePoolMessage = '';
+  renderRoutePoolDashboard();
+  return true;
+}
+
+async function saveRoutePool({ silent = false } = {}) {
+  updateRoutePoolHeaderDraft();
+  const draft = activeRoutePoolDraft();
+  draft.id = draft.id || state.currentRoutePoolId || 'default-pool';
+  if (!draft.name) draft.name = '连接池';
+  state.routePoolRunning = true;
+  renderRoutePoolDashboard();
+  try {
+    const r = await window.pywebview.api.save_route_pool(cloneJson(draft));
+    if (!r || !r.ok) {
+      if (!silent) setStatus((r && r.error) || '保存连接池失败', 'err');
+      return null;
+    }
+    state.routePools = r.pools || [];
+    state.currentRoutePoolId = r.saved_id || r.current_id || state.currentRoutePoolId;
+    state.routePoolCandidates = r.candidates || state.routePoolCandidates;
+    state.routePoolStatus = r.status || state.routePoolStatus;
+    const saved = state.routePools.find((item) => item.id === state.currentRoutePoolId);
+    if (saved) state.routePoolDraft = cloneJson(saved);
+    if (!silent) setStatus('✓ 已保存连接池', 'ok');
+    return state.currentRoutePoolId;
+  } catch (err) {
+    if (!silent) setStatus(err && err.message ? err.message : String(err), 'err');
+    return null;
+  } finally {
+    state.routePoolRunning = false;
+    renderRoutePoolDashboard();
+  }
+}
+
+async function applyRoutePoolToCodex() {
+  if (state.routePoolRunning) return;
+  const savedId = await saveRoutePool({ silent: true });
+  if (!savedId) return;
+  state.routePoolRunning = true;
+  renderRoutePoolDashboard();
+  renderRoutePoolStatus('[SYS] 正在配置连接池到 Codex...');
+  setStatus('配置连接池中…', 'warn');
+  try {
+    const r = await window.pywebview.api.route_pool_config_apply(savedId);
+    const log = buildApplyLog(r || {}, '连接池');
+    if (r && r.ok) {
+      state.lastInjectBackup = r.backup_name || null;
+      setStatus('✓ 连接池已配置到 Codex', 'ok');
+      renderRoutePoolStatus(planLog([
+        `[READY] 连接池已配置到 Codex`,
+        r.backup_name ? `[INFO] backup: ${r.backup_name}` : null,
+        r.stdout ? `[INFO] stdout:\n${r.stdout}` : null,
+      ]));
+      await refreshRoutePools();
+      return;
+    }
+    setStatus('连接池配置失败', 'err');
+    renderRoutePoolStatus(log);
+  } catch (err) {
+    setStatus('连接池配置调用失败', 'err');
+    renderRoutePoolStatus(`[ERR] ${err && err.message ? err.message : String(err)}`);
+  } finally {
+    state.routePoolRunning = false;
+    renderRoutePoolDashboard();
+  }
+}
+
+async function restartRoutePoolProxy() {
+  if (state.routePoolRunning) return;
+  state.routePoolRunning = true;
+  renderRoutePoolDashboard();
+  renderRoutePoolStatus('[SYS] 正在重启连接池服务...');
+  setStatus('重启连接池服务中…', 'warn');
+  try {
+    const r = await window.pywebview.api.route_pool_restart_proxy();
+    const lines = [];
+    if (r && r.ok) {
+      setStatus('✓ 连接池服务已重启', 'ok');
+      lines.push('[READY] 连接池服务已重启');
+    } else {
+      setStatus('连接池服务重启失败', 'err');
+      lines.push(`[ERR] ${(r && r.error) || '连接池服务重启失败'}`);
+    }
+    if (r && r.stdout) lines.push(`[INFO] stdout:\n${r.stdout}`);
+    if (r && r.stderr) lines.push(`[WARN] stderr:\n${r.stderr}`);
+    state.routePoolStatus = (r && r.status) || state.routePoolStatus;
+    state.routePoolLastStatusAt = Date.now();
+    renderRoutePoolStatus(lines.join('\n'));
+    await refreshRoutePoolRuntimeStatus({ render: true });
+  } catch (err) {
+    setStatus('连接池服务重启调用失败', 'err');
+    renderRoutePoolStatus(`[ERR] ${err && err.message ? err.message : String(err)}`);
+  } finally {
+    state.routePoolRunning = false;
+    renderRoutePoolDashboard();
+  }
 }
 
 // ---- custom OpenAI-compatible APIs ----
@@ -1436,6 +2546,8 @@ function renderConfigTargetChoices() {
     value: acc.slot,
     label: acc.email || acc.display_name || acc.slot,
   }));
+  const poolLabel = $('#choice-pool-label');
+  if (poolLabel) poolLabel.textContent = '连接池';
   setSelectOptions($('#choice-relay'), relayRows, state.lastDomain || '', '未设置');
   setSelectOptions($('#choice-custom'), customRows, state.currentCustomApi ? state.currentCustomApi.id : '', '未设置');
   setSelectOptions($('#choice-codex'), officialRows, state.currentCodexAccount ? state.currentCodexAccount.slot : '', '未设置');
@@ -1443,6 +2555,16 @@ function renderConfigTargetChoices() {
 }
 
 function updateConfigChoiceMeta() {
+  const pool = (state.routePools || []).find((item) => item.id === state.currentRoutePoolId)
+    || state.routePools[0]
+    || null;
+  const poolMeta = $('#choice-pool-meta');
+  if (poolMeta) {
+    poolMeta.textContent = pool
+      ? `${pool.routes ? pool.routes.length : 0} routes · fail=${(pool.policy && pool.policy.fail_consecutive) || 2}`
+      : '请先点顶部「管理连接池」添加 route 并保存';
+  }
+
   const relayValue = selectValue('#choice-relay');
   const relay = (state.relays || []).find((item) => item.domain === relayValue);
   const relayMeta = $('#choice-relay-meta');
@@ -1483,6 +2605,7 @@ function updateConfigChoiceMeta() {
 
   const buttons = configTargetButtons();
   if (!state.configTargetRunning) {
+    if (buttons.pool) buttons.pool.disabled = !pool || !(pool.routes || []).length;
     if (buttons.relay) buttons.relay.disabled = !relay;
     if (buttons.custom) buttons.custom.disabled = !custom;
     if (buttons.official) buttons.official.disabled = !official;
@@ -1492,6 +2615,7 @@ function updateConfigChoiceMeta() {
 function openConfigTargetModal() {
   resetConfigTargetUi();
   renderConfigTargetChoices();
+  refreshRoutePools();
   $('#config-target-modal').classList.remove('hidden');
 }
 
@@ -1562,6 +2686,22 @@ async function startRelayConfig() {
   applyConfigTarget('relay');
 }
 
+function startPoolConfig() {
+  state.currentInjectTarget = 'pool';
+  const pool = (state.routePools || []).find((item) => item.id === state.currentRoutePoolId)
+    || state.routePools[0]
+    || null;
+  const id = pool ? pool.id : '';
+  if (!id) {
+    renderConfigTargetResult('warn', '没有可配置的连接池', '请先点顶部「管理连接池」添加 route 并保存。', { tag: '[WARN]' });
+    setStatus('请先保存连接池 route', 'warn');
+    return;
+  }
+  state.currentRoutePoolId = id;
+  if (pool) state.routePoolDraft = cloneJson(pool);
+  applyConfigTarget('pool');
+}
+
 function startOfficialConfig() {
   state.currentInjectTarget = 'official';
   const slot = selectValue('#choice-codex');
@@ -1626,6 +2766,7 @@ function resetConfigTargetUi() {
 
 function configTargetButtons() {
   return {
+    pool: $('#btn-config-pool'),
     relay: $('#btn-config-relay'),
     custom: $('#btn-config-custom'),
     official: $('#btn-config-official'),
@@ -1652,12 +2793,17 @@ function setConfigTargetBusy(target, text = '配置中…') {
 }
 
 function configTargetTitle(target) {
+  if (target === 'pool') return '连接池';
   if (target === 'official') return '官方账号';
   if (target === 'custom') return '自定义 API';
   return '中转';
 }
 
 function configTargetDetail(target) {
+  if (target === 'pool') {
+    const pool = (state.routePools || []).find((item) => item.id === state.currentRoutePoolId);
+    return pool ? `${pool.name || pool.id} · ${(pool.routes || []).length} routes` : '未选择连接池';
+  }
   if (target === 'official') {
     const acc = state.currentCodexAccount;
     return acc ? `${acc.email || acc.display_name || acc.slot} · ${acc.plan_label || 'Codex'}` : '未选择官方账号';
@@ -1737,6 +2883,12 @@ async function applyConfigTarget(target) {
   if (state.configTargetRunning) return;
   const isOfficial = target === 'official';
   const isCustom = target === 'custom';
+  const isPool = target === 'pool';
+  if (isPool && !state.currentRoutePoolId) {
+    renderConfigTargetResult('warn', '没有可配置的连接池', '请先选择一个已保存的连接池。', { tag: '[WARN]' });
+    setStatus('请先选择连接池', 'warn');
+    return;
+  }
   if (isOfficial && !state.currentCodexAccount) {
     renderConfigTargetResult('warn', '没有可配置的官方账号', '请先在左侧官号列表新增或选择一个官方账号。', { tag: '[WARN]' });
     setStatus('请先选择官方账号', 'warn');
@@ -1763,6 +2915,8 @@ async function applyConfigTarget(target) {
     let r;
     if (isOfficial) {
       r = await window.pywebview.api.codex_account_config_apply(state.currentCodexAccount && state.currentCodexAccount.slot);
+    } else if (isPool) {
+      r = await window.pywebview.api.route_pool_config_apply(state.currentRoutePoolId);
     } else if (isCustom) {
       r = await window.pywebview.api.custom_api_config_apply(state.currentCustomApi && state.currentCustomApi.id);
     } else {
@@ -1783,6 +2937,7 @@ async function applyConfigTarget(target) {
       );
       setStatus('✓ 配置完成', 'ok');
       if (isOfficial) refreshCodexAccounts();
+      if (isPool) refreshRoutePools();
       return;
     }
 
@@ -2031,7 +3186,7 @@ async function applyInject() {
       { path: '~/.codex/auth.json', detail: '切换到该渠道的 API key 登录文件' },
       { path: '~/.codex/config.toml', detail: '写入 Codex provider 的 base_url/model 配置' },
       { path: '~/Library/Application Support/Codex', detail: '保持或切换 Codex App profile symlink' },
-      { path: 'Codex 历史 session', detail: '必要时归一历史会话 provider, 让旧会话继续走当前渠道' },
+      { path: 'Codex 历史 session', detail: '保留现有历史, 不批量改写旧会话 provider' },
       { path: 'Codex App', detail: '需要时重新打开以加载新配置' },
     ]),
   });
@@ -3116,9 +4271,39 @@ $('#health-modal').addEventListener('click', (e) => {
 });
 
 $('#btn-inject').addEventListener('click', openConfigTargetModal);
+$('#btn-manage-pool').addEventListener('click', showRoutePoolDashboard);
+const routePoolSelect = $('#route-pool-select');
+if (routePoolSelect) routePoolSelect.addEventListener('change', () => selectRoutePoolDraft(selectValue('#route-pool-select')));
+const routePoolNew = $('#btn-route-pool-new');
+if (routePoolNew) routePoolNew.addEventListener('click', createRoutePoolDraft);
+const btnRoutePoolToggleAdd = $('#btn-route-pool-toggle-add');
+if (btnRoutePoolToggleAdd) btnRoutePoolToggleAdd.addEventListener('click', toggleRoutePoolEditor);
+const btnRoutePoolRefresh = $('#btn-route-pool-refresh');
+if (btnRoutePoolRefresh) btnRoutePoolRefresh.addEventListener('click', () => refreshRoutePools({ preserveDraft: true }));
+const btnRoutePoolRestart = $('#btn-route-pool-restart');
+if (btnRoutePoolRestart) btnRoutePoolRestart.addEventListener('click', restartRoutePoolProxy);
+const btnRoutePoolSave = $('#btn-route-pool-save');
+if (btnRoutePoolSave) btnRoutePoolSave.addEventListener('click', () => saveRoutePool());
+const btnRoutePoolAddRoute = $('#btn-route-pool-add-route');
+if (btnRoutePoolAddRoute) btnRoutePoolAddRoute.addEventListener('click', addSelectedRouteToPool);
+const routePoolSourceType = $('#route-pool-source-type');
+if (routePoolSourceType) routePoolSourceType.addEventListener('change', handleRoutePoolSourceTypeChange);
+const routePoolRelayDomain = $('#route-pool-relay-domain');
+if (routePoolRelayDomain) routePoolRelayDomain.addEventListener('change', handleRoutePoolRelayDomainChange);
+const routePoolContextDelete = $('#route-pool-context-delete');
+if (routePoolContextDelete) routePoolContextDelete.addEventListener('click', deleteRoutePoolContextRoute);
+const routePoolContextMenu = $('#route-pool-context-menu');
+if (routePoolContextMenu) {
+  routePoolContextMenu.addEventListener('click', (e) => e.stopPropagation());
+  routePoolContextMenu.addEventListener('contextmenu', (e) => e.preventDefault());
+}
 $('#btn-config-target-close').addEventListener('click', closeConfigTargetModal);
-$('#btn-config-relay').addEventListener('click', startRelayConfig);
-$('#btn-config-custom').addEventListener('click', startCustomConfig);
+const btnConfigPool = $('#btn-config-pool');
+if (btnConfigPool) btnConfigPool.addEventListener('click', startPoolConfig);
+const btnConfigRelay = $('#btn-config-relay');
+if (btnConfigRelay) btnConfigRelay.addEventListener('click', startRelayConfig);
+const btnConfigCustom = $('#btn-config-custom');
+if (btnConfigCustom) btnConfigCustom.addEventListener('click', startCustomConfig);
 $('#btn-config-official').addEventListener('click', startOfficialConfig);
 ['choice-relay', 'choice-custom', 'choice-codex'].forEach((id) => {
   const select = $('#' + id);
@@ -3175,6 +4360,7 @@ $('#add-codex-account-modal').addEventListener('click', (e) => {
   });
 });
 document.addEventListener('click', (e) => {
+  closeRoutePoolContextMenu();
   const pop = $('#account-pop');
   if (pop.classList.contains('hidden')) return;
   if (!pop.contains(e.target) && e.target.id !== 'btn-account') closeAccountPop();
@@ -3186,6 +4372,7 @@ $('#inject-modal').addEventListener('click', (e) => {
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
+    closeRoutePoolContextMenu();
     if (!$('#health-modal').classList.contains('hidden')) closeHealthModal();
     if (!$('#config-target-modal').classList.contains('hidden')) closeConfigTargetModal();
     if (!$('#inject-modal').classList.contains('hidden')) closeInjectModal();

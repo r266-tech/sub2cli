@@ -49,12 +49,15 @@ CODEX_AUTH_REFRESH_TIMEOUT = 25
 CODEX_PROVIDER_HOME_PATH = Path(os.environ.get("CODEX_PROVIDER_HOME", str(Path.home()))).expanduser()
 CODEX_HOME_PATH = Path(os.environ.get("CODEX_HOME", str(CODEX_PROVIDER_HOME_PATH / ".codex"))).expanduser()
 PROVIDER_SLOTS_PATH = CODEX_HOME_PATH / "provider-slots.json"
+ROUTE_POOL_LOG_PATH = CODEX_HOME_PATH / "sub2cli-responses-proxy.log"
 CODEX_APP_SUPPORT_PATH = CODEX_PROVIDER_HOME_PATH / "Library" / "Application Support"
 CODEXBAR_MANAGED_ACCOUNTS_PATH = (
     CODEX_APP_SUPPORT_PATH / "CodexBar" / "managed-codex-accounts.json"
 )
 CODEXBAR_MANAGED_HOMES_PATH = CODEX_APP_SUPPORT_PATH / "CodexBar" / "managed-codex-homes"
 CODEX_LOCK_PATH = CODEX_HOME_PATH / ".sub2cli-inject.lock"
+INJECT_BACKUP_ROOT = CODEX_HOME_PATH / "provider-switch-backups"
+AUTO_ROLLBACK_MARKER = ".auto-rollback-done"
 UPDATE_CACHE_DIR = Path.home() / "Library" / "Caches" / "sub2cli" / "updates"
 UPDATE_LOG_PATH = Path.home() / "Library" / "Logs" / "sub2cli-updater.log"
 
@@ -577,6 +580,31 @@ def _rollback_inject_backup(inject_bin: str, backup_name: str | None) -> dict[st
         "stderr": proc.stderr,
         "returncode": proc.returncode,
     }
+
+
+def _inject_cli_auto_rollback_result(backup_name: str | None) -> dict[str, Any] | None:
+    if not backup_name or not re.fullmatch(r"[A-Za-z0-9._-]+", backup_name):
+        return None
+    marker = INJECT_BACKUP_ROOT / backup_name / AUTO_ROLLBACK_MARKER
+    if not marker.exists():
+        return None
+    try:
+        detail = marker.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        detail = ""
+    suffix = f" {detail}" if detail else ""
+    return {
+        "ok": True,
+        "backup_name": backup_name,
+        "stdout": f"sub2cli-inject already auto-rolled back.{suffix}",
+        "stderr": "",
+        "returncode": 0,
+        "source": "inject-cli",
+    }
+
+
+def _rollback_inject_backup_if_needed(inject_bin: str, backup_name: str | None) -> dict[str, Any] | None:
+    return _inject_cli_auto_rollback_result(backup_name) or _rollback_inject_backup(inject_bin, backup_name)
 
 
 def _home_path(path: str | Path | None) -> str:
@@ -1914,6 +1942,202 @@ def _unique_custom_api_id(base: str, used: set[str]) -> str:
     return fallback
 
 
+# ---- route pools (priority-ordered local failover/fallback targets) ----
+#
+# Saved pool metadata keeps only route references: relay key ids or custom API
+# ids, endpoint/model/protocol/policy, and user-facing labels. API keys are
+# resolved only when applying the pool, then passed to sub2cli-inject through a
+# short-lived 0600 temp JSON file that is deleted immediately after use.
+
+def _route_pools(cfg: dict) -> list[dict]:
+    pools = cfg.get("route_pools")
+    if not isinstance(pools, list):
+        pools = []
+        cfg["route_pools"] = pools
+    return pools
+
+
+def _find_route_pool(cfg: dict, pool_id: str) -> dict | None:
+    for entry in _route_pools(cfg):
+        if isinstance(entry, dict) and entry.get("id") == pool_id:
+            return entry
+    return None
+
+
+def _route_pool_id_slug(value: str | None, fallback: str = "pool") -> str:
+    text = (value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9_.-]+", "-", text).strip("-_.")
+    if not text or not re.match(r"^[a-z0-9]", text):
+        text = fallback
+    return text[:48]
+
+
+def _unique_route_pool_id(base: str, used: set[str]) -> str:
+    slug = _route_pool_id_slug(base, "pool")
+    if slug not in used:
+        used.add(slug)
+        return slug
+    for i in range(2, 1000):
+        suffix = f"-{i}"
+        candidate = f"{slug[:48 - len(suffix)]}{suffix}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+    fallback = f"{slug[:40]}-{os.urandom(3).hex()}"
+    used.add(fallback)
+    return fallback
+
+
+def _route_pool_policy(policy: dict | None = None) -> dict:
+    raw = policy if isinstance(policy, dict) else {}
+
+    def _int(name: str, default: int, min_value: int, max_value: int) -> int:
+        try:
+            value = int(raw.get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(min_value, min(max_value, value))
+
+    def _cooldowns(default: list[int]) -> list[int]:
+        value = raw.get("cooldown_seconds", default)
+        items = value if isinstance(value, list) else [value]
+        out: list[int] = []
+        for item in items:
+            try:
+                out.append(max(5, min(3600, int(item))))
+            except (TypeError, ValueError):
+                continue
+        return out or default
+
+    return {
+        "fail_consecutive": _int("fail_consecutive", 2, 1, 20),
+        "recovery_successes": _int("recovery_successes", 2, 1, 20),
+        "cooldown_seconds": _cooldowns([60, 120, 300]),
+        "min_dwell_seconds": _int("min_dwell_seconds", 60, 0, 3600),
+        "probe_interval_seconds": _int("probe_interval_seconds", 90, 5, 3600),
+        "current_probe_interval_seconds": _int("current_probe_interval_seconds", 0, 0, 3600),
+        "rate_limit_cooldown_seconds": _int("rate_limit_cooldown_seconds", 120, 1, 7200),
+    }
+
+
+def _route_pool_log_lines(limit: int = 120) -> list[str]:
+    try:
+        if not ROUTE_POOL_LOG_PATH.exists():
+            return []
+        lines = ROUTE_POOL_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = [line for line in lines if _is_route_pool_event_log(line)]
+        return lines[-max(1, min(500, int(limit))):]
+    except Exception as exc:  # noqa: BLE001
+        return [f"[WARN] route pool log read failed: {type(exc).__name__}: {exc}"]
+
+
+def _is_route_pool_event_log(line: str) -> bool:
+    return bool(re.search(r"\bpool (?:route|monitor)\b", str(line), flags=re.IGNORECASE))
+
+
+def _sanitize_route_pool_route(route: dict, index: int) -> dict | None:
+    if not isinstance(route, dict):
+        return None
+    source_type = str(route.get("source_type") or route.get("type") or "").strip().lower()
+    if source_type not in {"relay", "custom"}:
+        return None
+    route_id = _route_pool_id_slug(route.get("id") or route.get("label") or f"route-{index}", f"route-{index}")
+    label = str(route.get("label") or route.get("name") or route_id).strip() or route_id
+    try:
+        priority = int(route.get("priority", index * 10))
+    except (TypeError, ValueError):
+        priority = index * 10
+    protocol = str(route.get("protocol") or ("chat" if source_type == "custom" else "responses")).strip().lower()
+    if protocol not in {"responses", "chat"}:
+        protocol = "chat" if source_type == "custom" else "responses"
+    clean = {
+        "id": route_id,
+        "label": label[:120],
+        "source_type": source_type,
+        "priority": max(1, min(100000, priority)),
+        "protocol": protocol,
+        "model": str(route.get("model") or "").strip(),
+        "notes": str(route.get("notes") or "").strip()[:240],
+    }
+    if source_type == "relay":
+        key_id = route.get("key_id")
+        if key_id in (None, ""):
+            return None
+        clean.update({
+            "relay_domain": str(route.get("relay_domain") or "").strip(),
+            "key_id": key_id,
+            "key_name": str(route.get("key_name") or "").strip(),
+            "key_masked": str(route.get("key_masked") or "").strip(),
+            "group_id": route.get("group_id"),
+            "group_name": str(route.get("group_name") or "").strip(),
+            "group_rate": route.get("group_rate"),
+            "endpoint_name": str(route.get("endpoint_name") or "").strip(),
+            "base_url": str(route.get("base_url") or "").strip(),
+        })
+    else:
+        api_id = str(route.get("custom_api_id") or route.get("source_id") or "").strip()
+        if not api_id:
+            return None
+        clean.update({
+            "custom_api_id": api_id,
+            "custom_api_name": str(route.get("custom_api_name") or "").strip(),
+            "base_url": str(route.get("base_url") or "").strip(),
+        })
+    return clean
+
+
+def _sanitize_route_pool(pool: dict, *, existing_id: str | None = None, used_ids: set[str] | None = None) -> dict:
+    if not isinstance(pool, dict):
+        pool = {}
+    name = str(pool.get("name") or pool.get("id") or "连接池").strip() or "连接池"
+    used = used_ids if used_ids is not None else set()
+    requested_id = str(pool.get("id") or existing_id or name).strip()
+    pool_id = existing_id or _unique_route_pool_id(requested_id or name, used)
+    routes = []
+    seen_routes: set[str] = set()
+    for idx, route in enumerate(pool.get("routes") or [], 1):
+        clean = _sanitize_route_pool_route(route, idx)
+        if not clean:
+            continue
+        rid = clean["id"]
+        if rid in seen_routes:
+            rid = _unique_route_pool_id(rid, seen_routes)
+            clean["id"] = rid
+        seen_routes.add(rid)
+        routes.append(clean)
+    routes.sort(key=lambda item: int(item.get("priority", 99999)))
+    return {
+        "id": pool_id,
+        "name": name[:80],
+        "description": str(pool.get("description") or "").strip()[:240],
+        "model": str(pool.get("model") or "").strip(),
+        "policy": _route_pool_policy(pool.get("policy") if isinstance(pool.get("policy"), dict) else {}),
+        "routes": routes,
+        "updated_at": int(time.time()),
+        "created_at": int(pool.get("created_at") or time.time()),
+    }
+
+
+def _mask_many_secret_text(text: str, secrets: list[str]) -> str:
+    masked = text
+    for secret in secrets:
+        if secret:
+            masked = _mask_secret_text(masked, secret)
+    return masked
+
+
+def _mask_many_result_texts(result: dict | None, secrets: list[str]) -> dict | None:
+    if not isinstance(result, dict):
+        return result
+    masked = dict(result)
+    for key in ("stdout", "stderr", "error", "plan_text"):
+        if key in masked and isinstance(masked[key], str):
+            masked[key] = _mask_many_secret_text(masked[key], secrets)
+    if isinstance(masked.get("auto_rollback"), dict):
+        masked["auto_rollback"] = _mask_many_result_texts(masked["auto_rollback"], secrets)
+    return masked
+
+
 class JsApi:
     """Thread-safe-ish wrapper around Sub2Context for the pywebview bridge.
 
@@ -1990,6 +2214,79 @@ class JsApi:
             "is_test_key": k.get("name") == sub2cli_lib.TEST_KEY_NAME,
             "is_codex_key": bool(k.get("_is_codex_key")),
         }
+
+    @staticmethod
+    def _relay_site_label(domain: str) -> str:
+        return (
+            sub2cli_lib._normalize_domain(domain)
+            .replace("https://", "")
+            .replace("http://", "")
+            .rstrip("/")
+        )
+
+    @staticmethod
+    def _relay_saved_emails(cfg: dict, domain: str) -> list[str]:
+        ad = (cfg.get("accounts") or {}).get(domain) or {}
+        emails: list[str] = []
+        current = ad.get("current")
+        if current:
+            emails.append(current)
+        for account in ad.get("saved") or []:
+            email = account.get("email") if isinstance(account, dict) else None
+            if email and email not in emails:
+                emails.append(email)
+        return emails
+
+    def _relay_ctx_for_domain(self, cfg: dict, domain: str) -> Any:
+        """Build an authenticated context for a saved relay without switching cfg."""
+        current = cfg.get("domain")
+        if current == domain and self._ctx is not None:
+            ctx, _cfg = self._ensure_ctx()
+            return ctx
+        ctx = Sub2Context(domain)
+        for email in self._relay_saved_emails(cfg, domain):
+            token = _kc_get(domain, email)
+            if token:
+                ctx.set_token(token)
+                return ctx
+        if _try_relogin_with_saved_creds(ctx, cfg):
+            return ctx
+        raise RuntimeError("需要先登录该中转站")
+
+    def _route_pool_relay_source(self, cfg: dict, domain: str, *, load: bool = False) -> dict:
+        relays = cfg.get("relays") or {}
+        relay_cfg = relays.get(domain) or {}
+        source = {
+            "domain": domain,
+            "site": self._relay_site_label(domain),
+            "is_current": domain == cfg.get("domain"),
+            "loaded": False,
+            "keys": [],
+            "endpoints": [],
+            "current_endpoint_url": relay_cfg.get("default_endpoint_url") or "",
+            "current_endpoint_name": relay_cfg.get("default_endpoint_name") or "",
+            "error": "",
+        }
+        if not load:
+            return source
+        try:
+            ctx = self._relay_ctx_for_domain(cfg, domain)
+            keys = ctx.fetch_keys()
+            codex_key = sub2cli_lib.find_codex_key(keys, relay_cfg)
+            keys = self._mark_codex_key(keys, codex_key)
+            settings = ctx.fetch_settings() or {}
+            endpoints = sub2cli_lib.collect_endpoints(settings, fallback_site=ctx.domain)
+            source.update({
+                "loaded": True,
+                "keys": [self._serialize_key(k) for k in keys],
+                "endpoints": [self._serialize_endpoint(e) for e in endpoints],
+                "current_endpoint_url": relay_cfg.get("default_endpoint_url") or "",
+                "current_endpoint_name": relay_cfg.get("default_endpoint_name") or "",
+                "error": "",
+            })
+        except Exception as exc:  # noqa: BLE001
+            source["error"] = f"需先登录或刷新: {exc}"
+        return source
 
     @staticmethod
     def _same_key_id(left: Any, right: Any) -> bool:
@@ -2898,7 +3195,7 @@ class JsApi:
             stdout = _coerce_proc_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
             stderr = _coerce_proc_text(getattr(exc, "stderr", None))
             backup_name = _extract_rollback_backup(stdout)
-            rollback_result = _rollback_inject_backup(inject_bin, backup_name) if backup_name else None
+            rollback_result = _rollback_inject_backup_if_needed(inject_bin, backup_name) if backup_name else None
             return {
                 "ok": False,
                 "error": f"配置超过 {timeout} 秒仍未完成",
@@ -2937,7 +3234,7 @@ class JsApi:
         backup_name = _extract_rollback_backup(proc.stdout)
         rollback_result = None
         if proc.returncode != 0 and backup_name:
-            rollback_result = _rollback_inject_backup(inject_bin, backup_name)
+            rollback_result = _rollback_inject_backup_if_needed(inject_bin, backup_name)
         return {
             "ok": proc.returncode == 0,
             "stdout": _mask_secret_text(proc.stdout, api_key),
@@ -2946,6 +3243,312 @@ class JsApi:
             "backup_name": backup_name,
             "rollback_command": f"sub2cli-inject rollback {backup_name}" if backup_name else None,
             "auto_rollback": _mask_result_texts(rollback_result, api_key),
+        }
+
+    def _run_inject_add_pool(self, pool: dict, routes: list[dict], secrets: list[str]) -> dict:
+        """Apply a saved route pool through `sub2cli-inject add-pool`.
+
+        `routes` already contains resolved api_key values. The saved pool in
+        sub2cli config never stores them.
+        """
+        inject_bin = self._resolve_inject_bin()
+        if not inject_bin:
+            return {"ok": False, "error": "找不到 sub2cli-inject 二进制"}
+        if not routes:
+            return {"ok": False, "error": "连接池至少需要一条 route"}
+        payload = {
+            "policy": _route_pool_policy(pool.get("policy") if isinstance(pool.get("policy"), dict) else {}),
+            "routes": routes,
+        }
+        tmp: tempfile.NamedTemporaryFile | None = None
+        try:
+            tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix="-sub2cli-routes.json", delete=False)
+            json.dump(payload, tmp, ensure_ascii=False)
+            tmp.flush()
+            tmp.close()
+            slot = _route_pool_id_slug(pool.get("id") or pool.get("name") or "pool")
+            display = f"Codex - {pool.get('name') or slot} route pool"
+            cmd = [inject_bin, "add-pool", slot, "--routes-json", tmp.name, "--display", display]
+            model = str(pool.get("model") or "").strip()
+            if model:
+                cmd.extend(["--model", model])
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    env=_inject_subprocess_env(),
+                    timeout=INJECT_APPLY_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired as exc:
+                stdout = _coerce_proc_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
+                stderr = _coerce_proc_text(getattr(exc, "stderr", None))
+                backup_name = _extract_rollback_backup(stdout)
+                rollback_result = _rollback_inject_backup_if_needed(inject_bin, backup_name) if backup_name else None
+                return _mask_many_result_texts({
+                    "ok": False,
+                    "error": f"配置连接池超过 {INJECT_APPLY_TIMEOUT} 秒仍未完成",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "returncode": None,
+                    "backup_name": backup_name,
+                    "rollback_command": f"sub2cli-inject rollback {backup_name}" if backup_name else None,
+                    "auto_rollback": rollback_result,
+                }, secrets)
+            except Exception as exc:
+                return {"ok": False, "error": _mask_many_secret_text(f"{type(exc).__name__}: {exc}", secrets)}
+
+            backup_name = _extract_rollback_backup(proc.stdout)
+            rollback_result = None
+            if proc.returncode != 0 and backup_name:
+                rollback_result = _rollback_inject_backup_if_needed(inject_bin, backup_name)
+            return _mask_many_result_texts({
+                "ok": proc.returncode == 0,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "returncode": proc.returncode,
+                "backup_name": backup_name,
+                "rollback_command": f"sub2cli-inject rollback {backup_name}" if backup_name else None,
+                "auto_rollback": rollback_result,
+            }, secrets)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+    def _route_pool_candidates(self, cfg: dict) -> dict:
+        """Build current selectable route sources for the GUI."""
+        relay_keys: list[dict] = []
+        relay_endpoints: list[dict] = []
+        relay_domain = cfg.get("domain")
+        relays = cfg.get("relays") or {}
+        if relay_domain and relay_domain not in relays:
+            relays = {**relays, relay_domain: {f: cfg.get(f) for f in sub2cli_lib.RELAY_FIELDS}}
+        relay_sources = [
+            self._route_pool_relay_source(cfg, domain, load=(domain == relay_domain))
+            for domain in relays.keys()
+        ]
+        try:
+            current_source = next((source for source in relay_sources if source.get("domain") == relay_domain), None)
+            if current_source:
+                relay_keys = current_source.get("keys") or []
+                relay_endpoints = current_source.get("endpoints") or []
+        except Exception:
+            relay_keys = []
+            relay_endpoints = []
+        current_endpoint = cfg.get("default_endpoint_url") or ""
+        custom_apis = [
+            self._serialize_custom_api(e, current_id=cfg.get("current_custom_api"))
+            for e in _custom_apis(cfg)
+            if isinstance(e, dict) and e.get("id")
+        ]
+        return {
+            "relay_domain": relay_domain,
+            "relay_sources": relay_sources,
+            "relay_keys": relay_keys,
+            "relay_endpoints": relay_endpoints,
+            "current_endpoint_url": current_endpoint,
+            "current_endpoint_name": cfg.get("default_endpoint_name") or "",
+            "custom_apis": custom_apis,
+        }
+
+    def route_pool_relay_source(self, domain: str) -> dict:
+        """Load keys/endpoints for one saved relay selected in the route pool UI."""
+        domain = (domain or "").strip()
+        cfg = sub2cli_lib.load_config() or {}
+        relays = cfg.get("relays") or {}
+        if domain not in relays:
+            return {"ok": False, "error": f"未保存的中转站: {domain}"}
+        source = self._route_pool_relay_source(cfg, domain, load=True)
+        return {"ok": not bool(source.get("error")), "source": source, "error": source.get("error") or ""}
+
+    def list_route_pools(self) -> dict:
+        """Saved route pools and current selectable route sources."""
+        cfg = sub2cli_lib.load_config() or {}
+        pools = [
+            _sanitize_route_pool(e, existing_id=e.get("id"))
+            for e in _route_pools(cfg)
+            if isinstance(e, dict) and e.get("id")
+        ]
+        current_id = cfg.get("current_route_pool")
+        if current_id and not any(p["id"] == current_id for p in pools):
+            current_id = pools[0]["id"] if pools else None
+        return {
+            "ok": True,
+            "pools": pools,
+            "current_id": current_id,
+            "candidates": self._route_pool_candidates(cfg),
+            "status": self.route_pool_status(),
+        }
+
+    def save_route_pool(self, pool: dict) -> dict:
+        """Create/update a saved route pool. Secrets are intentionally omitted."""
+        with self._lock:
+            cfg = sub2cli_lib.load_config() or {}
+            pools = _route_pools(cfg)
+            requested_id = str((pool or {}).get("id") or "").strip()
+            existing = _find_route_pool(cfg, requested_id) if requested_id else None
+            used = {e.get("id") for e in pools if isinstance(e, dict) and e.get("id")}
+            if existing:
+                clean = _sanitize_route_pool(pool, existing_id=existing.get("id"))
+                clean["created_at"] = existing.get("created_at") or clean["created_at"]
+                index = pools.index(existing)
+                pools[index] = clean
+            else:
+                clean = _sanitize_route_pool(pool, used_ids=used)
+                pools.append(clean)
+            cfg["current_route_pool"] = clean["id"]
+            sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
+        listing = self.list_route_pools()
+        listing["saved_id"] = clean["id"]
+        return listing
+
+    def _resolve_route_pool_routes(self, cfg: dict, pool: dict) -> tuple[list[dict], list[str], str | None]:
+        routes: list[dict] = []
+        secrets: list[str] = []
+        relay_cache: dict[str, tuple[Any, dict, list[dict]]] = {}
+
+        def _relay_ctx(domain: str) -> tuple[Any, dict, list[dict]] | None:
+            if domain in relay_cache:
+                return relay_cache[domain]
+            relays = cfg.get("relays") or {}
+            relay_cfg = cfg if domain == cfg.get("domain") else (relays.get(domain) or {})
+            ctx = self._relay_ctx_for_domain(cfg, domain or cfg.get("domain") or "")
+            keys = ctx.fetch_keys()
+            relay_cache[domain or ctx.domain] = (ctx, relay_cfg, keys)
+            return relay_cache[domain or ctx.domain]
+
+        for idx, route in enumerate(pool.get("routes") or [], 1):
+            source_type = route.get("source_type")
+            if source_type == "relay":
+                domain = str(route.get("relay_domain") or cfg.get("domain") or "").strip()
+                try:
+                    relay = _relay_ctx(domain)
+                except Exception as exc:  # noqa: BLE001
+                    return [], secrets, f"无法读取中转 {domain}: {exc}"
+                _ctx, relay_cfg, keys = relay
+                try:
+                    key_id = int(route.get("key_id"))
+                except (TypeError, ValueError):
+                    return [], secrets, f"route {route.get('label') or idx} 的 key id 无效"
+                key = sub2cli_lib.find_key_by_id(keys, key_id)
+                if not key:
+                    return [], secrets, f"找不到 relay key: {route.get('key_name') or key_id}"
+                api_key = key.get("key") or ""
+                base_url = route.get("base_url") or relay_cfg.get("default_endpoint_url") or sub2cli_lib.normalize_v1(_ctx.domain)
+                group = key.get("group") or {}
+                label = route.get("label") or f"{key.get('name') or key_id} · {group.get('name') or 'default'}"
+                resolved = {
+                    "id": _route_pool_id_slug(route.get("id") or f"relay-{idx}", f"relay-{idx}"),
+                    "label": label,
+                    "priority": int(route.get("priority") or idx * 10),
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "protocol": route.get("protocol") or "responses",
+                    "model": route.get("model") or pool.get("model") or "",
+                    "group": route.get("group_name") or group.get("name"),
+                    "group_id": route.get("group_id") or group.get("id"),
+                    "endpoint": route.get("endpoint_name") or relay_cfg.get("default_endpoint_name"),
+                }
+                routes.append(resolved)
+                secrets.append(api_key)
+                continue
+
+            if source_type == "custom":
+                api_id = str(route.get("custom_api_id") or "").strip()
+                entry = _find_custom_api(cfg, api_id)
+                if not entry:
+                    return [], secrets, f"找不到自定义 API: {api_id}"
+                api_key = _kc_custom_api_get(api_id) or ""
+                if not api_key:
+                    return [], secrets, f"Keychain 里没有自定义 API 的 Key: {api_id}"
+                base_url = entry.get("base_url") or route.get("base_url") or ""
+                label = route.get("label") or entry.get("name") or api_id
+                routes.append({
+                    "id": _route_pool_id_slug(route.get("id") or f"custom-{idx}", f"custom-{idx}"),
+                    "label": label,
+                    "priority": int(route.get("priority") or idx * 10),
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "protocol": route.get("protocol") or "chat",
+                    "model": route.get("model") or pool.get("model") or "",
+                    "notes": route.get("notes") or "custom-api",
+                })
+                secrets.append(api_key)
+                continue
+
+            return [], secrets, f"未知 route 类型: {source_type}"
+
+        routes.sort(key=lambda item: int(item.get("priority", 99999)))
+        return routes, secrets, None
+
+    def route_pool_config_apply(self, pool_id: str) -> dict:
+        """Configure Codex to a saved route pool."""
+        pool_id = (pool_id or "").strip()
+        if not pool_id:
+            return {"ok": False, "error": "缺少连接池 id"}
+        with self._lock:
+            cfg = sub2cli_lib.load_config() or {}
+            pool = _find_route_pool(cfg, pool_id)
+            if not pool:
+                return {"ok": False, "error": f"未保存的连接池: {pool_id}"}
+            clean_pool = _sanitize_route_pool(pool, existing_id=pool_id)
+            if not clean_pool.get("routes"):
+                return {"ok": False, "error": "连接池至少需要一条 route"}
+            routes, secrets, error = self._resolve_route_pool_routes(cfg, clean_pool)
+            if error:
+                return {"ok": False, "error": error}
+            result = self._run_inject_add_pool(clean_pool, routes, secrets)
+            if result.get("ok"):
+                cfg["current_route_pool"] = clean_pool["id"]
+                sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
+                result["pool_id"] = clean_pool["id"]
+        return result
+
+    def route_pool_status(self) -> dict:
+        """Best-effort snapshot from the local pool proxy."""
+        url = "http://127.0.0.1:18765/poolz"
+        logs = _route_pool_log_lines()
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=0.8) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            return {"ok": True, "snapshot": data, "logs": logs}
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "logs": logs}
+
+    def route_pool_restart_proxy(self) -> dict:
+        """Restart only the local route-pool proxy process."""
+        inject_bin = self._resolve_inject_bin()
+        if not inject_bin:
+            return {"ok": False, "error": "找不到 sub2cli-inject 二进制"}
+        try:
+            proc = subprocess.run(
+                [inject_bin, "restart-proxy"],
+                capture_output=True,
+                text=True,
+                env=_inject_subprocess_env(),
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "error": "重启连接池代理超过 30 秒仍未完成",
+                "stdout": _coerce_proc_text(getattr(exc, "stdout", None) or getattr(exc, "output", None)),
+                "stderr": _coerce_proc_text(getattr(exc, "stderr", None)),
+                "status": self.route_pool_status(),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "status": self.route_pool_status()}
+        return {
+            "ok": proc.returncode == 0,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "returncode": proc.returncode,
+            "status": self.route_pool_status(),
         }
 
     def inject_plan(self) -> dict:
@@ -3749,7 +4352,7 @@ class JsApi:
             stdout = _coerce_proc_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
             stderr = _coerce_proc_text(getattr(exc, "stderr", None))
             backup_name = _extract_rollback_backup(stdout)
-            rollback_result = _rollback_inject_backup(inject_bin, backup_name) if backup_name else None
+            rollback_result = _rollback_inject_backup_if_needed(inject_bin, backup_name) if backup_name else None
             return {
                 "ok": False,
                 "error": f"配置超过 {INJECT_APPLY_TIMEOUT} 秒仍未完成",
@@ -3765,7 +4368,7 @@ class JsApi:
         backup_name = _extract_rollback_backup(proc.stdout)
         rollback_result = None
         if proc.returncode != 0 and backup_name:
-            rollback_result = _rollback_inject_backup(inject_bin, backup_name)
+            rollback_result = _rollback_inject_backup_if_needed(inject_bin, backup_name)
         return {
             "ok": proc.returncode == 0,
             "stdout": proc.stdout,

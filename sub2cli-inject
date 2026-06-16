@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import tty
 
@@ -61,6 +62,8 @@ DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
 PROTOCOL_PROXY_PORT = int(os.environ.get("SUB2CLI_PROTOCOL_PROXY_PORT", "18765"))
 PROTOCOL_PROXY_BASE_URL = f"http://127.0.0.1:{PROTOCOL_PROXY_PORT}/v1"
 PROTOCOL_PROXY_LOG = CODEX_HOME / "sub2cli-responses-proxy.log"
+POOL_PLACEHOLDER_API_KEY = "sk-sub2cli-local-route-pool"
+PROXY_STARTED_AT = time.time()
 CODEX_APP_BUNDLE = Path(os.environ.get("SUB2CLI_CODEX_APP", "/Applications/Codex.app")).expanduser()
 # Derive the bundled CLI from CODEX_APP_BUNDLE so a non-/Applications install
 # (via SUB2CLI_CODEX_APP) still finds the codex binary inside its own bundle.
@@ -73,7 +76,7 @@ FORCE_QUIT_CODEX = os.environ.get("SUB2CLI_CODEX_FORCE_QUIT", "1").lower() not i
     "no",
     "off",
 }
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.2.4"
 APP_URL = os.environ.get(
     "SUB2CLI_URL",
     os.environ.get("CODEX_PROVIDER_URL", "https://github.com/r266-tech/sub2cli"),
@@ -115,6 +118,19 @@ class ChineseHelpFormatter(argparse.HelpFormatter):
 def fail(message: str, code: int = 2) -> None:
     print(f"错误：{message}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def fresh_urlopen(req: str | urlrequest.Request, *, timeout: float):
+    """Open a URL without urllib's process-global opener cache.
+
+    The route-pool proxy is a long-lived process. Python's default
+    urlrequest.urlopen installs and reuses a global opener, including proxy
+    settings captured from the environment/system at first use. If Clash or the
+    macOS system proxy restarts, that stale opener can keep sending every
+    upstream request to a dead local proxy until sub2cli's pool process is
+    restarted. Building an opener per upstream call keeps proxy discovery fresh.
+    """
+    return urlrequest.build_opener().open(req, timeout=timeout)
 
 
 # ==================== File lock ====================
@@ -534,20 +550,22 @@ def codex_cli_app_server_control_pids() -> list[int]:
     can cache the pre-switch auth mode until restarted.
     """
     pids: set[int] = set()
-    if CODEX_APP_SERVER_CONTROL_SOCKET.exists():
-        try:
-            proc = subprocess.run(
-                ["lsof", "-t", "-nP", str(CODEX_APP_SERVER_CONTROL_SOCKET)],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            pids.update(_parse_pid_lines(proc.stdout))
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+    if not CODEX_APP_SERVER_CONTROL_SOCKET.exists():
+        return []
+    try:
+        proc = subprocess.run(
+            ["lsof", "-t", "-nP", str(CODEX_APP_SERVER_CONTROL_SOCKET)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        pids.update(_parse_pid_lines(proc.stdout))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     if pids:
         return sorted(pid for pid in pids if pid != os.getpid())
 
+    socket_ref = str(CODEX_APP_SERVER_CONTROL_SOCKET)
     proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True)
     for line in proc.stdout.splitlines():
         stripped = line.strip()
@@ -560,6 +578,8 @@ def codex_cli_app_server_control_pids() -> list[int]:
         if " app-server " not in f" {command} ":
             continue
         if "--listen unix://" not in command:
+            continue
+        if socket_ref not in command:
             continue
         if "app-server-broker" in command:
             continue
@@ -955,7 +975,7 @@ def probe_relay(base_url: str, api_key: str, timeout: float = 12.0) -> tuple[boo
         },
     )
     try:
-        with urlrequest.urlopen(req, timeout=timeout) as resp:
+        with fresh_urlopen(req, timeout=timeout) as resp:
             body = resp.read(8192)
         parsed = json.loads(body)
         if isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
@@ -988,6 +1008,18 @@ def models_endpoint(base_url: str) -> str:
     return f"{cleaned}/v1/models"
 
 
+def responses_endpoint(base_url: str) -> str:
+    cleaned = base_url.strip().rstrip("/")
+    if not cleaned:
+        return ""
+    lowered = cleaned.lower()
+    if lowered.endswith("/responses"):
+        return cleaned
+    if lowered.endswith("/v1"):
+        return f"{cleaned}/responses"
+    return f"{cleaned}/v1/responses"
+
+
 def fetch_relay_models(base_url: str, api_key: str, timeout: float = 12.0) -> tuple[list[str], str | None]:
     endpoint = models_endpoint(base_url)
     if not endpoint:
@@ -1001,7 +1033,7 @@ def fetch_relay_models(base_url: str, api_key: str, timeout: float = 12.0) -> tu
         },
     )
     try:
-        with urlrequest.urlopen(req, timeout=timeout) as resp:
+        with fresh_urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read(2 * 1024 * 1024))
     except urlerror.HTTPError as exc:
         return [], f"HTTP {exc.code} {exc.reason}"
@@ -1393,27 +1425,541 @@ def chat_sse_to_response_json(raw: bytes) -> dict:
     })
 
 
-def _active_chat_proxy_slot() -> dict:
+def _active_proxy_slot() -> dict:
     data = load_slots(required=False)
     slot = data.get("current")
     cfg = (data.get("slots") or {}).get(slot) or {}
-    if cfg.get("mode") != "relay" or cfg.get("protocol") != "chat":
-        raise RuntimeError("当前渠道不是 chat-completions 自定义 API")
-    if not str(cfg.get("base_url") or "").strip() or not str(cfg.get("api_key") or "").strip():
+    protocol = str(cfg.get("protocol") or "responses")
+    if cfg.get("mode") != "relay" or protocol not in {"chat", "pool"}:
+        raise RuntimeError("当前渠道不是本地代理 API")
+    if protocol == "chat" and (
+        not str(cfg.get("base_url") or "").strip()
+        or not str(cfg.get("api_key") or "").strip()
+    ):
         raise RuntimeError("chat-completions 自定义 API 缺少 base_url 或 api_key")
+    if protocol == "pool" and not pool_routes(cfg):
+        raise RuntimeError("route pool 没有可用 routes")
     return cfg
+
+
+def proxy_log(message: str) -> None:
+    try:
+        PROTOCOL_PROXY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with PROTOCOL_PROXY_LOG.open("a", encoding="utf-8") as fh:
+            fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
+    except OSError:
+        pass
+
+
+def pool_routes(cfg: dict) -> list[dict]:
+    routes = cfg.get("routes")
+    if not isinstance(routes, list):
+        return []
+    return sorted(
+        [r for r in routes if isinstance(r, dict) and not r.get("disabled")],
+        key=lambda r: (int(r.get("priority", 1000)), int(r.get("_order", 0)), str(r.get("id") or "")),
+    )
+
+
+def pool_policy(cfg: dict) -> dict:
+    raw = cfg.get("policy") if isinstance(cfg.get("policy"), dict) else {}
+
+    def _int(name: str, default: int, minimum: int = 0) -> int:
+        try:
+            value = int(raw.get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, value)
+
+    cooldown_raw = raw.get("cooldown_seconds", [60, 120, 300])
+    cooldowns: list[int] = []
+    cooldown_items = cooldown_raw if isinstance(cooldown_raw, list) else [cooldown_raw]
+    for item in cooldown_items:
+        try:
+            cooldowns.append(max(1, int(item)))
+        except (TypeError, ValueError):
+            continue
+    if not cooldowns:
+        cooldowns = [60, 120, 300]
+    return {
+        "preempt_higher_priority": bool(raw.get("preempt_higher_priority", True)),
+        "fail_consecutive": _int("fail_consecutive", 2, 1),
+        "recovery_successes": _int("recovery_successes", 2, 1),
+        "min_dwell_seconds": _int("min_dwell_seconds", 60, 0),
+        "probe_interval_seconds": _int("probe_interval_seconds", 90, 5),
+        "current_probe_interval_seconds": _int("current_probe_interval_seconds", 0, 0),
+        "rate_limit_cooldown_seconds": _int("rate_limit_cooldown_seconds", 120, 1),
+        "request_timeout_seconds": _int("request_timeout_seconds", 600, 10),
+        "cooldown_seconds": cooldowns,
+    }
+
+
+def single_route_from_slot(cfg: dict) -> dict:
+    return {
+        "id": "current",
+        "label": cfg.get("display_name") or "current",
+        "priority": 10,
+        "base_url": str(cfg.get("base_url") or "").strip().rstrip("/"),
+        "api_key": str(cfg.get("api_key") or ""),
+        "protocol": "chat",
+        "model": cfg.get("model"),
+        "_order": 0,
+    }
+
+
+def route_id(route: dict) -> str:
+    return str(route.get("id") or route.get("label") or route.get("base_url") or "route")
+
+
+def route_label(route: dict) -> str:
+    return str(route.get("label") or route.get("name") or route_id(route))
+
+
+def route_protocol(route: dict) -> str:
+    return "chat" if route.get("protocol") == "chat" else "responses"
+
+
+def route_headers(route: dict, *, accept: str = "application/json", content_type: str | None = None) -> dict:
+    headers = {
+        "Authorization": f"Bearer {route.get('api_key')}",
+        "Accept": accept,
+        "User-Agent": f"sub2cli-responses-proxy/{APP_VERSION}",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def retry_after_seconds(headers: object) -> int | None:
+    raw = None
+    try:
+        raw = headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if not raw:
+        return None
+    try:
+        return max(1, int(float(raw)))
+    except ValueError:
+        return None
+
+
+def classify_upstream_status(status: int, body: bytes = b"") -> str:
+    if status in (401, 403):
+        return "blocked"
+    if status == 429:
+        return "rate_limit"
+    if status in (408, 409, 425) or status >= 500:
+        return "retryable"
+    if status == 400 and re.search(rb"model|unsupported|not\s+found", body[:4096], re.I):
+        return "retryable"
+    return "client_error"
+
+
+class UpstreamRouteError(Exception):
+    def __init__(
+        self,
+        *,
+        route: dict,
+        status: int | None,
+        body: bytes,
+        content_type: str,
+        kind: str,
+        detail: str,
+        retry_after: int | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.route = route
+        self.status = status
+        self.body = body
+        self.content_type = content_type or "application/json"
+        self.kind = kind
+        self.detail = detail
+        self.retry_after = retry_after
+
+
+class RoutePoolRuntime:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._states: dict[str, dict] = {}
+        self._current_route_id: str | None = None
+        self._current_since = 0.0
+        self._monitor_started = False
+
+    def _state(self, rid: str) -> dict:
+        return self._states.setdefault(rid, {
+            "failures": 0,
+            "open_until": 0.0,
+            "blocked": False,
+            "last_error": "",
+            "last_status": None,
+            "last_success": 0.0,
+            "last_probe": 0.0,
+            "probe_successes": 0,
+        })
+
+    def _sync(self, routes: list[dict]) -> None:
+        valid = {route_id(route) for route in routes}
+        for rid in list(self._states):
+            if rid not in valid:
+                self._states.pop(rid, None)
+        if self._current_route_id and self._current_route_id not in valid:
+            self._current_route_id = None
+            self._current_since = 0.0
+
+    def _usable(self, route: dict, now: float) -> bool:
+        state = self._state(route_id(route))
+        return not state.get("blocked") and float(state.get("open_until") or 0.0) <= now
+
+    def _activate(self, route: dict, now: float) -> dict:
+        rid = route_id(route)
+        if self._current_route_id != rid:
+            old = self._current_route_id or "(none)"
+            self._current_route_id = rid
+            self._current_since = now
+            proxy_log(f"pool route active {old} -> {rid} ({route_label(route)})")
+        return route
+
+    def choose(self, cfg: dict, *, exclude_ids: set[str] | None = None) -> tuple[dict | None, str | None]:
+        routes = pool_routes(cfg)
+        policy = pool_policy(cfg)
+        exclude_ids = exclude_ids or set()
+        now = time.monotonic()
+        with self._lock:
+            self._sync(routes)
+            by_id = {route_id(route): route for route in routes}
+            usable = [
+                route for route in routes
+                if route_id(route) not in exclude_ids and self._usable(route, now)
+            ]
+            if not usable:
+                return None, "no usable route"
+            current = by_id.get(self._current_route_id or "")
+            if current and route_id(current) not in exclude_ids and self._usable(current, now):
+                better = [
+                    route for route in usable
+                    if (int(route.get("priority", 1000)), int(route.get("_order", 0)))
+                    < (int(current.get("priority", 1000)), int(current.get("_order", 0)))
+                ]
+                dwell_ok = (now - self._current_since) >= int(policy["min_dwell_seconds"])
+                if better and policy["preempt_higher_priority"] and dwell_ok:
+                    return self._activate(better[0], now), None
+                return current, None
+            return self._activate(usable[0], now), None
+
+    def record_success(self, route: dict, *, probe: bool = False) -> None:
+        now = time.monotonic()
+        policy = {"recovery_successes": 1}
+        rid = route_id(route)
+        with self._lock:
+            state = self._state(rid)
+            if probe:
+                state["probe_successes"] = int(state.get("probe_successes") or 0) + 1
+                # The caller handles the exact threshold because it knows cfg policy.
+            else:
+                state["probe_successes"] = int(policy["recovery_successes"])
+            state["failures"] = 0
+            state["last_error"] = ""
+            state["last_status"] = 200
+            state["last_success"] = now
+            state["blocked"] = False
+            state["open_until"] = 0.0
+
+    def record_probe_success(self, route: dict, cfg: dict) -> None:
+        now = time.monotonic()
+        policy = pool_policy(cfg)
+        rid = route_id(route)
+        with self._lock:
+            state = self._state(rid)
+            successes = int(state.get("probe_successes") or 0) + 1
+            threshold = int(policy["recovery_successes"])
+            was_closed = bool(state.get("blocked")) or float(state.get("open_until") or 0.0) > now
+            state["probe_successes"] = successes
+            state["last_status"] = 200
+            state["last_success"] = now
+            state["last_error"] = ""
+            proxy_log(f"pool route probe ok {rid} successes={successes}/{threshold}")
+            if successes >= threshold:
+                state["failures"] = 0
+                state["blocked"] = False
+                state["open_until"] = 0.0
+                if was_closed:
+                    proxy_log(f"pool route recovered {rid} ({route_label(route)})")
+
+    def record_failure(
+        self,
+        route: dict,
+        cfg: dict,
+        *,
+        kind: str,
+        status: int | None = None,
+        detail: str = "",
+        retry_after: int | None = None,
+    ) -> None:
+        now = time.monotonic()
+        policy = pool_policy(cfg)
+        rid = route_id(route)
+        with self._lock:
+            state = self._state(rid)
+            state["probe_successes"] = 0
+            state["last_error"] = detail
+            state["last_status"] = status
+            if kind == "client_error":
+                return
+            if kind == "blocked":
+                state["blocked"] = True
+                state["open_until"] = now + 24 * 60 * 60
+            elif kind == "rate_limit":
+                cooldown = retry_after or int(policy["rate_limit_cooldown_seconds"])
+                state["open_until"] = now + cooldown
+            else:
+                state["failures"] = int(state.get("failures") or 0) + 1
+                if int(state["failures"]) >= int(policy["fail_consecutive"]):
+                    cooldowns = policy["cooldown_seconds"]
+                    idx = min(len(cooldowns) - 1, max(0, int(state["failures"]) - int(policy["fail_consecutive"])))
+                    state["open_until"] = now + int(cooldowns[idx])
+            if self._current_route_id == rid and not self._usable(route, now):
+                self._current_route_id = None
+                self._current_since = 0.0
+            proxy_log(f"pool route failure {rid} kind={kind} status={status} detail={detail[:160]}")
+
+    def snapshot(self, cfg: dict | None = None) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            states = {}
+            routes = pool_routes(cfg or {}) if cfg else []
+            route_map = {route_id(route): route for route in routes}
+            for rid, state in self._states.items():
+                route = route_map.get(rid, {})
+                states[rid] = {
+                    "label": route_label(route) if route else rid,
+                    "priority": route.get("priority"),
+                    "blocked": bool(state.get("blocked")),
+                    "cooldown_remaining": max(0, int(float(state.get("open_until") or 0.0) - now)),
+                    "failures": int(state.get("failures") or 0),
+                    "last_status": state.get("last_status"),
+                    "last_error": state.get("last_error") or "",
+                    "probe_successes": int(state.get("probe_successes") or 0),
+                }
+            return {
+                "current_route": self._current_route_id,
+                "states": states,
+            }
+
+    def start_monitor(self) -> None:
+        with self._lock:
+            if self._monitor_started:
+                return
+            self._monitor_started = True
+        thread = threading.Thread(target=self._monitor_loop, name="sub2cli-route-pool-monitor", daemon=True)
+        thread.start()
+
+    def _monitor_loop(self) -> None:
+        while True:
+            try:
+                data = load_slots(required=False)
+                cfg = (data.get("slots") or {}).get(data.get("current")) or {}
+                if cfg.get("mode") == "relay" and cfg.get("protocol") == "pool":
+                    self.probe_due_routes(cfg)
+            except Exception as exc:
+                proxy_log(f"pool monitor error: {type(exc).__name__}: {exc}")
+            time.sleep(2)
+
+    def probe_due_routes(self, cfg: dict) -> None:
+        routes = pool_routes(cfg)
+        if not routes:
+            return
+        policy = pool_policy(cfg)
+        now = time.monotonic()
+        due: list[dict] = []
+        with self._lock:
+            self._sync(routes)
+            current = self._current_route_id
+            current_route = next((route for route in routes if route_id(route) == current), None)
+            if not current_route:
+                current_rank = None
+            else:
+                current_rank = (
+                    int(current_route.get("priority", 1000)),
+                    int(current_route.get("_order", 0)),
+                )
+            for route in routes:
+                state = self._state(route_id(route))
+                if current_rank is not None:
+                    route_rank = (
+                        int(route.get("priority", 1000)),
+                        int(route.get("_order", 0)),
+                    )
+                    if route_id(route) == current or route_rank >= current_rank:
+                        continue
+                interval = int(policy["probe_interval_seconds"])
+                if now - float(state.get("last_probe") or 0.0) >= interval:
+                    state["last_probe"] = now
+                    due.append(route)
+        for route in due:
+            try:
+                probe_route(route, timeout=min(10, int(policy["request_timeout_seconds"])))
+                self.record_probe_success(route, cfg)
+            except UpstreamRouteError as exc:
+                self.record_failure(
+                    route,
+                    cfg,
+                    kind=exc.kind,
+                    status=exc.status,
+                    detail=exc.detail,
+                    retry_after=exc.retry_after,
+                )
+
+
+ROUTE_POOL_RUNTIME = RoutePoolRuntime()
+
+
+def probe_route(route: dict, *, timeout: int = 10) -> None:
+    model = str(route.get("model") or "").strip() or DEFAULT_MODEL
+    request_route_response(
+        route,
+        {
+            "model": model,
+            "input": "ping",
+            "max_output_tokens": 1,
+            "store": False,
+        },
+        timeout=timeout,
+    )
+
+
+def fetch_route_models(route: dict, *, timeout: int = 30) -> tuple[bytes, str]:
+    endpoint = models_endpoint(str(route.get("base_url") or ""))
+    req = urlrequest.Request(endpoint, headers=route_headers(route, accept="application/json"))
+    try:
+        with fresh_urlopen(req, timeout=timeout) as resp:
+            body = resp.read(4 * 1024 * 1024)
+            return body, resp.headers.get("Content-Type") or "application/json"
+    except urlerror.HTTPError as exc:
+        body = exc.read(1024 * 1024)
+        raise UpstreamRouteError(
+            route=route,
+            status=exc.code,
+            body=body,
+            content_type=exc.headers.get("Content-Type") or "application/json",
+            kind=classify_upstream_status(exc.code, body),
+            detail=f"HTTP {exc.code} {exc.reason}",
+            retry_after=retry_after_seconds(exc.headers),
+        ) from exc
+    except Exception as exc:
+        raise UpstreamRouteError(
+            route=route,
+            status=None,
+            body=b"",
+            content_type="application/json",
+            kind="retryable",
+            detail=f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+
+def request_route_response(route: dict, responses_body: dict, *, timeout: int) -> tuple[bytes, str]:
+    body = dict(responses_body)
+    route_model = str(route.get("model") or "").strip()
+    if route_model:
+        body["model"] = route_model
+    if route_protocol(route) == "chat":
+        chat_body = responses_to_chat_request(body)
+        endpoint = chat_completions_endpoint(str(route.get("base_url") or ""))
+        data = json.dumps(chat_body, ensure_ascii=False).encode("utf-8")
+        req = urlrequest.Request(
+            endpoint,
+            data=data,
+            headers=route_headers(
+                route,
+                accept="text/event-stream" if chat_body.get("stream") else "application/json",
+                content_type="application/json",
+            ),
+            method="POST",
+        )
+        try:
+            with fresh_urlopen(req, timeout=timeout) as resp:
+                upstream = resp.read()
+                upstream_type = resp.headers.get("Content-Type") or ""
+        except urlerror.HTTPError as exc:
+            body_bytes = exc.read(1024 * 1024)
+            raise UpstreamRouteError(
+                route=route,
+                status=exc.code,
+                body=body_bytes,
+                content_type=exc.headers.get("Content-Type") or "application/json",
+                kind=classify_upstream_status(exc.code, body_bytes),
+                detail=f"HTTP {exc.code} {exc.reason}",
+                retry_after=retry_after_seconds(exc.headers),
+            ) from exc
+        except Exception as exc:
+            raise UpstreamRouteError(
+                route=route,
+                status=None,
+                body=b"",
+                content_type="application/json",
+                kind="retryable",
+                detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
+        if "text/event-stream" in upstream_type:
+            response = chat_sse_to_response_json(upstream)
+        else:
+            response = chat_completion_to_response(json.loads(upstream.decode("utf-8")))
+        if body.get("stream"):
+            return response_json_to_sse(response), "text/event-stream"
+        return json.dumps(response, ensure_ascii=False).encode("utf-8"), "application/json"
+
+    endpoint = responses_endpoint(str(route.get("base_url") or ""))
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urlrequest.Request(
+        endpoint,
+        data=data,
+        headers=route_headers(
+            route,
+            accept="text/event-stream" if body.get("stream") else "application/json",
+            content_type="application/json",
+        ),
+        method="POST",
+    )
+    try:
+        with fresh_urlopen(req, timeout=timeout) as resp:
+            return resp.read(), resp.headers.get("Content-Type") or "application/json"
+    except urlerror.HTTPError as exc:
+        body_bytes = exc.read(1024 * 1024)
+        raise UpstreamRouteError(
+            route=route,
+            status=exc.code,
+            body=body_bytes,
+            content_type=exc.headers.get("Content-Type") or "application/json",
+            kind=classify_upstream_status(exc.code, body_bytes),
+            detail=f"HTTP {exc.code} {exc.reason}",
+            retry_after=retry_after_seconds(exc.headers),
+        ) from exc
+    except Exception as exc:
+        raise UpstreamRouteError(
+            route=route,
+            status=None,
+            body=b"",
+            content_type="application/json",
+            kind="retryable",
+            detail=f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+
+def pool_error_response(attempts: list[str], error: str = "no usable route") -> dict:
+    return {
+        "error": {
+            "message": f"sub2cli route pool unavailable: {error}",
+            "type": "sub2cli_route_pool_unavailable",
+            "attempts": attempts,
+        }
+    }
 
 
 class ResponsesProxyHandler(BaseHTTPRequestHandler):
     server_version = "sub2cli-responses-proxy/0.1"
 
     def log_message(self, fmt: str, *args: object) -> None:
-        try:
-            PROTOCOL_PROXY_LOG.parent.mkdir(parents=True, exist_ok=True)
-            with PROTOCOL_PROXY_LOG.open("a", encoding="utf-8") as fh:
-                fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), fmt % args))
-        except OSError:
-            pass
+        return
 
     def _send(self, status: int, body: bytes, content_type: str = "application/json") -> None:
         self.send_response(status)
@@ -1430,20 +1976,36 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send_json(200, {"ok": True})
             return
+        if path == "/poolz":
+            try:
+                cfg = _active_proxy_slot()
+                self._send_json(200, {
+                    "ok": True,
+                    "pid": os.getpid(),
+                    "port": PROTOCOL_PROXY_PORT,
+                    "started_at": int(PROXY_STARTED_AT),
+                    "uptime_seconds": max(0, int(time.time() - PROXY_STARTED_AT)),
+                    **ROUTE_POOL_RUNTIME.snapshot(cfg),
+                })
+            except Exception as exc:
+                self._send_json(200, {
+                    "ok": False,
+                    "pid": os.getpid(),
+                    "port": PROTOCOL_PROXY_PORT,
+                    "started_at": int(PROXY_STARTED_AT),
+                    "uptime_seconds": max(0, int(time.time() - PROXY_STARTED_AT)),
+                    "error": str(exc),
+                })
+            return
         if path not in {"/models", "/v1/models"}:
             self._send_json(404, {"error": {"message": "not found"}})
             return
         try:
-            cfg = _active_chat_proxy_slot()
-            endpoint = models_endpoint(str(cfg.get("base_url") or ""))
-            req = urlrequest.Request(endpoint, headers={
-                "Authorization": f"Bearer {cfg.get('api_key')}",
-                "Accept": "application/json",
-                "User-Agent": "sub2cli-responses-proxy/0.1",
-            })
-            with urlrequest.urlopen(req, timeout=30) as resp:
-                body = resp.read(4 * 1024 * 1024)
-                content_type = resp.headers.get("Content-Type") or "application/json"
+            cfg = _active_proxy_slot()
+            if cfg.get("protocol") == "pool":
+                self._send_pool_models(cfg)
+                return
+            body, content_type = fetch_route_models(single_route_from_slot(cfg), timeout=30)
             self._send(200, body, content_type)
         except Exception as exc:
             self._send_json(502, {"error": {"message": str(exc)}})
@@ -1454,40 +2016,19 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": {"message": "not found"}})
             return
         try:
-            cfg = _active_chat_proxy_slot()
+            cfg = _active_proxy_slot()
             length = int(self.headers.get("Content-Length") or "0")
             body = self.rfile.read(length)
             responses_body = json.loads(body.decode("utf-8"))
-            chat_body = responses_to_chat_request(responses_body)
-            endpoint = chat_completions_endpoint(str(cfg.get("base_url") or ""))
-            req = urlrequest.Request(
-                endpoint,
-                data=json.dumps(chat_body, ensure_ascii=False).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {cfg.get('api_key')}",
-                    "Content-Type": "application/json",
-                    "Accept": "text/event-stream" if chat_body.get("stream") else "application/json",
-                    "User-Agent": "sub2cli-responses-proxy/0.1",
-                },
-                method="POST",
-            )
-            try:
-                with urlrequest.urlopen(req, timeout=600) as resp:
-                    upstream = resp.read()
-                    upstream_type = resp.headers.get("Content-Type") or ""
-            except urlerror.HTTPError as exc:
-                err_body = exc.read()[:1024 * 1024]
-                self._send(exc.code, err_body or str(exc).encode("utf-8"), exc.headers.get("Content-Type") or "application/json")
+            if cfg.get("protocol") == "pool":
+                self._send_pool_response(cfg, responses_body)
                 return
-            wants_stream = bool(responses_body.get("stream"))
-            if "text/event-stream" in upstream_type:
-                response = chat_sse_to_response_json(upstream)
-            else:
-                response = chat_completion_to_response(json.loads(upstream.decode("utf-8")))
-            if wants_stream:
-                self._send(200, response_json_to_sse(response), "text/event-stream")
-            else:
-                self._send_json(200, response)
+            try:
+                upstream, content_type = request_route_response(single_route_from_slot(cfg), responses_body, timeout=600)
+            except UpstreamRouteError as exc:
+                self._send(exc.status or 502, exc.body or str(exc).encode("utf-8"), exc.content_type)
+                return
+            self._send(200, upstream, content_type)
         except Exception as exc:
             payload = {"error": {"message": str(exc), "type": "sub2cli_proxy_error"}}
             if self.headers.get("accept", "").lower().find("text/event-stream") >= 0:
@@ -1496,8 +2037,74 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json(500, payload)
 
+    def _send_pool_models(self, cfg: dict) -> None:
+        attempted: list[str] = []
+        excluded: set[str] = set()
+        for _ in range(max(1, len(pool_routes(cfg)))):
+            route, err = ROUTE_POOL_RUNTIME.choose(cfg, exclude_ids=excluded)
+            if not route:
+                self._send_json(503, pool_error_response(attempted, err or "no route"))
+                return
+            rid = route_id(route)
+            attempted.append(rid)
+            try:
+                body, content_type = fetch_route_models(route, timeout=30)
+                ROUTE_POOL_RUNTIME.record_success(route)
+                self._send(200, body, content_type)
+                return
+            except UpstreamRouteError as exc:
+                ROUTE_POOL_RUNTIME.record_failure(
+                    route,
+                    cfg,
+                    kind=exc.kind,
+                    status=exc.status,
+                    detail=exc.detail,
+                    retry_after=exc.retry_after,
+                )
+                if exc.kind == "client_error":
+                    self._send(exc.status or 502, exc.body or str(exc).encode("utf-8"), exc.content_type)
+                    return
+                excluded.add(rid)
+        self._send_json(503, pool_error_response(attempted))
+
+    def _send_pool_response(self, cfg: dict, responses_body: dict) -> None:
+        attempted: list[str] = []
+        excluded: set[str] = set()
+        policy = pool_policy(cfg)
+        for _ in range(max(1, len(pool_routes(cfg)))):
+            route, err = ROUTE_POOL_RUNTIME.choose(cfg, exclude_ids=excluded)
+            if not route:
+                self._send_json(503, pool_error_response(attempted, err or "no route"))
+                return
+            rid = route_id(route)
+            attempted.append(rid)
+            try:
+                body, content_type = request_route_response(
+                    route,
+                    responses_body,
+                    timeout=int(policy["request_timeout_seconds"]),
+                )
+                ROUTE_POOL_RUNTIME.record_success(route)
+                self._send(200, body, content_type)
+                return
+            except UpstreamRouteError as exc:
+                ROUTE_POOL_RUNTIME.record_failure(
+                    route,
+                    cfg,
+                    kind=exc.kind,
+                    status=exc.status,
+                    detail=exc.detail,
+                    retry_after=exc.retry_after,
+                )
+                if exc.kind == "client_error":
+                    self._send(exc.status or 502, exc.body or str(exc).encode("utf-8"), exc.content_type)
+                    return
+                excluded.add(rid)
+        self._send_json(503, pool_error_response(attempted))
+
 
 def run_responses_proxy(port: int = PROTOCOL_PROXY_PORT) -> int:
+    ROUTE_POOL_RUNTIME.start_monitor()
     server = ThreadingHTTPServer(("127.0.0.1", port), ResponsesProxyHandler)
     print(f"sub2cli responses proxy listening on http://127.0.0.1:{port}/v1", flush=True)
     server.serve_forever()
@@ -1512,7 +2119,7 @@ def _self_command_prefix() -> list[str]:
 
 def protocol_proxy_healthy(port: int = PROTOCOL_PROXY_PORT) -> bool:
     try:
-        with urlrequest.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.8) as resp:
+        with fresh_urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1.5) as resp:
             return resp.status == 200
     except Exception:
         return False
@@ -1536,11 +2143,110 @@ def ensure_protocol_proxy(port: int = PROTOCOL_PROXY_PORT) -> bool:
             start_new_session=True,
             env=env,
         )
-    for _ in range(30):
-        time.sleep(0.1)
+    deadline = time.monotonic() + 12.0
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
         if protocol_proxy_healthy(port):
             return True
     return False
+
+
+def protocol_proxy_pids(port: int = PROTOCOL_PROXY_PORT) -> list[int]:
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in proc.stdout.splitlines():
+        try:
+            pid = int(line.strip())
+        except ValueError:
+            continue
+        if pid > 0 and pid not in pids:
+            pids.append(pid)
+    return pids
+
+
+def process_group_pids_for(pids: list[int]) -> list[int]:
+    wanted = {pid for pid in pids if pid > 0}
+    if not wanted:
+        return []
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,pgid=,command="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return sorted(wanted)
+    pid_to_pgid: dict[int, int] = {}
+    pid_to_command: dict[int, str] = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+            pid_to_pgid[pid] = int(parts[1])
+            pid_to_command[pid] = parts[2] if len(parts) >= 3 else ""
+        except ValueError:
+            continue
+    groups = {pid_to_pgid[pid] for pid in wanted if pid in pid_to_pgid}
+    if not groups:
+        return sorted(wanted)
+    expanded = {
+        pid for pid, pgid in pid_to_pgid.items()
+        if pgid in groups and "responses-proxy" in pid_to_command.get(pid, "")
+    }
+    return sorted(expanded or wanted)
+
+
+def stop_protocol_proxy(port: int = PROTOCOL_PROXY_PORT, *, timeout: float = 5.0) -> bool:
+    pids = protocol_proxy_pids(port)
+    if not pids:
+        return True
+    current = os.getpid()
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        targets = [pid for pid in process_group_pids_for(pids) if pid != current]
+        for pid in targets:
+            if pid == current:
+                continue
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                proxy_log(f"pool monitor proxy stop permission denied pid={pid}")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = [pid for pid in protocol_proxy_pids(port) if pid != current]
+            if not remaining:
+                return True
+            time.sleep(0.15)
+        pids = [pid for pid in protocol_proxy_pids(port) if pid != current]
+        if not pids:
+            return True
+    return not [pid for pid in protocol_proxy_pids(port) if pid != current]
+
+
+def cmd_restart_proxy(port: int = PROTOCOL_PROXY_PORT) -> int:
+    stopped = stop_protocol_proxy(port)
+    if not stopped:
+        fail(f"本地代理停止失败，请检查端口 {port} 的监听进程")
+    started = ensure_protocol_proxy(port)
+    if started or protocol_proxy_healthy(port):
+        print(f"本地代理已重启: http://127.0.0.1:{port}/v1")
+        return 0
+    fail(f"本地代理启动失败，请查看 {PROTOCOL_PROXY_LOG}")
+    return 1
 
 
 def load_models_json(path: str | None) -> list[str]:
@@ -1571,6 +2277,23 @@ def relay_model_catalog_for_slot(cfg: dict, *, refresh: bool = False) -> dict:
             "base_url": "",
             "models": [configured_model],
             "message": "official Codex account",
+        }
+    if cfg.get("protocol") == "pool":
+        models = merge_model_lists(
+            [str(route.get("model") or "").strip() for route in pool_routes(cfg) if str(route.get("model") or "").strip()],
+            cfg.get("models", []) if isinstance(cfg.get("models"), list) else [],
+        )
+        configured_model = raw_model or (models[0] if models else DEFAULT_MODEL)
+        return {
+            "mode": "relay",
+            "status": "ok" if pool_routes(cfg) else "failed",
+            "model": configured_model,
+            "default_model": configured_model,
+            "model_provider": RELAY_PROVIDER,
+            "provider_name": cfg.get("display_name") or RELAY_PROVIDER,
+            "base_url": PROTOCOL_PROXY_BASE_URL,
+            "models": models or [configured_model],
+            "message": f"route pool ({len(pool_routes(cfg))} routes)",
         }
     base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
     api_key = str(cfg.get("api_key") or "").strip()
@@ -1680,7 +2403,7 @@ def patch_config(
     if mode == "relay":
         if not relay_base_url:
             fail("relay_base_url is required for relay mode")
-        codex_base_url = PROTOCOL_PROXY_BASE_URL if protocol == "chat" else relay_base_url.rstrip("/")
+        codex_base_url = PROTOCOL_PROXY_BASE_URL if protocol in {"chat", "pool"} else relay_base_url.rstrip("/")
         block = (
             f"\n[model_providers.{RELAY_PROVIDER}]\n"
             f'name = "{RELAY_PROVIDER}"\n'
@@ -1738,7 +2461,7 @@ def config_clean_for_slot(cfg: dict) -> bool:
         return False
     relay_url = relay_block_base_url(text)
     if mode == "relay":
-        expected_url = PROTOCOL_PROXY_BASE_URL if cfg.get("protocol") == "chat" else str(cfg.get("base_url", "")).rstrip("/")
+        expected_url = PROTOCOL_PROXY_BASE_URL if cfg.get("protocol") in {"chat", "pool"} else str(cfg.get("base_url", "")).rstrip("/")
         return (
             relay_url == expected_url
             and top_level_bool_value(text, "disable_response_storage") is True
@@ -1783,15 +2506,38 @@ def new_backup_dir(label: str) -> Path:
     return path
 
 
-def backup_state_db(backup_dir: Path) -> Path | None:
-    if not STATE_DB.exists():
+def state_db_paths() -> list[Path]:
+    paths = [STATE_DB, CODEX_HOME / "sqlite" / STATE_DB.name]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path.resolve(strict=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def state_db_backup_name(db_path: Path) -> str:
+    if db_path.resolve(strict=False) == STATE_DB.resolve(strict=False):
+        return STATE_DB.name
+    try:
+        rel = db_path.relative_to(CODEX_HOME)
+    except ValueError:
+        rel = Path(db_path.name)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(rel))
+
+
+def backup_state_db(backup_dir: Path, db_path: Path = STATE_DB) -> Path | None:
+    if not db_path.exists():
         return None
-    target = backup_dir / STATE_DB.name
+    target = backup_dir / state_db_backup_name(db_path)
     # Best-effort: a backup failure (incl. os.chmod OSError, e.g. dir removed or
     # FS remounted read-only mid-switch) must NOT abort an otherwise-successful
     # switch. normalize_state_db only guards sqlite3.Error, so swallow OSError here.
     try:
-        with sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=30) as src:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30) as src:
             src.execute("PRAGMA busy_timeout=30000")
             with sqlite3.connect(target) as dst:
                 src.backup(dst)
@@ -1803,10 +2549,11 @@ def backup_state_db(backup_dir: Path) -> Path | None:
 
 
 def thread_provider_counts() -> dict[str, int]:
-    if not STATE_DB.exists():
+    db_path = next((path for path in state_db_paths() if path.exists()), None)
+    if db_path is None:
         return {}
     try:
-        with sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=10) as conn:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10) as conn:
             conn.execute("PRAGMA busy_timeout=10000")
             rows = conn.execute("SELECT model_provider, COUNT(*) FROM threads GROUP BY model_provider").fetchall()
     except sqlite3.Error:
@@ -1815,29 +2562,50 @@ def thread_provider_counts() -> dict[str, int]:
 
 
 def normalize_state_db(target_provider: str, *, backup_dir: Path | None, dry_run: bool) -> dict:
-    stats = {"exists": STATE_DB.exists(), "changed": 0, "backup": None, "error": None}
-    if not STATE_DB.exists():
+    stats = {
+        "exists": False,
+        "changed": 0,
+        "backup": None,
+        "backups": [],
+        "error": None,
+        "errors": [],
+        "paths": [],
+    }
+    paths = [path for path in state_db_paths() if path.exists()]
+    stats["exists"] = bool(paths)
+    if not paths:
         return stats
-    try:
-        with sqlite3.connect(STATE_DB, timeout=30) as conn:
-            conn.execute("PRAGMA busy_timeout=30000")
-            pending = conn.execute(
-                "SELECT COUNT(*) FROM threads WHERE model_provider IN (?, ?) AND model_provider != ?",
-                (*THREAD_PROVIDERS, target_provider),
-            ).fetchone()[0]
-            stats["changed"] = int(pending)
-            if dry_run or pending == 0:
-                return stats
-            if backup_dir is not None:
-                stats["backup"] = str(backup_state_db(backup_dir))
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "UPDATE threads SET model_provider = ? WHERE model_provider IN (?, ?) AND model_provider != ?",
-                (target_provider, *THREAD_PROVIDERS, target_provider),
-            )
-            conn.commit()
-    except sqlite3.Error as exc:
-        stats["error"] = f"{type(exc).__name__}: {exc}"
+    for db_path in paths:
+        path_stats = {"path": str(db_path), "changed": 0, "backup": None, "error": None}
+        stats["paths"].append(path_stats)
+        try:
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                conn.execute("PRAGMA busy_timeout=30000")
+                pending = conn.execute(
+                    "SELECT COUNT(*) FROM threads WHERE model_provider IN (?, ?) AND model_provider != ?",
+                    (*THREAD_PROVIDERS, target_provider),
+                ).fetchone()[0]
+                path_stats["changed"] = int(pending)
+                stats["changed"] += int(pending)
+                if dry_run or pending == 0:
+                    continue
+                if backup_dir is not None:
+                    backup = backup_state_db(backup_dir, db_path)
+                    path_stats["backup"] = str(backup) if backup is not None else None
+                    if backup is not None:
+                        stats["backups"].append(str(backup))
+                        stats["backup"] = stats["backup"] or str(backup)
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE threads SET model_provider = ? WHERE model_provider IN (?, ?) AND model_provider != ?",
+                    (target_provider, *THREAD_PROVIDERS, target_provider),
+                )
+                conn.commit()
+        except sqlite3.Error as exc:
+            message = f"{db_path}: {type(exc).__name__}: {exc}"
+            path_stats["error"] = message
+            stats["errors"].append(message)
+            stats["error"] = stats["error"] or message
     return stats
 
 
@@ -1985,6 +2753,25 @@ def normalize_sessions_if_needed(
     return normalize_sessions(target_provider, dry_run=False, backup_dir=backup_dir)
 
 
+def session_normalization_skipped(target_provider: str, reason: str) -> dict:
+    return {
+        "target_provider": target_provider,
+        "dry_run": False,
+        "skipped": True,
+        "reason": reason,
+        "state_db": {
+            "exists": any(path.exists() for path in state_db_paths()),
+            "changed": 0,
+            "backup": None,
+            "backups": [],
+            "error": None,
+            "errors": [],
+            "paths": [{"path": str(path), "changed": 0, "backup": None, "error": None} for path in state_db_paths() if path.exists()],
+        },
+        "rollouts": {"scanned": 0, "changed": 0, "errors": 0, "audit": None},
+    }
+
+
 def sessions_need_normalize(target_provider: str) -> bool:
     preview = normalize_sessions(target_provider, dry_run=True)
     return bool(
@@ -1996,6 +2783,9 @@ def sessions_need_normalize(target_provider: str) -> bool:
 
 
 def print_session_summary(stats: dict) -> None:
+    if stats.get("skipped") and stats.get("reason"):
+        print(f"  历史 session 保持不变: {stats['reason']}")
+        return
     action = "将聚合" if stats.get("dry_run") else "已聚合"
     db_stats = stats.get("state_db") or {}
     rollout_stats = stats.get("rollouts") or {}
@@ -2240,7 +3030,7 @@ def compute_switch_plan(data: dict, target_slot: str) -> dict:
             "type": "patch_toml",
             "path": str(CONFIG_TOML),
             "section": f"[model_providers.{RELAY_PROVIDER}]",
-            "base_url": PROTOCOL_PROXY_BASE_URL if cfg.get("protocol") == "chat" else cfg.get("base_url"),
+            "base_url": PROTOCOL_PROXY_BASE_URL if cfg.get("protocol") in {"chat", "pool"} else cfg.get("base_url"),
             "upstream_base_url": cfg.get("base_url") if cfg.get("protocol") == "chat" else None,
             "protocol": cfg.get("protocol") or "responses",
             "model": slot_config_model(cfg, refresh=False),
@@ -2467,21 +3257,27 @@ def restore_from_backup(backup_dir: Path) -> int:
             restored.append("App profile removed")
         except SystemExit as exc:
             warnings.append(f"App profile was NOT removed: {exc}")
-    state_db_backup = backup_dir / STATE_DB.name
-    if state_db_backup.exists():
+    restored_state_dbs: list[str] = []
+    for db_path in state_db_paths():
+        state_db_backup = backup_dir / state_db_backup_name(db_path)
+        if not state_db_backup.exists():
+            continue
         # SQLite may run in WAL mode (state_5.sqlite-wal / -shm sidecars).
         # If we only replace the main file, the WAL is replayed at open time
         # and silently re-applies the post-switch UPDATE — the rollback looks
         # successful but threads come back tagged with the new provider.
         # Wipe main + WAL + SHM together, then copy backup's main file.
-        wal = STATE_DB.parent / f"{STATE_DB.name}-wal"
-        shm = STATE_DB.parent / f"{STATE_DB.name}-shm"
-        for p in (STATE_DB, wal, shm):
+        wal = db_path.parent / f"{db_path.name}-wal"
+        shm = db_path.parent / f"{db_path.name}-shm"
+        for p in (db_path, wal, shm):
             if p.exists():
                 p.unlink()
-        shutil.copyfile(state_db_backup, STATE_DB)
-        os.chmod(STATE_DB, 0o600)
-        restored.append(f"state DB ← {state_db_backup.name}")
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(state_db_backup, db_path)
+        os.chmod(db_path, 0o600)
+        restored_state_dbs.append(state_db_backup.name)
+    if restored_state_dbs:
+        restored.append(f"state DB ← {', '.join(restored_state_dbs)}")
     # Restore the full slot registry. Switching and add-api mutate more than
     # just `current`, so pointer-only rollback can leave supposedly removed
     # relay/API-key slots behind.
@@ -2681,7 +3477,9 @@ def cmd_switch(
         if mode == "relay":
             api_key = str(cfg.get("api_key") or "").strip()
             base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
-            protocol = "chat" if cfg.get("protocol") == "chat" else "responses"
+            protocol = str(cfg.get("protocol") or "responses")
+            if protocol not in {"responses", "chat", "pool"}:
+                protocol = "responses"
             if not api_key or not base_url:
                 fail(f"relay slot {target_slot!r} is missing api_key/base_url")
             selected_model = slot_config_model(cfg, refresh=True)
@@ -2726,13 +3524,13 @@ def cmd_switch(
         data["current"] = target_slot
         data.setdefault("app_history_slot", target_slot)
         save_slots(data)
-        if mode == "relay" and cfg.get("protocol") == "chat":
+        if mode == "relay" and cfg.get("protocol") in {"chat", "pool"}:
             if ensure_protocol_proxy():
-                print(f"  Responses→Chat 代理已启动: {PROTOCOL_PROXY_BASE_URL}")
+                print(f"  本地代理已启动: {PROTOCOL_PROXY_BASE_URL}")
             elif protocol_proxy_healthy():
-                print(f"  Responses→Chat 代理已就绪: {PROTOCOL_PROXY_BASE_URL}")
+                print(f"  本地代理已就绪: {PROTOCOL_PROXY_BASE_URL}")
             else:
-                fail(f"Responses→Chat 代理启动失败，请查看 {PROTOCOL_PROXY_LOG}")
+                fail(f"本地代理启动失败，请查看 {PROTOCOL_PROXY_LOG}")
 
         verb = "已修复当前渠道" if previous == target_slot else "已切换到"
         print(f"{verb}：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
@@ -2746,6 +3544,8 @@ def cmd_switch(
             print(f"  model       -> {slot_config_model(cfg, refresh=False)}")
             if cfg.get("protocol") == "chat":
                 print(f"  protocol    -> chat via {PROTOCOL_PROXY_BASE_URL}")
+            elif cfg.get("protocol") == "pool":
+                print(f"  protocol    -> pool via {PROTOCOL_PROXY_BASE_URL} ({len(pool_routes(cfg))} routes)")
         elif not auth_target.exists() or auth_target.stat().st_size < 10:
             print(f"  尚未登录：请运行 `codex login` 写入 {auth_target}")
         print_session_summary(session_stats)
@@ -2764,6 +3564,168 @@ def cmd_switch(
         raise
     finally:
         lock_ctx.__exit__(None, None, None)
+
+
+def validate_route_id(value: str) -> str:
+    route = str(value or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,62}", route):
+        fail(f"invalid route id {value!r}; use lowercase a-z, 0-9, _, . or -, max 63 chars")
+    return route
+
+
+def mask_api_key(value: str) -> str:
+    if not value:
+        return "(empty)"
+    if len(value) <= 12:
+        return value[:2] + "***"
+    return f"{value[:6]}...{value[-4:]}"
+
+
+def load_pool_json(path: str) -> dict:
+    try:
+        raw = json.loads(Path(path).expanduser().read_text())
+    except OSError as exc:
+        fail(f"routes json 读取失败: {exc}")
+    except json.JSONDecodeError as exc:
+        fail(f"routes json 不是有效 JSON: {exc}")
+    if isinstance(raw, list):
+        raw = {"routes": raw}
+    if not isinstance(raw, dict):
+        fail("routes json 必须是对象或 routes 数组")
+    return raw
+
+
+def normalize_pool_json(raw: dict) -> tuple[list[dict], dict, list[str]]:
+    raw_routes = raw.get("routes")
+    if not isinstance(raw_routes, list) or not raw_routes:
+        fail("route pool 至少需要一个 routes[] 条目")
+    normalized: list[dict] = []
+    models: list[str] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(raw_routes, 1):
+        if not isinstance(item, dict):
+            fail(f"routes[{idx}] 必须是对象")
+        rid = validate_route_id(str(item.get("id") or item.get("name") or f"route-{idx}"))
+        if rid in seen:
+            fail(f"重复 route id: {rid}")
+        seen.add(rid)
+        base_url = normalize_base_url(str(item.get("base_url") or item.get("url") or ""))
+        api_key = str(item.get("api_key") or "").strip()
+        api_key_env = str(item.get("api_key_env") or "").strip()
+        if not api_key and api_key_env:
+            api_key = os.environ.get(api_key_env, "").strip()
+        if not api_key:
+            fail(f"route {rid} 缺少 api_key 或可读取的 api_key_env")
+        protocol = str(item.get("protocol") or "responses").strip().lower()
+        if protocol not in {"responses", "chat"}:
+            fail(f"route {rid} protocol 必须是 responses 或 chat")
+        try:
+            priority = int(item.get("priority", idx * 10))
+        except (TypeError, ValueError):
+            fail(f"route {rid} priority 必须是整数")
+        model = str(item.get("model") or "").strip()
+        if model:
+            models.append(model)
+        route = {
+            "id": rid,
+            "label": str(item.get("label") or item.get("name") or rid),
+            "priority": priority,
+            "base_url": base_url,
+            "api_key": api_key,
+            "protocol": protocol,
+            "model": model,
+            "_order": idx,
+        }
+        for key in ("group", "group_id", "endpoint", "notes"):
+            if item.get(key) is not None:
+                route[key] = item.get(key)
+        normalized.append(route)
+    policy = pool_policy({"policy": raw.get("policy") if isinstance(raw.get("policy"), dict) else {}})
+    return sorted(normalized, key=lambda r: (int(r["priority"]), int(r["_order"]))), policy, merge_model_lists(models)
+
+
+def cmd_pool(
+    slot: str,
+    *,
+    routes_json: str,
+    model: str | None = None,
+    display: str | None = None,
+    no_switch: bool = False,
+    no_restart: bool = False,
+    dry_run: bool = False,
+) -> int:
+    slot = validate_slot(slot)
+    routes, policy, models = normalize_pool_json(load_pool_json(routes_json))
+    selected_model = (model or "").strip() or (models[0] if models else DEFAULT_MODEL)
+    pool_cfg = {
+        "display_name": display or f"Codex - {slot} route pool",
+        "mode": "relay",
+        "auth_file": str(CODEX_HOME / f"auth.{slot}.json"),
+        "app_profile_dir": str(APP_SUPPORT / f"Codex.{slot}"),
+        "base_url": PROTOCOL_PROXY_BASE_URL,
+        "model": selected_model,
+        "model_source": "manual" if (model or "").strip() else "auto",
+        "models": models,
+        "protocol": "pool",
+        "api_key": POOL_PLACEHOLDER_API_KEY,
+        "routes": routes,
+        "policy": policy,
+    }
+
+    if dry_run:
+        existing_data = load_slots(required=False)
+        existing_slots = existing_data.get("slots", {}) or {}
+        verb = "update" if slot in existing_slots else "add"
+        print(f"DRY-RUN: 将 {verb} route pool")
+        print(f"  slot:   {slot}")
+        print(f"  model:  {selected_model}")
+        print(f"  routes: {len(routes)}")
+        for idx, route in enumerate(routes, 1):
+            print(
+                f"    #{idx} {route['id']} "
+                f"protocol={route['protocol']} base_url={route['base_url']} key={mask_api_key(route['api_key'])}"
+            )
+        if no_switch:
+            print("  --no-switch: 不会切换")
+            return 0
+        simulated = dict(existing_data)
+        simulated_slots = dict(existing_slots)
+        simulated_slots[slot] = pool_cfg
+        simulated["slots"] = simulated_slots
+        print()
+        print_switch_plan(compute_switch_plan(simulated, slot))
+        return 0
+
+    with Sub2cliLock():
+        backup_dir = new_backup_dir(f"add-pool-{slot}")
+        snapshot_pre_switch(backup_dir)
+        print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
+        try:
+            ensure_initialized()
+            data = load_slots()
+            slots = data.setdefault("slots", {})
+            existing = slots.get(slot)
+            if existing and existing.get("mode") != "relay":
+                fail(f"渠道 {slot!r} 已存在，但不是 API/route pool 渠道")
+            slots[slot] = pool_cfg
+            save_slots(data)
+            print(f"{'已更新' if existing else '已添加'} route pool：{slot}")
+            print(f"  model:  {selected_model}")
+            print(f"  routes: {len(routes)}")
+            for idx, route in enumerate(routes, 1):
+                group = f" group={route.get('group')}" if route.get("group") is not None else ""
+                print(
+                    f"    #{idx} {route['id']} "
+                    f"protocol={route['protocol']} base_url={route['base_url']}{group}"
+                )
+            if no_switch:
+                print(f"  稍后切换：sub2cli-inject use {slot}")
+                print(f"  回滚命令: sub2cli-inject rollback {backup_dir.name}")
+                return 0
+            return cmd_switch(slot, no_restart=no_restart, backup_dir=backup_dir)
+        except BaseException:
+            auto_rollback_after_failure(backup_dir, "配置 route pool")
+            raise
 
 
 def cmd_relay(
@@ -3034,7 +3996,10 @@ def cmd_list() -> int:
         marker = "*" if key == current else " "
         mode = cfg.get("mode", "oauth")
         label = cfg.get("display_name", key)
-        extra = cfg.get("base_url", "") if mode == "relay" else "(账号登录)"
+        if mode == "relay" and cfg.get("protocol") == "pool":
+            extra = f"pool:{len(pool_routes(cfg))} routes"
+        else:
+            extra = cfg.get("base_url", "") if mode == "relay" else "(账号登录)"
         print(f"{marker} {key:<16} [{mode:<5}] {label:<32} {extra}")
     return 0
 
@@ -3061,6 +4026,9 @@ def cmd_status() -> int:
     else:
         print(f"  auth.json:   {AUTH_JSON} (missing)")
     print(f"  App profile: {'-> ' + os.readlink(APP_PROFILE) if APP_PROFILE.is_symlink() else str(APP_PROFILE)}")
+    if cfg.get("mode") == "relay" and cfg.get("protocol") == "pool":
+        snap = ROUTE_POOL_RUNTIME.snapshot(cfg)
+        print(f"  route pool:  {len(pool_routes(cfg))} routes, active={snap.get('current_route') or '(unknown)'}")
     print(f"  App 运行中:  {'是' if codex_running() else '否'}")
     counts = thread_provider_counts()
     if counts:
@@ -3594,6 +4562,11 @@ def run_internal_command(command: str, argv: list[str]) -> int:
         args = parser.parse_args(argv)
         return run_responses_proxy(args.port)
 
+    if command == "restart-proxy":
+        parser.add_argument("--port", type=int, default=PROTOCOL_PROXY_PORT)
+        args = parser.parse_args(argv)
+        return cmd_restart_proxy(args.port)
+
     fail(f"unknown internal command: {command}")
     return 1
 
@@ -3614,6 +4587,7 @@ def main(argv: list[str] | None = None) -> int:
         "normalize-sessions",
         "rollback",
         "responses-proxy",
+        "restart-proxy",
     }
     if argv and argv[0] in internal_commands:
         return run_internal_command(argv[0], argv[1:])
@@ -3643,6 +4617,17 @@ def main(argv: list[str] | None = None) -> int:
     p_add_api.add_argument("--no-restart", action="store_true")
     p_add_api.add_argument("--dry-run", action="store_true",
                            help="只打印计划改动, 不写入")
+
+    p_add_pool = sub.add_parser("add-pool", help="添加本地 route pool，并切过去")
+    p_add_pool.add_argument("name")
+    p_add_pool.add_argument("--routes-json", required=True,
+                            help="JSON 文件: {policy, routes:[{id, base_url, api_key/api_key_env, protocol, priority, model}]}")
+    p_add_pool.add_argument("--model")
+    p_add_pool.add_argument("--display")
+    p_add_pool.add_argument("--no-switch", action="store_true")
+    p_add_pool.add_argument("--no-restart", action="store_true")
+    p_add_pool.add_argument("--dry-run", action="store_true",
+                            help="只打印计划改动, 不写入")
 
     p_add_account = sub.add_parser("add-account", help="添加 Codex 登录账号，并切过去")
     p_add_account.add_argument("name")
@@ -3691,6 +4676,16 @@ def main(argv: list[str] | None = None) -> int:
             protocol=args.protocol,
             display=args.display,
             skip_probe=args.skip_probe,
+            no_switch=args.no_switch,
+            no_restart=args.no_restart,
+            dry_run=args.dry_run,
+        )
+    if args.command == "add-pool":
+        return cmd_pool(
+            args.name,
+            routes_json=args.routes_json,
+            model=args.model,
+            display=args.display,
             no_switch=args.no_switch,
             no_restart=args.no_restart,
             dry_run=args.dry_run,

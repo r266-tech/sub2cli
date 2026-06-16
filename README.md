@@ -7,11 +7,15 @@
 macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-class.
 
 <p align="center">
-  <img src="docs/images/sub2cli-dashboard.png" alt="sub2cli relay dashboard" width="960">
+  <img src="docs/images/sub2cli-route-pool.png" alt="sub2cli route pool dashboard" width="960">
 </p>
 
 <p align="center">
+  <img src="docs/images/sub2cli-dashboard.png" alt="sub2cli relay dashboard" width="49%">
   <img src="docs/images/sub2cli-official-account.png" alt="sub2cli official Codex account dashboard" width="49%">
+</p>
+
+<p align="center">
   <img src="docs/images/sub2cli-config-picker.png" alt="sub2cli choose Codex config target" width="49%">
 </p>
 
@@ -19,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.3`
+Current desktop version: `v0.2.4`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -160,6 +164,49 @@ printf '%s' "$OPENAI_API_KEY" | sub2cli-inject add-api https://www.codex2api.com
 # Interactive hidden API key prompt.
 sub2cli-inject add-api https://www.codex2api.com/v1
 
+# Add/switch to a local route pool. Codex points at one local proxy URL;
+# the proxy chooses routes by priority and fails over without relaunching Codex.
+cat > /tmp/sub2cli-routes.json <<'JSON'
+{
+  "policy": {
+    "fail_consecutive": 2,
+    "recovery_successes": 2,
+    "min_dwell_seconds": 90,
+    "probe_interval_seconds": 30,
+    "fallback_probe_interval_seconds": 180
+  },
+  "routes": [
+    {
+      "id": "relay-a-group-a",
+      "priority": 10,
+      "base_url": "https://relay-a.example.com/v1",
+      "api_key_env": "RELAY_A_GROUP_A_KEY",
+      "protocol": "responses",
+      "model": "gpt-5.5",
+      "group": "A"
+    },
+    {
+      "id": "relay-a-group-b",
+      "priority": 20,
+      "base_url": "https://relay-a.example.com/v1",
+      "api_key_env": "RELAY_A_GROUP_B_KEY",
+      "protocol": "responses",
+      "model": "gpt-5.5",
+      "group": "B"
+    },
+    {
+      "id": "custom-url-1",
+      "priority": 30,
+      "base_url": "https://url1.example.com/v1",
+      "api_key_env": "CUSTOM_URL_1_KEY",
+      "protocol": "chat",
+      "model": "gpt-5.5"
+    }
+  ]
+}
+JSON
+sub2cli-inject add-pool work-pool --routes-json /tmp/sub2cli-routes.json
+
 # Add/import an official Codex account slot.
 sub2cli-inject add-account work --auth-file ~/.codex/auth.json
 
@@ -175,6 +222,7 @@ sub2cli-inject rollback latest
 `sub2cli-inject` rejects positional API keys intentionally. Use `--api-key-stdin` or the hidden prompt.
 
 When Codex is relaunched after `add-api` or `use`, sub2cli only updates local Codex config files and opens the app through the native macOS app launch path.
+Route pool slots are different: Codex is configured once to `http://127.0.0.1:18765/v1`, then the local proxy performs priority failover internally. Higher-priority routes are probed more often, lower-priority fallback routes are probed less often, and recovered higher-priority routes preempt after the configured dwell/recovery thresholds.
 
 ## Requirements
 
@@ -197,7 +245,10 @@ macOS Keychain                           relay tokens and optional relay login c
 ~/.codex/auth.<slot>.json                saved account/channel auth files
 ~/.codex/auth.json                       active Codex auth file
 ~/.codex/config.toml                     active Codex model provider config
+~/.codex/state_5.sqlite                  legacy Codex thread index
+~/.codex/sqlite/state_5.sqlite           newer Codex App thread index
 ~/.codex/.sub2cli-inject.lock            shared mutation lock
+~/.codex/sub2cli-responses-proxy.log      local proxy / route-pool diagnostics
 ~/.codex/provider-switch-backups/        rollback snapshots
 ```
 
@@ -214,6 +265,7 @@ Current behavior:
 - before switching, flush the current `auth.json` back into the previous slot when possible
 - switch by atomic-copying the selected slot into `auth.json`
 - keep `~/Library/Application Support/Codex` profile switching separate
+- keep existing Codex conversations untouched by default; `normalize-sessions` remains a manual recovery tool
 - use one lock file for all Codex state mutations
 
 This keeps official accounts, API relay slots and Codex App refreshes from corrupting each other.
@@ -251,7 +303,10 @@ docs/images/     README screenshots
 ~/Library/Application Support/Codex profile slot
 ```
 
+It does not rewrite existing conversation provider tags during normal switching.
+The manual `normalize-sessions` recovery command checks both known Codex thread-index locations.
 For relay slots, `provider-slots.json` also caches the last model list returned by `/v1/models` for config selection and diagnostics.
+For route pool slots, `provider-slots.json` stores route metadata and API keys for the local proxy, matching the existing relay-slot storage model.
 
 ## Build Desktop DMG
 
@@ -272,6 +327,12 @@ desktop/dist/sub2cli-<version>.dmg
 The current release is unsigned and not notarized.
 
 ## Release Notes
+
+### v0.2.4
+
+- added a route pool dashboard that shows active route, route health, failover state, and per-route status at a glance
+- compacted the route pool table to status/source/group controls, with right-click route deletion
+- limited route pool `[LOG]` output to connection-pool test/failover/change events instead of basic request access logs
 
 ### v0.2.3
 

@@ -43,6 +43,7 @@
   </div>
   <div class="header-actions">
     <button class="btn-action btn-config-top" id="btn-inject" title="选择配置到 Codex 的目标">⚡ 配置 Codex</button>
+    <button class="btn-action btn-pool-top" id="btn-manage-pool" title="打开连接池管理">管理连接池</button>
     <div class="dropdown account-anchor">
       <button class="btn-action" id="btn-account" title="账号">👤 <span id="account-email">未设</span> <span style="font-size: 8px;">▼</span></button>
       <div class="account-pop hidden" id="account-pop">
@@ -326,11 +327,88 @@
 
       </div>
 
+      <div class="route-pool-dashboard hidden" id="route-pool-dashboard">
+        <div class="pool-layout">
+          <div class="pool-main">
+            <div class="pool-status-hud" id="route-pool-hud">
+              <div class="pool-hud-active">
+                <div class="pool-hud-kicker">CURRENT ROUTE</div>
+                <div class="pool-hud-route" id="route-pool-active-route">—</div>
+                <div class="pool-hud-detail" id="route-pool-active-detail">连接池状态未读取</div>
+              </div>
+              <div class="pool-hud-counters" id="route-pool-counters">
+                <div class="pool-counter">
+                  <span class="pool-counter-value" id="route-pool-count-active">0</span>
+                  <span class="pool-counter-label">ACTIVE</span>
+                </div>
+                <div class="pool-counter">
+                  <span class="pool-counter-value" id="route-pool-count-healthy">0</span>
+                  <span class="pool-counter-label">HEALTHY</span>
+                </div>
+                <div class="pool-counter">
+                  <span class="pool-counter-value" id="route-pool-count-degraded">0</span>
+                  <span class="pool-counter-label">DEGRADED</span>
+                </div>
+                <div class="pool-counter">
+                  <span class="pool-counter-value" id="route-pool-count-failed">0</span>
+                  <span class="pool-counter-label">FAILED</span>
+                </div>
+              </div>
+            </div>
+            <div class="table-container pool-route-table">
+              <div class="table-header">
+                <div class="table-title">⇄ ROUTES</div>
+                <div class="table-action-group">
+                  <span class="pool-route-count" id="route-pool-route-count">0 ROUTES</span>
+                  <button class="btn-action" id="btn-route-pool-toggle-add">添加</button>
+                  <button class="btn-action" id="btn-route-pool-refresh">刷新</button>
+                  <button class="btn-action" id="btn-route-pool-restart">重启服务</button>
+                  <button class="btn-action primary" id="btn-route-pool-save">保存</button>
+                </div>
+              </div>
+              <div class="pool-inline-editor hidden" id="route-pool-editor">
+                <span class="pool-block-label">来源</span>
+                <select id="route-pool-source-type" aria-label="选择 route 来源">
+                  <option value="custom">API</option>
+                  <option value="relay">中转</option>
+                </select>
+                <select id="route-pool-relay-domain" aria-label="选择中转站"></select>
+                <select id="route-pool-relay-key" aria-label="选择中转 key"></select>
+                <select id="route-pool-relay-endpoint" aria-label="选择中转端点"></select>
+                <select id="route-pool-custom-api" aria-label="选择 API"></select>
+                <button class="btn-action primary" id="btn-route-pool-add-route">添加到队列</button>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>状态</th>
+                    <th>来源</th>
+                    <th>分组</th>
+                  </tr>
+                </thead>
+                <tbody id="route-pool-body"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="pool-side">
+            <div class="pool-panel">
+              <div class="pool-panel-title">[LOG]</div>
+              <div class="pool-status" id="route-pool-status">连接池日志未读取</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
     </section>
 
   </main>
 
 </div>
+</div>
+
+<div class="pool-context-menu hidden" id="route-pool-context-menu" role="menu" aria-label="route 操作菜单">
+  <button type="button" class="pool-context-menu-item danger" id="route-pool-context-delete" role="menuitem">删除 route</button>
 </div>
 
 <div class="modal-overlay hidden" id="health-modal">
@@ -448,19 +526,11 @@
     <div class="modal-body">
       <div class="config-choice-row">
         <div>
-          <div class="config-choice-label">中转</div>
-          <select class="config-choice-select" id="choice-relay" aria-label="选择中转"></select>
-          <div class="config-choice-meta" id="choice-relay-meta">使用保存好的中转 url + key</div>
+          <div class="config-choice-label">连接池配置</div>
+          <div class="config-choice-static" id="choice-pool-label">连接池</div>
+          <div class="config-choice-meta" id="choice-pool-meta">按连接池队列顺序自动切换 url + key</div>
         </div>
-        <button class="btn-action primary" id="btn-config-relay">配置</button>
-      </div>
-      <div class="config-choice-row">
-        <div>
-          <div class="config-choice-label">自定义 API</div>
-          <select class="config-choice-select" id="choice-custom" aria-label="选择自定义 API"></select>
-          <div class="config-choice-meta" id="choice-custom-meta">使用保存好的自定义 url + key</div>
-        </div>
-        <button class="btn-action primary" id="btn-config-custom">配置</button>
+        <button class="btn-action primary" id="btn-config-pool">配置</button>
       </div>
       <div class="config-choice-row">
         <div>
