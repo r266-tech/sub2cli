@@ -12,11 +12,13 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import plistlib
 import re
 import base64
 import errno
 import fcntl
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -60,6 +62,7 @@ INJECT_BACKUP_ROOT = CODEX_HOME_PATH / "provider-switch-backups"
 AUTO_ROLLBACK_MARKER = ".auto-rollback-done"
 UPDATE_CACHE_DIR = Path.home() / "Library" / "Caches" / "sub2cli" / "updates"
 UPDATE_LOG_PATH = Path.home() / "Library" / "Logs" / "sub2cli-updater.log"
+UPDATE_DOWNLOAD_MAX_BYTES = 300 * 1024 * 1024
 
 CODEX_CLI_FALLBACKS = (
     "~/bin/codex",
@@ -292,6 +295,155 @@ def _release_dmg_asset(release: dict | None) -> dict | None:
         return None
     preferred = [a for a in candidates if "sub2cli" in str(a.get("name") or "").lower()]
     return (preferred or candidates)[0]
+
+
+def _read_bundle_version(app_path: Path) -> str | None:
+    plist_path = app_path / "Contents" / "Info.plist"
+    try:
+        with plist_path.open("rb") as fh:
+            version = plistlib.load(fh).get("CFBundleShortVersionString")
+        return str(version or "").strip() or None
+    except Exception:
+        return None
+
+
+def _app_from_mounted_dmg(mount_point: Path) -> Path | None:
+    for candidate in mount_point.iterdir():
+        if candidate.name == "sub2cli.app" and candidate.is_dir():
+            return candidate
+    apps = sorted(
+        [p for p in mount_point.glob("*.app") if p.is_dir()],
+        key=lambda p: (p.name != "sub2cli.app", p.name.lower()),
+    )
+    return apps[0] if apps else None
+
+
+def _download_release_asset(url: str, dest: Path, *, timeout: int = 20) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with requests.get(url, stream=True, timeout=timeout) as resp:
+            resp.raise_for_status()
+            total = 0
+            with tmp.open("wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > UPDATE_DOWNLOAD_MAX_BYTES:
+                        raise RuntimeError("下载文件超过 300MB，已停止")
+                    fh.write(chunk)
+        os.replace(tmp, dest)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _hdiutil_attach(dmg_path: Path) -> Path:
+    proc = subprocess.run(
+        [
+            "hdiutil",
+            "attach",
+            str(dmg_path),
+            "-nobrowse",
+            "-readonly",
+            "-plist",
+        ],
+        capture_output=True,
+        text=False,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"hdiutil attach 失败: {stderr.strip() or proc.returncode}")
+    body = plistlib.loads(proc.stdout)
+    for entity in body.get("system-entities") or []:
+        mount_point = entity.get("mount-point")
+        if mount_point:
+            return Path(mount_point)
+    raise RuntimeError("DMG 未返回 mount-point")
+
+
+def _hdiutil_detach(mount_point: Path) -> None:
+    subprocess.run(
+        ["hdiutil", "detach", str(mount_point), "-quiet"],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def _stage_update_app_from_dmg(dmg_path: Path, latest: str) -> Path:
+    stage_root = UPDATE_CACHE_DIR / f"stage-{latest}-{os.getpid()}-{time.time_ns()}"
+    staged_app = stage_root / "sub2cli.app"
+    mount_point: Path | None = None
+    try:
+        mount_point = _hdiutil_attach(dmg_path)
+        source_app = _app_from_mounted_dmg(mount_point)
+        if source_app is None:
+            raise RuntimeError("DMG 中没有找到 .app")
+        bundled_version = _read_bundle_version(source_app)
+        if bundled_version != latest:
+            raise RuntimeError(f"DMG app 版本不匹配: {bundled_version or '?'} != {latest}")
+        if staged_app.exists():
+            shutil.rmtree(staged_app)
+        staged_app.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_app, staged_app, symlinks=True)
+    finally:
+        if mount_point is not None:
+            _hdiutil_detach(mount_point)
+    return staged_app
+
+
+def _write_update_script(*, staged_app: Path, target_app: Path, latest: str) -> Path:
+    UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    UPDATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    script_path = UPDATE_CACHE_DIR / f"install-{latest}-{os.getpid()}-{time.time_ns()}.sh"
+    backup_app = UPDATE_CACHE_DIR / f"backup-{latest}-{os.getpid()}-{time.time_ns()}.app"
+    target_parent = target_app.parent
+    script = f"""#!/bin/sh
+set -eu
+LOG={shlex.quote(str(UPDATE_LOG_PATH))}
+exec >>"$LOG" 2>&1
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] sub2cli updater start latest={latest}"
+STAGED_APP={shlex.quote(str(staged_app))}
+TARGET_APP={shlex.quote(str(target_app))}
+BACKUP_APP={shlex.quote(str(backup_app))}
+TARGET_PARENT={shlex.quote(str(target_parent))}
+mkdir -p "$TARGET_PARENT"
+osascript -e 'tell application id "com.r266-tech.sub2cli" to quit' || true
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if pgrep -f "$TARGET_APP/Contents/MacOS/sub2cli" >/dev/null 2>&1; then
+    sleep 1
+  else
+    break
+  fi
+done
+rm -rf "$BACKUP_APP"
+if [ -d "$TARGET_APP" ]; then
+  mv "$TARGET_APP" "$BACKUP_APP"
+fi
+if cp -R "$STAGED_APP" "$TARGET_APP"; then
+  xattr -dr com.apple.quarantine "$TARGET_APP" >/dev/null 2>&1 || true
+  rm -rf "$BACKUP_APP"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] sub2cli updater installed $TARGET_APP"
+  open "$TARGET_APP" || true
+  exit 0
+fi
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] sub2cli updater copy failed"
+rm -rf "$TARGET_APP"
+if [ -d "$BACKUP_APP" ]; then
+  mv "$BACKUP_APP" "$TARGET_APP"
+  open "$TARGET_APP" || true
+fi
+exit 1
+"""
+    script_path.write_text(script, encoding="utf-8")
+    script_path.chmod(0o755)
+    return script_path
 
 
 def _kc_creds_set(domain: str, email: str, password: str, *, allow_prompt: bool = False) -> bool:
@@ -2424,13 +2576,62 @@ class JsApi:
             "download_url": asset.get("browser_download_url") if asset else None,
             "asset_name": asset.get("name") if asset else None,
             "release_name": body.get("name"),
+            "can_install": bool(has_update and asset and asset.get("browser_download_url")),
         }
 
     def install_update(self) -> dict:
-        """Disabled for unsigned releases; the UI opens GitHub Releases instead."""
+        """Download the latest DMG, stage its .app, then hand off replacement.
+
+        The running process cannot safely replace its own .app bundle. This
+        method prepares the update and launches a tiny detached shell script
+        that quits sub2cli, swaps the bundle, and reopens the app.
+        """
+        current = _read_app_version()
+        release, error = _fetch_latest_release(timeout=12)
+        if error or not release:
+            return {"ok": False, "error": error or "读取 release 失败"}
+        latest = (release.get("tag_name") or "").lstrip("v")
+        if not latest:
+            return {"ok": False, "error": "latest release 缺少 tag"}
+        if current not in ("dev", "?") and _parse_semver(latest) <= _parse_semver(current):
+            return {"ok": False, "error": f"当前已是最新版本 v{current}"}
+        asset = _release_dmg_asset(release)
+        if not asset:
+            return {"ok": False, "error": f"v{latest} release 没有可下载 DMG"}
+        download_url = asset.get("browser_download_url")
+        if not download_url:
+            return {"ok": False, "error": "release DMG 缺少下载 URL"}
+        target_app = _running_app_bundle_path() or Path("/Applications/sub2cli.app")
+        if target_app.name != "sub2cli.app":
+            return {"ok": False, "error": f"当前 app 路径不支持自动更新: {target_app}"}
+        try:
+            UPDATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            asset_name = str(asset.get("name") or f"sub2cli-{latest}.dmg")
+            if "/" in asset_name or asset_name.startswith("."):
+                asset_name = f"sub2cli-{latest}.dmg"
+            dmg_path = UPDATE_CACHE_DIR / asset_name
+            _download_release_asset(download_url, dmg_path, timeout=30)
+            staged_app = _stage_update_app_from_dmg(dmg_path, latest)
+            script_path = _write_update_script(
+                staged_app=staged_app,
+                target_app=target_app,
+                latest=latest,
+            )
+            subprocess.Popen(
+                ["nohup", str(script_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         return {
-            "ok": False,
-            "error": "当前发布为 unsigned app，自动替换 .app 容易触发 Gatekeeper/权限问题；请从 release 页面手动下载并按 README 安装。",
+            "ok": True,
+            "current": current,
+            "latest": latest,
+            "asset_name": asset_name,
+            "message": "已下载更新，正在退出并替换 sub2cli.app",
+            "log_path": str(UPDATE_LOG_PATH),
         }
 
     def customize_chrome(self) -> dict:

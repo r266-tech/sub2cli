@@ -76,7 +76,7 @@ FORCE_QUIT_CODEX = os.environ.get("SUB2CLI_CODEX_FORCE_QUIT", "1").lower() not i
     "no",
     "off",
 }
-APP_VERSION = "0.2.4"
+APP_VERSION = "0.2.6"
 APP_URL = os.environ.get(
     "SUB2CLI_URL",
     os.environ.get("CODEX_PROVIDER_URL", "https://github.com/r266-tech/sub2cli"),

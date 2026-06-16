@@ -1196,7 +1196,7 @@ function routePoolStatusText() {
   const logs = status && Array.isArray(status.logs)
     ? status.logs.filter((line) => line && isRoutePoolEventLog(line))
     : [];
-  if (logs.length) return logs.slice(-120).join('\n');
+  if (logs.length) return compactRoutePoolEventLogs(logs).slice(-120).join('\n');
   if (!status) return '[INFO] 连接池日志未读取';
   if (!status.ok) {
     const error = status.error || '';
@@ -1222,6 +1222,67 @@ function routePoolStatusText() {
 
 function isRoutePoolEventLog(line) {
   return /\bpool (route|monitor)\b/i.test(String(line || ''));
+}
+
+function parseRoutePoolFailureLog(line) {
+  const raw = String(line || '');
+  const match = raw.match(/^\[([^\]]+)\]\s+pool route failure\s+(\S+)\s+kind=([^\s]+)(?:\s+status=([^\s]+))?(?:\s+detail=(.*))?$/i);
+  if (!match) return null;
+  return {
+    line: raw,
+    timestamp: match[1] || '',
+    routeId: match[2] || '',
+    kind: match[3] || '',
+    status: match[4] || '',
+    detail: match[5] || '',
+  };
+}
+
+function routePoolFailureSignature(entry) {
+  return [entry.routeId, entry.kind, entry.status, entry.detail].join('\u0001');
+}
+
+function formatRoutePoolFailureGroup(group) {
+  if (group.length <= 1) return group[0] ? group[0].line : '';
+  const first = group[0];
+  const last = group[group.length - 1];
+  let span = first.timestamp || last.timestamp || 'time unknown';
+  if (first.timestamp && last.timestamp && first.timestamp !== last.timestamp) {
+    const sameDate = first.timestamp.slice(0, 10) === last.timestamp.slice(0, 10);
+    span = `${first.timestamp} -> ${sameDate ? last.timestamp.slice(11) : last.timestamp}`;
+  }
+  const status = first.status ? ` status=${first.status}` : '';
+  const detail = first.detail ? ` detail=${first.detail}` : '';
+  return `[${span}] pool route failure ${first.routeId} kind=${first.kind}${status} x${group.length}${detail}`;
+}
+
+function compactRoutePoolEventLogs(lines) {
+  const out = [];
+  let block = new Map();
+  let blockOrder = [];
+  const flush = () => {
+    if (!blockOrder.length) return;
+    for (const key of blockOrder) out.push(formatRoutePoolFailureGroup(block.get(key) || []));
+    block = new Map();
+    blockOrder = [];
+  };
+
+  for (const line of lines) {
+    const failure = parseRoutePoolFailureLog(line);
+    if (!failure) {
+      flush();
+      out.push(String(line));
+      continue;
+    }
+    const nextSignature = routePoolFailureSignature(failure);
+    if (!block.has(nextSignature)) {
+      block.set(nextSignature, []);
+      blockOrder.push(nextSignature);
+    }
+    block.get(nextSignature).push(failure);
+  }
+  flush();
+  return out;
 }
 
 function renderRoutePoolStatus(extraText) {
@@ -4112,7 +4173,9 @@ async function initVersionChip() {
       chip.title = `当前版本 v${r.current || '?'} · 新版 v${r.latest} 可用`;
       if (updateBtn) {
         updateBtn.classList.remove('hidden');
-        updateBtn.title = `打开 v${r.latest} release`;
+        updateBtn.title = r.can_install
+          ? `一键更新到 v${r.latest}`
+          : `打开 v${r.latest} release`;
       }
     }
   } catch (_) {}
@@ -4123,17 +4186,19 @@ async function installAppUpdate() {
   if (!latestUpdateInfo || !btn) return;
   btn.disabled = true;
   const previousTitle = btn.title;
-  btn.title = `打开 v${latestUpdateInfo.latest} release 页面…`;
+  btn.title = `正在更新到 v${latestUpdateInfo.latest}…`;
   try {
-    const url = latestUpdateInfo.html_url || PROJECT_URL;
-    const r = await window.pywebview.api.open_url(url);
+    if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.install_update) {
+      throw new Error('当前版本不支持一键更新');
+    }
+    const r = await window.pywebview.api.install_update();
     if (!r || !r.ok) {
       btn.disabled = false;
-      btn.title = (r && r.error) || '打开 release 失败';
-      alert((r && r.error) || '打开 release 失败');
+      btn.title = (r && r.error) || '更新失败';
+      alert((r && r.error) || '更新失败');
       return;
     }
-    btn.title = '已打开 release 页面，按 README 手动替换 unsigned app';
+    btn.title = '更新已下载，正在重启 app…';
   } catch (err) {
     btn.disabled = false;
     btn.title = previousTitle;

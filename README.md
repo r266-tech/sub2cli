@@ -23,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.4`
+Current desktop version: `v0.2.6`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -328,6 +328,14 @@ The current release is unsigned and not notarized.
 
 ## Release Notes
 
+### v0.2.6
+
+- added one-click desktop updates from the in-app update icon: download the latest DMG, replace `/Applications/sub2cli.app`, and reopen the app
+
+### v0.2.5
+
+- grouped repeated route-pool failure logs into compact time-window summaries such as `x73`, while keeping route switch and recovery events visible
+
 ### v0.2.4
 
 - added a route pool dashboard that shows active route, route health, failover state, and per-route status at a glance
@@ -360,7 +368,7 @@ The current release is unsigned and not notarized.
 ## Roadmap
 
 - first-run Edge/Chromium CDP guide when `127.0.0.1:9222` is unavailable
-- unsigned update prompt that opens GitHub Releases
+- one-click desktop updater hardening for unsigned builds
 - signed/notarized distribution when Apple Developer signing is available
 - background health monitor for relays and one-click failover
 
