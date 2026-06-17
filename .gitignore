@@ -30,3 +30,8 @@ desktop/.venv/
 desktop/.build/
 desktop/build/
 desktop/dist/
+
+# local research / tool output
+.playwright-mcp/
+_references/
+docs/audit/
