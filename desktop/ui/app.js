@@ -379,6 +379,7 @@ async function refresh() {
     state.pingResults = {};
     state.groupResults = {};
     applyBootstrap(data);
+    await refreshRoutePools();
     setStatus('✓ 已刷新', 'ok');
   } catch (err) {
     showError('刷新失败', err && err.message ? err.message : String(err));
@@ -717,11 +718,13 @@ function showRelayDashboard() {
   stopRoutePoolStatusRefresh();
 }
 
-function showRoutePoolDashboard() {
+async function showRoutePoolDashboard() {
+  state.routePoolMessage = '[INFO] 正在读取连接池...';
+  await refreshRoutePools();
   state.viewMode = 'pool';
   renderMainMode();
   startRoutePoolStatusRefresh();
-  refreshRoutePools();
+  renderRoutePoolDashboard();
 }
 
 function renderMainMode() {
@@ -1443,27 +1446,83 @@ async function updateRoutePoolRouteSource(route, value) {
 function routePoolGroupRows(route) {
   if (route.source_type === 'custom') return [{ value: 'default', label: '默认' }];
   const source = routePoolRelaySourceByDomain(route.relay_domain || '');
-  const rows = ((source && source.keys) || []).map((key) => ({
-    value: String(key.id),
-    label: `${key.group_name || '未分组'} · ${key.name || key.id} (${fmtRate(key.group_rate)})`,
+  const rows = ((source && source.groups) || []).map((group) => ({
+    value: String(group.id),
+    label: `${group.name || '未分组'} (${fmtRate(group.rate_multiplier)})`,
   }));
-  const current = route.key_id == null ? '' : String(route.key_id);
+  const current = route.group_id == null ? '' : String(route.group_id);
   if (current && !rows.some((row) => row.value === current)) {
     rows.unshift({
       value: current,
-      label: `${route.group_name || '未分组'} · ${route.key_name || current} (${fmtRate(route.group_rate)})`,
+      label: `${route.group_name || '未分组'} (${fmtRate(route.group_rate)})`,
     });
   }
   return rows;
 }
 
-function updateRoutePoolRouteGroup(route, value) {
+function routePoolKeyNameRows(route) {
+  if (route.source_type === 'custom') {
+    return [{
+      value: route.custom_api_id || 'custom',
+      label: route.custom_api_name || route.label || route.custom_api_id || 'API',
+    }];
+  }
+  const source = routePoolRelaySourceByDomain(route.relay_domain || '');
+  const rows = ((source && source.keys) || []).map((key) => ({
+    value: String(key.id),
+    label: key.name || String(key.id),
+  }));
+  const current = route.key_id == null ? '' : String(route.key_id);
+  if (current && !rows.some((row) => row.value === current)) {
+    rows.unshift({
+      value: current,
+      label: route.key_name || current,
+    });
+  }
+  return rows;
+}
+
+function routePoolCurrentKeyValue(route) {
+  return route.key_id == null ? '' : String(route.key_id);
+}
+
+function updateRoutePoolRouteName(route, value) {
   if (route.source_type !== 'relay') return;
   const source = routePoolRelaySourceByDomain(route.relay_domain || '');
   const key = ((source && source.keys) || []).find((item) => String(item.id) === String(value));
   if (!key) return;
   applyRelayKeyToRoute(route, source, key);
   renderRoutePoolDashboard();
+}
+
+async function updateRoutePoolRouteKeyGroup(route, value) {
+  if (route.source_type !== 'relay') return;
+  const source = routePoolRelaySourceByDomain(route.relay_domain || '');
+  const previous = cloneJson(route);
+  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.route_pool_update_key_group) return;
+  try {
+    const r = await window.pywebview.api.route_pool_update_key_group(
+      route.relay_domain || '',
+      route.key_id,
+      value,
+    );
+    if (!r || !r.ok) {
+      Object.assign(route, previous);
+      renderRoutePoolDashboard();
+      renderRoutePoolStatus(`[ERR] ${(r && r.error) || '切换 route 分组失败'}`);
+      return;
+    }
+    if (r.source) upsertRoutePoolRelaySource({ ...r.source, loading: false });
+    if (r.key) {
+      const refreshed = routePoolRelaySourceByDomain(route.relay_domain || '');
+      applyRelayKeyToRoute(route, refreshed || source, r.key);
+    }
+    renderRoutePoolDashboard();
+  } catch (err) {
+    Object.assign(route, previous);
+    renderRoutePoolDashboard();
+    renderRoutePoolStatus(`[ERR] ${err && err.message ? err.message : String(err)}`);
+  }
 }
 
 function closeRoutePoolContextMenu() {
@@ -1556,11 +1615,13 @@ function renderRoutePoolRoutes() {
       children: [sourceSelect],
     }));
 
-    const groupSelect = el('select', {
+    const nameSelect = el('select', {
       className: 'pool-route-select',
       attrs: {
-        'aria-label': '切换 route 分组',
-        title: display.group,
+        'aria-label': '切换 route 名称',
+        title: route.source_type === 'custom'
+          ? (route.custom_api_name || route.label || route.custom_api_id || 'API')
+          : (route.key_name || ''),
       },
     });
     const source = routePoolRelaySourceByDomain(route.relay_domain || '');
@@ -1569,6 +1630,31 @@ function renderRoutePoolRoutes() {
         if (state.viewMode === 'pool') renderRoutePoolDashboard();
       });
     }
+    const relayEmpty = source && source.loading
+      ? '加载中...'
+      : source && source.error
+        ? source.error
+        : '无名称';
+    setSelectOptions(
+      nameSelect,
+      routePoolKeyNameRows(route),
+      route.source_type === 'custom' ? (route.custom_api_id || 'custom') : routePoolCurrentKeyValue(route),
+      relayEmpty,
+    );
+    nameSelect.disabled = route.source_type === 'custom' || nameSelect.disabled;
+    nameSelect.addEventListener('contextmenu', (e) => e.stopPropagation());
+    nameSelect.addEventListener('change', () => updateRoutePoolRouteName(route, nameSelect.value));
+    tr.appendChild(el('td', {
+      children: [nameSelect],
+    }));
+
+    const groupSelect = el('select', {
+      className: 'pool-route-select',
+      attrs: {
+        'aria-label': '切换 route 分组',
+        title: display.group,
+      },
+    });
     const groupEmpty = source && source.loading
       ? '加载中...'
       : source && source.error
@@ -1577,12 +1663,12 @@ function renderRoutePoolRoutes() {
     setSelectOptions(
       groupSelect,
       routePoolGroupRows(route),
-      route.key_id == null ? 'default' : String(route.key_id),
+      route.source_type === 'custom' ? 'default' : (route.group_id == null ? '' : String(route.group_id)),
       groupEmpty,
     );
     groupSelect.disabled = route.source_type === 'custom' || groupSelect.disabled;
     groupSelect.addEventListener('contextmenu', (e) => e.stopPropagation());
-    groupSelect.addEventListener('change', () => updateRoutePoolRouteGroup(route, groupSelect.value));
+    groupSelect.addEventListener('change', () => updateRoutePoolRouteKeyGroup(route, groupSelect.value));
     tr.appendChild(el('td', {
       children: [groupSelect],
     }));
@@ -1595,7 +1681,7 @@ function renderRoutePoolRoutes() {
       children: [el('td', {
         className: 'muted small',
         text: '还没有 route，点击「添加」后选择 API 或中转。',
-        attrs: { colspan: '3' },
+        attrs: { colspan: '4' },
       })],
     }));
   }
@@ -1801,6 +1887,16 @@ async function saveRoutePool({ silent = false } = {}) {
     const r = await window.pywebview.api.save_route_pool(cloneJson(draft));
     if (!r || !r.ok) {
       if (!silent) setStatus((r && r.error) || '保存连接池失败', 'err');
+      if (!silent) renderRoutePoolStatus(`[ERR] ${(r && r.error) || '保存连接池失败'}`);
+      return null;
+    }
+    const savedPool = (r.pools || []).find((item) => item.id === (r.saved_id || r.current_id || state.currentRoutePoolId));
+    const savedRouteCount = savedPool && Array.isArray(savedPool.routes) ? savedPool.routes.length : 0;
+    const draftRouteCount = Array.isArray(draft.routes) ? draft.routes.length : 0;
+    if (draftRouteCount && savedRouteCount !== draftRouteCount) {
+      const message = `保存连接池失败: 提交 ${draftRouteCount} 条，实际保存 ${savedRouteCount} 条`;
+      if (!silent) setStatus(message, 'err');
+      if (!silent) renderRoutePoolStatus(`[ERR] ${message}`);
       return null;
     }
     state.routePools = r.pools || [];
@@ -1809,7 +1905,10 @@ async function saveRoutePool({ silent = false } = {}) {
     state.routePoolStatus = r.status || state.routePoolStatus;
     const saved = state.routePools.find((item) => item.id === state.currentRoutePoolId);
     if (saved) state.routePoolDraft = cloneJson(saved);
-    if (!silent) setStatus('✓ 已保存连接池', 'ok');
+    if (!silent) {
+      setStatus('✓ 已保存连接池', 'ok');
+      renderRoutePoolStatus(`[READY] 已保存连接池 · ${draftRouteCount} routes`);
+    }
     return state.currentRoutePoolId;
   } catch (err) {
     if (!silent) setStatus(err && err.message ? err.message : String(err), 'err');
@@ -3232,7 +3331,7 @@ async function applyInject() {
   setStatus('配置中…', 'warn');
   const isOfficial = state.currentInjectTarget === 'official';
   renderInjectState('正在配置 Codex', [
-    { state: 'ok', title: `读取${isOfficial ? '官方账号' : '当前中转'}`, detail: isOfficial ? '使用已选择的官方账号作为配置目标' : '使用 API Keys 中选用的 Codex key 和端点作为配置目标' },
+    { state: 'ok', title: `读取${isOfficial ? '官方账号' : '当前中转'}`, detail: isOfficial ? '使用已选择的官方账号作为配置目标' : '使用当前中转保存的 Codex key 和端点作为配置目标' },
     { state: 'running', title: '写入 Codex 配置', detail: isOfficial ? '导入账号 auth、切换 auth.json、更新 config.toml 为 OAuth 模式' : '保存 API 渠道、切换 auth.json、更新 config.toml' },
     { state: 'pending', title: '刷新 Codex App', detail: '写入成功后会按 sub2cli-inject 逻辑重启/打开 Codex' },
     { state: 'pending', title: '准备撤销点', detail: '成功后会显示撤销本次配置按钮' },
@@ -3537,27 +3636,6 @@ function buildGroupSelect(currentGroupId, options = {}) {
   return select;
 }
 
-function buildKeyActions(k, isCodexKey) {
-  const actions = el('div', { className: 'key-actions' });
-  actions.appendChild(el('button', {
-    className: 'link sm key-action-btn',
-    text: 'key',
-    attrs: { type: 'button', title: `显示 ${k.name || 'key'} 的完整 key` },
-    onClick: () => openKeySecret(k),
-  }));
-  actions.appendChild(el('button', {
-    className: 'link sm key-action-btn' + (isCodexKey ? ' active' : ''),
-    text: isCodexKey ? '已选' : '选用',
-    attrs: {
-      type: 'button',
-      title: isCodexKey ? '配置 Codex 时已使用此 key' : '配置 Codex 时使用此 key',
-      disabled: isCodexKey ? 'true' : null,
-    },
-    onClick: () => selectCodexKey(k.id),
-  }));
-  return actions;
-}
-
 function buildKeyRow(k, defaultKey, codexKey) {
   const tr = document.createElement('tr');
   const isTestKey = !!(k.is_test_key || (defaultKey && String(defaultKey.id) === String(k.id)));
@@ -3571,7 +3649,18 @@ function buildKeyRow(k, defaultKey, codexKey) {
       isCodexKey ? el('span', { className: 'tag running key-row-badge', text: 'Codex' }) : null,
     ],
   }));
-  tr.appendChild(el('td', { className: 'mono', text: k.key_masked || '—' }));
+  tr.appendChild(el('td', {
+    className: 'mono',
+    children: [
+      el('span', { text: k.key_masked || '—' }),
+      el('button', {
+        className: 'link sm key-inline-secret',
+        text: 'key',
+        attrs: { type: 'button', title: `显示 ${k.name || 'key'} 的完整 key` },
+        onClick: () => openKeySecret(k),
+      }),
+    ],
+  }));
   const groupTd = el('td');
   if (isTestKey) {
     groupTd.appendChild(el('span', { className: 'key-test-auto', text: '测试时自动切换' }));
@@ -3584,10 +3673,6 @@ function buildKeyRow(k, defaultKey, codexKey) {
     groupTd.appendChild(select);
   }
   tr.appendChild(groupTd);
-  tr.appendChild(el('td', {
-    className: 'right',
-    children: [buildKeyActions(k, isCodexKey)],
-  }));
   return tr;
 }
 
@@ -3597,7 +3682,7 @@ function renderKeys(keys, _groups, defaultKey, codexKey = state.codexKey) {
   const frag = document.createDocumentFragment();
   if (!keys.length) {
     frag.appendChild(el('tr', {
-      children: [el('td', { text: '暂无 key', attrs: { colspan: '4' } })],
+      children: [el('td', { text: '暂无 key', attrs: { colspan: '3' } })],
     }));
   } else {
     for (const k of keys) frag.appendChild(buildKeyRow(k, defaultKey, codexKey));
@@ -3924,30 +4009,6 @@ async function setDefaultEndpoint(name) {
     renderEndpoints(state.endpoints, state.defaultEndpoint);
     updateContextLabels();
     setStatus('✓ 已切端点', 'ok');
-  } catch (err) {
-    setStatus('错误', 'err');
-  }
-}
-
-async function selectCodexKey(keyId) {
-  setStatus('切 Codex key 中…', 'warn');
-  try {
-    const r = await window.pywebview.api.set_codex_key(keyId);
-    if (!r.ok) {
-      setStatus(r.error || '切 Codex key 失败', 'err');
-      return;
-    }
-    state.codexKey = r.codex_key || null;
-    if (r.keys) state.keys = r.keys;
-    if (state.codexKey) {
-      syncCurrentRelaySummary({
-        codex_key_name: state.codexKey.name,
-        default_key_name: state.codexKey.name,
-      });
-    }
-    renderKeys(state.keys, state.groups, state.defaultKey, state.codexKey);
-    updateContextLabels();
-    setStatus('✓ 已切 Codex key', 'ok');
   } catch (err) {
     setStatus('错误', 'err');
   }

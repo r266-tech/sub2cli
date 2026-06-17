@@ -2414,6 +2414,7 @@ class JsApi:
             "is_current": domain == cfg.get("domain"),
             "loaded": False,
             "keys": [],
+            "groups": [],
             "endpoints": [],
             "current_endpoint_url": relay_cfg.get("default_endpoint_url") or "",
             "current_endpoint_name": relay_cfg.get("default_endpoint_name") or "",
@@ -2426,11 +2427,13 @@ class JsApi:
             keys = ctx.fetch_keys()
             codex_key = sub2cli_lib.find_codex_key(keys, relay_cfg)
             keys = self._mark_codex_key(keys, codex_key)
+            groups = ctx.fetch_groups()
             settings = ctx.fetch_settings() or {}
             endpoints = sub2cli_lib.collect_endpoints(settings, fallback_site=ctx.domain)
             source.update({
                 "loaded": True,
                 "keys": [self._serialize_key(k) for k in keys],
+                "groups": [self._serialize_group(g) for g in groups],
                 "endpoints": [self._serialize_endpoint(e) for e in endpoints],
                 "current_endpoint_url": relay_cfg.get("default_endpoint_url") or "",
                 "current_endpoint_name": relay_cfg.get("default_endpoint_name") or "",
@@ -3565,6 +3568,43 @@ class JsApi:
         source = self._route_pool_relay_source(cfg, domain, load=True)
         return {"ok": not bool(source.get("error")), "source": source, "error": source.get("error") or ""}
 
+    def route_pool_update_key_group(self, domain: str, key_id: int, group_id: int) -> dict:
+        """Move a relay key to a group from the route-pool table."""
+        domain = (domain or "").strip()
+        with self._lock:
+            cfg = sub2cli_lib.load_config() or {}
+            relays = cfg.get("relays") or {}
+            if domain not in relays and domain != cfg.get("domain"):
+                return {"ok": False, "error": f"未保存的中转站: {domain}"}
+            try:
+                target_key_id = int(key_id)
+                target_group_id = int(group_id)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "key id 或分组 id 无效"}
+            try:
+                ctx = self._relay_ctx_for_domain(cfg, domain)
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": f"无法读取中转 {domain}: {exc}"}
+            keys = ctx.fetch_keys()
+            current = sub2cli_lib.find_key_by_id(keys, target_key_id)
+            if not current:
+                return {"ok": False, "error": f"key 不存在: {target_key_id}"}
+            if current.get("group_id") != target_group_id:
+                ok, err = ctx.update_key_group(target_key_id, target_group_id)
+                if not ok:
+                    return {"ok": False, "error": f"切分组失败: {err}"}
+                keys = ctx.fetch_keys()
+                current = sub2cli_lib.find_key_by_id(keys, target_key_id)
+                if not current:
+                    return {"ok": False, "error": "切完分组后 key 丢失"}
+            source = self._route_pool_relay_source(cfg, domain, load=True)
+        return {
+            "ok": True,
+            "key": self._serialize_key(current),
+            "source": source,
+            "error": source.get("error") or "",
+        }
+
     def list_route_pools(self) -> dict:
         """Saved route pools and current selectable route sources."""
         cfg = sub2cli_lib.load_config() or {}
@@ -3588,6 +3628,8 @@ class JsApi:
         """Create/update a saved route pool. Secrets are intentionally omitted."""
         with self._lock:
             cfg = sub2cli_lib.load_config() or {}
+            submitted_routes = (pool or {}).get("routes") if isinstance(pool, dict) else []
+            submitted_count = len(submitted_routes) if isinstance(submitted_routes, list) else 0
             pools = _route_pools(cfg)
             requested_id = str((pool or {}).get("id") or "").strip()
             existing = _find_route_pool(cfg, requested_id) if requested_id else None
@@ -3600,6 +3642,11 @@ class JsApi:
             else:
                 clean = _sanitize_route_pool(pool, used_ids=used)
                 pools.append(clean)
+            if submitted_count and len(clean.get("routes") or []) != submitted_count:
+                return {
+                    "ok": False,
+                    "error": f"保存失败: {submitted_count} 条 route 中只有 {len(clean.get('routes') or [])} 条有效，请检查来源/名称/分组是否已加载",
+                }
             cfg["current_route_pool"] = clean["id"]
             sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
         listing = self.list_route_pools()
@@ -3762,7 +3809,7 @@ class JsApi:
         if not target:
             return {
                 "ok": False,
-                "error": "未设置 Codex 配置用 key 或端点; 先在 API Keys 点“选用”。",
+                "error": "未设置 Codex 配置用 key 或端点；请先确认当前中转有可用 key，并选择端点。",
             }
         url, api_key, label, models = target
         result = self._run_inject_add_api(url, api_key, models, dry_run=True)
@@ -4724,7 +4771,7 @@ class JsApi:
                         "ok": False,
                         "severity": "warn",
                         "message": "未设置 Codex 配置用 key 或端点",
-                        "fix_hint": "在 API Keys 点“选用”，并选择端点",
+                        "fix_hint": "确认当前中转有可用 key，并选择端点",
                     })
                 else:
                     probe = sub2cli_lib.probe_endpoint(
@@ -4747,7 +4794,7 @@ class JsApi:
                             "ok": False,
                             "severity": "err",
                             "message": f"探测失败 (status={probe.get('status')}): {probe.get('summary')}",
-                            "fix_hint": "切端点或在 API Keys 换 key",
+                            "fix_hint": "切换端点，或在连接池里选择其他 key",
                         })
         except Exception as exc:
             checks.append({
