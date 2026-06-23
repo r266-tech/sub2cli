@@ -2777,6 +2777,12 @@ class JsApi:
                     except Exception:
                         pass
 
+            def _is_main_native_window(w: Any) -> bool:
+                try:
+                    return str(w.title() or "") == "sub2cli"
+                except Exception:
+                    return False
+
             def _ensure_visible_frame(w: Any) -> None:
                 try:
                     screen = w.screen() or AppKit.NSScreen.mainScreen()
@@ -2847,6 +2853,12 @@ class JsApi:
 
             for w in NSApp.windows():
                 try:
+                    if not _is_main_native_window(w):
+                        try:
+                            w.orderOut_(None)
+                        except Exception:
+                            pass
+                        continue
                     if dark is not None:
                         w.setAppearance_(dark)
                     w.setContentMinSize_(NSMakeSize(960.0, 680.0))

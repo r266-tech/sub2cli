@@ -61,6 +61,7 @@ sub2cli_lib = None  # set by _bootstrap()
 WINDOW_WIDTH = 1180
 WINDOW_HEIGHT = 820
 WINDOW_MIN_SIZE = (960, 680)
+MAIN_WINDOW_TITLE = "sub2cli"
 
 # ---- crash log ----
 
@@ -221,10 +222,22 @@ def _restore_main_window(window: webview.Window) -> None:
         from AppKit import NSApp  # type: ignore
         from Foundation import NSMakeRect, NSOperationQueue  # type: ignore
 
+        def _is_main_native_window(native: object) -> bool:
+            try:
+                return str(native.title() or "") == MAIN_WINDOW_TITLE
+            except Exception:
+                return False
+
         def _apply() -> None:
             rect = NSMakeRect(float(x), float(y), float(width), float(height))
             for native in NSApp.windows():
                 try:
+                    if not _is_main_native_window(native):
+                        try:
+                            native.orderOut_(None)
+                        except Exception:
+                            pass
+                        continue
                     native.deminiaturize_(None)
                     native.setFrame_display_(rect, True)
                     native.orderFrontRegardless()
@@ -267,7 +280,7 @@ def main() -> int:
     api = JsApi()
     x, y, width, height = _primary_window_rect()
     window = webview.create_window(
-        "sub2cli",
+        MAIN_WINDOW_TITLE,
         url=f"file://{os.path.join(UI_DIR, 'index.html')}",
         js_api=api,
         width=width,

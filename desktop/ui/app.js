@@ -330,6 +330,7 @@ async function bootstrap(autoRecovered = false) {
   try {
     const data = await window.pywebview.api.bootstrap();
     if (!data.ok) {
+      refreshNavigationLists();
       // auto-recovery: stored token failed → try re-reading fresh token from Edge CDP once
       if (data.needs_login && !autoRecovered) {
         setStatus('token 过期, 从 Edge 重读…', 'warn');
@@ -357,6 +358,7 @@ async function bootstrap(autoRecovered = false) {
     setStatus('✓ 已连接', 'ok');
     showScreen('dashboard');
   } catch (err) {
+    refreshNavigationLists();
     showError('调用 bootstrap 失败', err && err.message ? err.message : String(err));
     setStatus('错误', 'err');
   }
@@ -419,6 +421,14 @@ function applyBootstrap(data) {
   refreshRoutePools();
   updateContextLabels();
   updateAccountChip((data.user && data.user.email) || null);
+}
+
+function refreshNavigationLists() {
+  return Promise.allSettled([
+    refreshSidebar(),
+    refreshCodexAccounts(),
+    refreshCustomApis(),
+  ]);
 }
 
 function updateAccountChip(email) {
