@@ -23,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.6`
+Current desktop version: `v0.2.7`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -327,6 +327,11 @@ desktop/dist/sub2cli-<version>.dmg
 The current release is unsigned and not notarized.
 
 ## Release Notes
+
+### v0.2.7
+
+- fixed startup error states so the sidebar relay/custom API/official account lists finish loading even when the current relay needs login
+- fixed an extra blank macOS helper window appearing beside the main desktop app window
 
 ### v0.2.6
 
