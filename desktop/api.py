@@ -63,6 +63,9 @@ AUTO_ROLLBACK_MARKER = ".auto-rollback-done"
 UPDATE_CACHE_DIR = Path.home() / "Library" / "Caches" / "sub2cli" / "updates"
 UPDATE_LOG_PATH = Path.home() / "Library" / "Logs" / "sub2cli-updater.log"
 UPDATE_DOWNLOAD_MAX_BYTES = 300 * 1024 * 1024
+APP_SUPPORT_DIR = CODEX_PROVIDER_HOME_PATH / "Library" / "Application Support" / "sub2cli"
+RELAY_CREDS_PATH = APP_SUPPORT_DIR / "relay-credentials.json"
+RELAY_CREDS_KEY_PATH = APP_SUPPORT_DIR / "relay-credentials.key"
 
 CODEX_CLI_FALLBACKS = (
     "~/bin/codex",
@@ -446,12 +449,147 @@ exit 1
     return script_path
 
 
+_relay_cred_lock = threading.RLock()
+_relay_cred_key_bytes: bytes | None = None
+
+
+def _ensure_private_file(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _relay_cred_secret_key() -> bytes:
+    global _relay_cred_key_bytes
+    if _relay_cred_key_bytes is not None:
+        return _relay_cred_key_bytes
+    with _relay_cred_lock:
+        if _relay_cred_key_bytes is not None:
+            return _relay_cred_key_bytes
+        if RELAY_CREDS_KEY_PATH.exists():
+            key = base64.urlsafe_b64decode(RELAY_CREDS_KEY_PATH.read_bytes().strip())
+        else:
+            key = os.urandom(32)
+            _ensure_private_file(RELAY_CREDS_KEY_PATH, base64.urlsafe_b64encode(key))
+        _relay_cred_key_bytes = key
+        return _relay_cred_key_bytes
+
+
+def _relay_cred_encode(value: str) -> str:
+    data = value.encode("utf-8")
+    key = _relay_cred_secret_key()
+    stream = (key * ((len(data) // len(key)) + 1))[:len(data)]
+    encoded = bytes(a ^ b for a, b in zip(data, stream))
+    return base64.urlsafe_b64encode(encoded).decode("ascii")
+
+
+def _relay_cred_decode(value: str) -> str | None:
+    try:
+        data = base64.urlsafe_b64decode(str(value).encode("ascii"))
+        key = _relay_cred_secret_key()
+        stream = (key * ((len(data) // len(key)) + 1))[:len(data)]
+        decoded = bytes(a ^ b for a, b in zip(data, stream))
+        return decoded.decode("utf-8")
+    except Exception:
+        return None
+
+
+def _relay_cred_load() -> dict:
+    if not RELAY_CREDS_PATH.exists():
+        return {"version": 1, "items": {}}
+    try:
+        data = json.loads(RELAY_CREDS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "items": {}}
+    if not isinstance(data, dict):
+        return {"version": 1, "items": {}}
+    if not isinstance(data.get("items"), dict):
+        data["items"] = {}
+    return data
+
+
+def _relay_cred_save(data: dict) -> None:
+    _ensure_private_file(
+        RELAY_CREDS_PATH,
+        json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+    )
+
+
+def _relay_cred_key(domain: str, email: str) -> str:
+    return base64.urlsafe_b64encode(f"{domain}|{email}".encode("utf-8")).decode("ascii")
+
+
+def _relay_cred_item(domain: str, email: str) -> dict:
+    data = _relay_cred_load()
+    item = (data.get("items") or {}).get(_relay_cred_key(domain, email))
+    return item if isinstance(item, dict) else {}
+
+
+def _relay_cred_get_secret(domain: str, email: str, field: str) -> str | None:
+    with _relay_cred_lock:
+        raw = _relay_cred_item(domain, email).get(field)
+        if not raw:
+            return None
+        return _relay_cred_decode(str(raw))
+
+
+def _relay_cred_set_secret(domain: str, email: str, field: str, value: str) -> bool:
+    if not domain or not email or not value:
+        return False
+    with _relay_cred_lock:
+        try:
+            data = _relay_cred_load()
+            items = data.setdefault("items", {})
+            key = _relay_cred_key(domain, email)
+            item = items.setdefault(key, {})
+            item.update({"domain": domain, "email": email, "updated_at": int(time.time())})
+            item[field] = _relay_cred_encode(value)
+            _relay_cred_save(data)
+            return True
+        except Exception:
+            return False
+
+
+def _relay_cred_delete(domain: str, email: str) -> None:
+    with _relay_cred_lock:
+        data = _relay_cred_load()
+        items = data.get("items") or {}
+        items.pop(_relay_cred_key(domain, email), None)
+        data["items"] = items
+        _relay_cred_save(data)
+
+
+def _relay_cred_delete_field(domain: str, email: str, field: str) -> None:
+    with _relay_cred_lock:
+        data = _relay_cred_load()
+        items = data.get("items") or {}
+        key = _relay_cred_key(domain, email)
+        item = items.get(key)
+        if isinstance(item, dict):
+            item.pop(field, None)
+            if not any(item.get(secret_field) for secret_field in ("password", "token")):
+                items.pop(key, None)
+            else:
+                item["updated_at"] = int(time.time())
+        data["items"] = items
+        _relay_cred_save(data)
+
+
 def _kc_creds_set(domain: str, email: str, password: str, *, allow_prompt: bool = False) -> bool:
-    """Return True on a confirmed Keychain write, False on failure.
+    """Return True when relay login credentials are persisted locally.
 
     Callers MUST check this before reporting success — a swallowed failure means
     the credential isn't persisted and is silently lost on next launch.
     """
+    if _relay_cred_set_secret(domain, email, "password", password):
+        return True
     username = f"{domain}|{email}"
     if not allow_prompt:
         return _security_set_password(KEYCHAIN_CREDS_SERVICE, username, password)
@@ -535,14 +673,22 @@ def _security_delete_password(service: str, username: str) -> bool:
 
 
 def _kc_creds_get(domain: str, email: str, *, allow_prompt: bool = False) -> str | None:
+    cached = _relay_cred_get_secret(domain, email, "password")
+    if cached:
+        return cached
     username = f"{domain}|{email}"
     if not allow_prompt:
-        return _security_get_password(KEYCHAIN_CREDS_SERVICE, username)
-    return keyring.get_password(KEYCHAIN_CREDS_SERVICE, username)
+        legacy = _security_get_password(KEYCHAIN_CREDS_SERVICE, username)
+    else:
+        legacy = keyring.get_password(KEYCHAIN_CREDS_SERVICE, username)
+    if legacy:
+        _relay_cred_set_secret(domain, email, "password", legacy)
+    return legacy
 
 
 def _kc_creds_delete(domain: str, email: str, *, allow_prompt: bool = False) -> None:
     try:
+        _relay_cred_delete_field(domain, email, "password")
         username = f"{domain}|{email}"
         if not allow_prompt:
             _security_delete_password(KEYCHAIN_CREDS_SERVICE, username)
@@ -1942,14 +2088,16 @@ def _mask_key(k: str) -> str:
     return sub2cli_lib.mask_key(k)
 
 
-# ---- macOS Keychain wrappers (sub2cli service) ----
+# ---- relay token cache (local first, Keychain fallback) ----
 
 def _kc_username(domain: str, email: str) -> str:
     return f"{domain}|{email}"
 
 
 def _kc_set(domain: str, email: str, token: str, *, allow_prompt: bool = False) -> bool:
-    """Return True on a confirmed Keychain write, False on failure (see _kc_creds_set)."""
+    """Return True when the relay token is persisted locally (see _kc_creds_set)."""
+    if _relay_cred_set_secret(domain, email, "token", token):
+        return True
     username = _kc_username(domain, email)
     if not allow_prompt:
         return _security_set_password(KEYCHAIN_SERVICE, username, token)
@@ -1961,14 +2109,22 @@ def _kc_set(domain: str, email: str, token: str, *, allow_prompt: bool = False) 
 
 
 def _kc_get(domain: str, email: str, *, allow_prompt: bool = False) -> str | None:
+    cached = _relay_cred_get_secret(domain, email, "token")
+    if cached:
+        return cached
     username = _kc_username(domain, email)
     if not allow_prompt:
-        return _security_get_password(KEYCHAIN_SERVICE, username)
-    return keyring.get_password(KEYCHAIN_SERVICE, username)
+        legacy = _security_get_password(KEYCHAIN_SERVICE, username)
+    else:
+        legacy = keyring.get_password(KEYCHAIN_SERVICE, username)
+    if legacy:
+        _relay_cred_set_secret(domain, email, "token", legacy)
+    return legacy
 
 
 def _kc_delete(domain: str, email: str, *, allow_prompt: bool = False) -> None:
     try:
+        _relay_cred_delete_field(domain, email, "token")
         username = _kc_username(domain, email)
         if not allow_prompt:
             _security_delete_password(KEYCHAIN_SERVICE, username)
@@ -1980,9 +2136,9 @@ def _kc_delete(domain: str, email: str, *, allow_prompt: bool = False) -> None:
 
 
 def _try_relogin_with_saved_creds(ctx: Any, cfg: dict) -> bool:
-    """If the current relay has any saved email+password in Keychain, try logging in.
+    """If the current relay has saved email+password, try logging in.
 
-    Sets ctx token + writes new token to Keychain on success. Returns True iff
+    Sets ctx token + writes the new token on success. Returns True iff
     a token was obtained. Tries current first, then any saved email.
     """
     ad = (cfg.get("accounts") or {}).get(ctx.domain) or {}
@@ -2004,6 +2160,92 @@ def _try_relogin_with_saved_creds(ctx: Any, cfg: dict) -> bool:
             ctx.set_token(token)
             return True
     return False
+
+
+def _auth_error_text(value: object) -> bool:
+    text = str(value or "").lower()
+    return any(
+        token in text
+        for token in (
+            "401",
+            "403",
+            "unauthorized",
+            "forbidden",
+            "token",
+            "auth",
+            "登录",
+            "未登录",
+            "过期",
+        )
+    )
+
+
+class _AutoReloginContext:
+    """Sub2Context proxy that replays relay API calls once after saved-creds login.
+
+    Sub2Context intentionally returns empty values for many failed API reads, so
+    the desktop layer treats an empty management response as a possible stale
+    token and retries once when saved credentials are available.
+    """
+
+    def __init__(self, ctx: Any, cfg: dict) -> None:
+        self._ctx = ctx
+        self._cfg = cfg
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ctx, name)
+
+    @property
+    def token(self) -> str:
+        return self._ctx.token
+
+    def set_token(self, token: str) -> None:
+        self._ctx.set_token(token)
+
+    def clear_token(self) -> None:
+        self._ctx.clear_token()
+
+    def _call(self, method: str, *args: Any, stale: Any = None, **kwargs: Any) -> Any:
+        fn = getattr(self._ctx, method)
+        result = fn(*args, **kwargs)
+        is_stale = stale(result) if stale else False
+        if is_stale and _try_relogin_with_saved_creds(self._ctx, self._cfg):
+            result = fn(*args, **kwargs)
+        return result
+
+    def fetch_user(self) -> dict | None:
+        return self._call("fetch_user", stale=lambda result: not result)
+
+    def fetch_keys(self) -> list[dict]:
+        return self._call("fetch_keys", stale=lambda result: not result)
+
+    def fetch_settings(self) -> dict | None:
+        return self._call("fetch_settings", stale=lambda result: result is None)
+
+    def fetch_groups(self) -> list[dict]:
+        return self._call("fetch_groups", stale=lambda result: not result)
+
+    def fetch_subscriptions(self) -> list[dict]:
+        return self._call("fetch_subscriptions", stale=lambda result: not result)
+
+    def fetch_history(self, limit: int = 10) -> list[dict]:
+        return self._call("fetch_history", limit, stale=lambda result: not result)
+
+    def create_key(self, name: str = "sub2cli") -> dict | None:
+        return self._call("create_key", name, stale=lambda result: result is None)
+
+    def update_key_group(self, key_id: int, group_id: int) -> tuple[bool, str]:
+        return self._call(
+            "update_key_group",
+            key_id,
+            group_id,
+            stale=lambda result: (
+                isinstance(result, tuple)
+                and len(result) >= 2
+                and not bool(result[0])
+                and _auth_error_text(result[1])
+            ),
+        )
 
 
 def _accounts_for_domain(cfg: dict, domain: str) -> dict:
@@ -2107,6 +2349,10 @@ def _route_pools(cfg: dict) -> list[dict]:
         pools = []
         cfg["route_pools"] = pools
     return pools
+
+
+def _mark_route_pool_config_changed(cfg: dict) -> None:
+    cfg[sub2cli_lib.CONFIG_MUTATED_FIELDS_KEY] = list(sub2cli_lib.ROUTE_POOL_FIELDS)
 
 
 def _find_route_pool(cfg: dict, pool_id: str) -> dict | None:
@@ -2215,8 +2461,11 @@ def _sanitize_route_pool_route(route: dict, index: int) -> dict | None:
         key_id = route.get("key_id")
         if key_id in (None, ""):
             return None
+        relay_domain = str(route.get("relay_domain") or "").strip()
+        if relay_domain:
+            relay_domain = sub2cli_lib._normalize_domain(relay_domain)
         clean.update({
-            "relay_domain": str(route.get("relay_domain") or "").strip(),
+            "relay_domain": relay_domain,
             "key_id": key_id,
             "key_name": str(route.get("key_name") or "").strip(),
             "key_masked": str(route.get("key_masked") or "").strip(),
@@ -2338,9 +2587,9 @@ class JsApi:
                 saved_token = _kc_get(ctx.domain, current_email)
                 if saved_token:
                     ctx.set_token(saved_token)
-        self._ctx = ctx
+        self._ctx = _AutoReloginContext(ctx, cfg)
         self._cfg = cfg
-        return ctx, cfg
+        return self._ctx, cfg
 
     @staticmethod
     def _serialize_endpoint(ep: dict) -> dict:
@@ -2400,9 +2649,9 @@ class JsApi:
             token = _kc_get(domain, email)
             if token:
                 ctx.set_token(token)
-                return ctx
+                return _AutoReloginContext(ctx, cfg)
         if _try_relogin_with_saved_creds(ctx, cfg):
-            return ctx
+            return _AutoReloginContext(ctx, cfg)
         raise RuntimeError("需要先登录该中转站")
 
     def _route_pool_relay_source(self, cfg: dict, domain: str, *, load: bool = False) -> dict:
@@ -2944,7 +3193,7 @@ class JsApi:
         """First load: account + test key + Codex key + default endpoint + lists."""
         with self._lock:
             try:
-                ctx, cfg = self._ensure_ctx(use_keychain=False)
+                ctx, cfg = self._ensure_ctx()
             except RuntimeError as exc:
                 return {"ok": False, "error": str(exc), "needs_setup": True}
             try:
@@ -3542,8 +3791,20 @@ class JsApi:
         relays = cfg.get("relays") or {}
         if relay_domain and relay_domain not in relays:
             relays = {**relays, relay_domain: {f: cfg.get(f) for f in sub2cli_lib.RELAY_FIELDS}}
+        route_domains = {
+            str(route.get("relay_domain") or "").strip()
+            for pool in _route_pools(cfg)
+            if isinstance(pool, dict)
+            for route in (pool.get("routes") or [])
+            if isinstance(route, dict) and route.get("source_type") == "relay"
+        }
+        route_domains.discard("")
         relay_sources = [
-            self._route_pool_relay_source(cfg, domain, load=(domain == relay_domain))
+            self._route_pool_relay_source(
+                cfg,
+                domain,
+                load=(domain == relay_domain or domain in route_domains),
+            )
             for domain in relays.keys()
         ]
         try:
@@ -3572,7 +3833,7 @@ class JsApi:
 
     def route_pool_relay_source(self, domain: str) -> dict:
         """Load keys/endpoints for one saved relay selected in the route pool UI."""
-        domain = (domain or "").strip()
+        domain = sub2cli_lib._normalize_domain(domain or "")
         cfg = sub2cli_lib.load_config() or {}
         relays = cfg.get("relays") or {}
         if domain not in relays:
@@ -3660,6 +3921,7 @@ class JsApi:
                     "error": f"保存失败: {submitted_count} 条 route 中只有 {len(clean.get('routes') or [])} 条有效，请检查来源/名称/分组是否已加载",
                 }
             cfg["current_route_pool"] = clean["id"]
+            _mark_route_pool_config_changed(cfg)
             sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
         listing = self.list_route_pools()
         listing["saved_id"] = clean["id"]
@@ -3694,8 +3956,11 @@ class JsApi:
                 except (TypeError, ValueError):
                     return [], secrets, f"route {route.get('label') or idx} 的 key id 无效"
                 key = sub2cli_lib.find_key_by_id(keys, key_id)
+                key_name = str(route.get("key_name") or "").strip()
+                if not key and key_name:
+                    key = sub2cli_lib.find_key_by_name(keys, key_name)
                 if not key:
-                    return [], secrets, f"找不到 relay key: {route.get('key_name') or key_id}"
+                    return [], secrets, f"找不到 relay key: {key_name or key_id}"
                 api_key = key.get("key") or ""
                 base_url = route.get("base_url") or relay_cfg.get("default_endpoint_url") or sub2cli_lib.normalize_v1(_ctx.domain)
                 group = key.get("group") or {}
@@ -3763,6 +4028,7 @@ class JsApi:
             result = self._run_inject_add_pool(clean_pool, routes, secrets)
             if result.get("ok"):
                 cfg["current_route_pool"] = clean_pool["id"]
+                _mark_route_pool_config_changed(cfg)
                 sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
                 result["pool_id"] = clean_pool["id"]
         return result
@@ -3953,7 +4219,7 @@ class JsApi:
         Steps:
           1. Normalize URL; probe /api/v1/settings/public to confirm it's a Sub2API instance.
           2. Write cfg["relays"][domain] with empty RELAY_FIELDS.
-          3. If email+password provided: POST /auth/login → token. Store creds + token in Keychain. Register account.
+          3. If email+password provided: POST /auth/login -> token. Store creds + token locally. Register account.
           4. Switch active domain to the new relay and re-bootstrap.
         """
         url = (url or "").strip()
@@ -4004,15 +4270,15 @@ class JsApi:
             for f in sub2cli_lib.RELAY_FIELDS:
                 cfg[f] = (relays[domain] or {}).get(f)
 
-            keychain_warning = None
+            credential_warning = None
             if token and email:
                 if not _kc_set(domain, email, token):
-                    keychain_warning = (
-                        "token 未能写入 Keychain（下次启动可能需要重新登录）"
+                    credential_warning = (
+                        "token 未能写入 sub2cli 本地凭据缓存（下次启动可能需要重新登录）"
                     )
                 if save_creds and not _kc_creds_set(domain, email, password):
-                    keychain_warning = (
-                        "登录凭据未能写入 Keychain（自动续登将不可用）"
+                    credential_warning = (
+                        "登录凭据未能写入 sub2cli 本地凭据缓存（自动续登将不可用）"
                     )
                 ad = _accounts_for_domain(cfg, domain)
                 if not any(a.get("email") == email for a in ad["saved"]):
@@ -4028,8 +4294,8 @@ class JsApi:
             self._default_ep = None
 
         result = self.bootstrap()
-        if keychain_warning and isinstance(result, dict):
-            result["keychain_warning"] = keychain_warning
+        if credential_warning and isinstance(result, dict):
+            result["credential_warning"] = credential_warning
         return result
 
     def switch_relay(self, domain: str) -> dict:
@@ -4108,7 +4374,7 @@ class JsApi:
         }
 
     def remove_relay(self, domain: str) -> dict:
-        """Remove a relay from cfg + clear all its Keychain entries (tokens + creds).
+        """Remove a relay from cfg + clear its local/legacy credential entries.
 
         If the removed relay was the active one, switches to any remaining relay
         (or returns needs_setup if none left).
@@ -4123,7 +4389,7 @@ class JsApi:
         if domain not in relays:
             return {"ok": False, "error": f"未保存的 relay: {domain}"}
 
-        # Clear Keychain entries (tokens + creds) for every saved account under this relay.
+        # Clear local cache and legacy Keychain entries for every saved account under this relay.
         ad = (cfg.get("accounts") or {}).get(domain) or {}
         for a in ad.get("saved") or []:
             email = a.get("email")
@@ -4164,7 +4430,7 @@ class JsApi:
                     "error": "已删除最后一个 relay, 请点 + 新增中转"}
         return {"ok": True, "removed": domain}
 
-    # ---- accounts (Keychain-backed) ----
+    # ---- accounts (local credential-cache backed) ----
 
     def list_accounts(self) -> dict:
         """Saved accounts for the current relay + which one is active."""
@@ -4183,7 +4449,7 @@ class JsApi:
 
     def import_edge_account(self) -> dict:
         """Read fresh CDP token for current relay, identify user via /auth/me,
-        store token in macOS Keychain, register in cfg.accounts.
+        store token in the local credential cache, register in cfg.accounts.
 
         After this, the active ctx will use the saved token, so subsequent
         bootstraps don't need Edge open.
@@ -4218,7 +4484,8 @@ class JsApi:
     def add_account(self, email: str, password: str) -> dict:
         """Add a new account to the CURRENT relay via POST /auth/login.
 
-        Stores token + creds in Keychain, registers the account, activates it.
+        Stores token + creds in the local credential cache, registers the account,
+        activates it.
         """
         email = (email or "").strip()
         password = password or ""
@@ -4240,11 +4507,11 @@ class JsApi:
                 )}
             return {"ok": False, "error": f"登录失败: {err}"}
         with self._lock:
-            keychain_warning = None
+            credential_warning = None
             if not _kc_set(ctx.domain, email, token):
-                keychain_warning = "token 未能写入 Keychain（下次启动可能需要重新登录）"
+                credential_warning = "token 未能写入 sub2cli 本地凭据缓存（下次启动可能需要重新登录）"
             if not _kc_creds_set(ctx.domain, email, password):
-                keychain_warning = "登录凭据未能写入 Keychain（自动续登将不可用）"
+                credential_warning = "登录凭据未能写入 sub2cli 本地凭据缓存（自动续登将不可用）"
             ad = _accounts_for_domain(cfg, ctx.domain)
             if not any(a.get("email") == email for a in ad["saved"]):
                 ad["saved"].append({"email": email, "last_verified": int(time.time())})
@@ -4261,17 +4528,17 @@ class JsApi:
             self._codex_key = None
             self._default_ep = None
         result = self.bootstrap()
-        if keychain_warning and isinstance(result, dict):
-            result["keychain_warning"] = keychain_warning
+        if credential_warning and isinstance(result, dict):
+            result["credential_warning"] = credential_warning
         return result
 
     def switch_account(self, email: str) -> dict:
         """Activate a saved account.
 
         Semantics (per V's request): "logout + login again" — if we have the
-        password in Keychain we POST /auth/login to get a FRESH token rather
-        than reusing the cached one. Fallback to cached Keychain token only
-        when password isn't saved (e.g. legacy Edge-imported accounts).
+        password in the local credential cache we POST /auth/login to get a
+        FRESH token rather than reusing the cached one. Fallback to a cached
+        token only when password isn't saved (e.g. legacy Edge-imported accounts).
         """
         with self._lock:
             try:
@@ -4292,7 +4559,7 @@ class JsApi:
             else:
                 token = _kc_get(ctx.domain, email)
                 if not token:
-                    return {"ok": False, "error": f"{email} 没保存密码且 Keychain 无 token, 请重新添加账号"}
+                    return {"ok": False, "error": f"{email} 没保存密码且本地没有 token, 请重新添加账号"}
 
             ctx.set_token(token)
             ad["current"] = email
@@ -4308,7 +4575,7 @@ class JsApi:
         return self.bootstrap()
 
     def delete_account(self, email: str) -> dict:
-        """Remove an account from Keychain and cfg."""
+        """Remove an account from local credentials and cfg."""
         with self._lock:
             try:
                 ctx, cfg = self._ensure_ctx()

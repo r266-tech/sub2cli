@@ -23,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.7`
+Current desktop version: `v0.2.8`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -61,7 +61,7 @@ open sub2cli -> test -> select -> 配置 Codex
 | Area | Capability |
 |---|---|
 | Relay management | Add multiple Sub2API/codex2api-compatible relays, including full URLs with ports and path prefixes. |
-| Account management | Store relay login credentials in macOS Keychain and auto-refresh expired relay tokens. |
+| Account management | Store relay login credentials in sub2cli's local private cache and auto-refresh expired relay tokens. |
 | Official Codex accounts | Discover/import saved Codex OAuth accounts and switch between official accounts and relay channels. |
 | Balance and subscriptions | Show account status, balance, concurrency and active subscription usage. |
 | Endpoint checks | Ping every endpoint exposed by the relay and select the fastest/desired URL. |
@@ -240,7 +240,11 @@ Route pool slots are different: Codex is configured once to `http://127.0.0.1:18
 
 ```text
 ~/.config/sub2cli/config.json            relay selection, default key, endpoint, group
-macOS Keychain                           relay tokens and optional relay login credentials
+~/Library/Application Support/sub2cli/relay-credentials.json
+                                            relay tokens and optional relay login credentials (0600, local cache)
+~/Library/Application Support/sub2cli/relay-credentials.key
+                                            local cache key (0600)
+macOS Keychain                           legacy relay credential fallback and custom API keys
 ~/.codex/provider-slots.json             saved Codex provider/account slots
 ~/.codex/auth.<slot>.json                saved account/channel auth files
 ~/.codex/auth.json                       active Codex auth file
@@ -315,18 +319,28 @@ cd desktop
 ./build.sh
 ```
 
-`build.sh` creates `desktop/.venv/`, builds a bundled `sub2cli-inject` from the current source, packages `sub2cli.app`, smoke-tests the app and then creates an unsigned DMG.
+`build.sh` creates `desktop/.venv/`, builds a bundled `sub2cli-inject` from the current source, packages `sub2cli.app`, smoke-tests the app and then creates unsigned zip and DMG artifacts.
 
 Output:
 
 ```text
 desktop/dist/sub2cli.app
+desktop/dist/sub2cli-<version>.zip
 desktop/dist/sub2cli-<version>.dmg
 ```
 
 The current release is unsigned and not notarized.
 
 ## Release Notes
+
+### v0.2.8
+
+- added a local relay credential cache with legacy Keychain migration so relay logins survive Keychain prompt failures
+- auto-retry relay management calls once after saved-credential re-login when tokens expire
+- made route pools load saved relay sources before adding routes and normalize bare relay domains
+- made route pools recover from stale relay key ids by falling back to the saved key name
+- retry OpenAI model-capacity 200-error responses on the same route before failing over
+- ship both unsigned DMG and zip desktop artifacts from the release build
 
 ### v0.2.7
 

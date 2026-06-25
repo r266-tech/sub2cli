@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# desktop/build.sh — build an unsigned sub2cli.app + DMG via PyInstaller.
+# desktop/build.sh — build an unsigned sub2cli.app + zip + DMG via PyInstaller.
 #
 # Prerequisites:
 #   - python3
@@ -10,6 +10,7 @@
 # Outputs:
 #   dist/sub2cli.app           — final .app bundle
 #   dist/sub2cli/              — flat onedir output (.app wraps this)
+#   dist/sub2cli-<version>.zip — unsigned app zip
 #   dist/sub2cli-<version>.dmg — unsigned installer DMG
 #   build/                     — intermediate (gitignored)
 set -euo pipefail
@@ -31,6 +32,10 @@ run_pyinstaller_child() {
     -u _PYI_PARENT_PROCESS_LEVEL \
     PYINSTALLER_RESET_ENVIRONMENT=1 \
     "$@"
+}
+
+sign_app_bundle() {
+  codesign --force --deep --sign - dist/sub2cli.app
 }
 
 # --- 0. Build environment ---
@@ -71,7 +76,10 @@ mkdir -p "$APP_PYSCRIPTS"
 rm -f "$APP_INJECT_BIN"
 cp "$INJECT_BIN" "$APP_INJECT_BIN"
 chmod 755 "$APP_INJECT_BIN"
-if run_pyinstaller_child "$APP_INJECT_BIN" --help >/dev/null; then
+sign_app_bundle
+if [[ "${SUB2CLI_SKIP_SMOKE:-0}" == "1" ]]; then
+  echo "↷ bundled injector smoke skipped (SUB2CLI_SKIP_SMOKE=1)"
+elif run_pyinstaller_child "$APP_INJECT_BIN" --help >/dev/null; then
   echo "✓ bundled injector runs"
 else
   echo "✗ bundled injector failed smoke test"
@@ -108,7 +116,9 @@ run_smoke() {
   return 124
 }
 
-if run_smoke; then
+if [[ "${SUB2CLI_SKIP_SMOKE:-0}" == "1" ]]; then
+  echo "↷ bundled app smoke skipped (SUB2CLI_SKIP_SMOKE=1)"
+elif run_smoke; then
   echo "✓ bundled app runs"
 else
   echo "✗ bundled app failed smoke test"
@@ -120,6 +130,14 @@ fi
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/sub2cli.app/Contents/Info.plist)"
 DMG_STAGE="dist/dmg-stage"
 DMG_PATH="dist/sub2cli-${VERSION}.dmg"
+ZIP_PATH="dist/sub2cli-${VERSION}.zip"
+rm -f "$ZIP_PATH"
+ditto -c -k --keepParent dist/sub2cli.app "$ZIP_PATH"
+echo "✓ $ZIP_PATH  ($(du -sh "$ZIP_PATH" | cut -f1))"
+if [[ "${SUB2CLI_SKIP_DMG:-0}" == "1" ]]; then
+  echo "↷ DMG skipped (SUB2CLI_SKIP_DMG=1)"
+  exit 0
+fi
 rm -rf "$DMG_STAGE" "$DMG_PATH"
 mkdir -p "$DMG_STAGE"
 cp -R dist/sub2cli.app "$DMG_STAGE/"

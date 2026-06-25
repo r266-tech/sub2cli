@@ -442,7 +442,7 @@
         <label>密码 <span class="required">*</span></label>
         <input type="password" id="add-account-password" autocomplete="off" />
       </div>
-      <div class="form-hint">添加当前中转 (<span id="add-account-relay-hint">—</span>) 下的新账号。会立即登录, 凭据存 Keychain。后续 token 失效或切换账号都用凭据自动续登, 不依赖浏览器。</div>
+      <div class="form-hint">添加当前中转 (<span id="add-account-relay-hint">—</span>) 下的新账号。会立即登录，凭据由 sub2cli 本地管理。后续 token 失效或切换账号都用凭据自动续登，不依赖浏览器或系统密码弹窗。</div>
       <div class="form-error hidden" id="add-account-error"></div>
     </div>
     <div class="modal-actions">
@@ -474,7 +474,7 @@
         <label>密码 <span class="optional">(可选)</span></label>
         <input type="password" id="add-relay-password" autocomplete="off" />
       </div>
-      <div class="form-hint hidden" id="add-relay-creds-hint">(可选) 填账号密码, app 自动管理登录, token 失效时自动续登。</div>
+      <div class="form-hint hidden" id="add-relay-creds-hint">(可选) 填中转站账号密码，sub2cli 会本地保存凭据并自动续登，避免反复触发系统密码弹窗。</div>
 
       <div class="form-error hidden" id="add-relay-error"></div>
     </div>

@@ -567,7 +567,7 @@ async function refreshSidebar() {
           className: 'danger',
           title: '删除中转站',
           onClick: () => {
-            if (confirm(`删除中转站 ${relay.site || relay.domain}?\n会清掉它在 Keychain 里的 token 和密码 (不可恢复).`)) {
+            if (confirm(`删除中转站 ${relay.site || relay.domain}?\n会清掉 sub2cli 本地保存的 token 和密码 (不可恢复).`)) {
               removeRelay(relay.domain);
             }
           },
@@ -917,6 +917,26 @@ async function loadSelectedRoutePoolRelaySource() {
   const relaySource = selectedRoutePoolRelaySource();
   if (!relaySource) return;
   await loadRoutePoolRelaySource(relaySource.domain);
+}
+
+function loadRoutePoolDraftRelaySources() {
+  const draft = activeRoutePoolDraft();
+  const domains = new Set();
+  if (draft && Array.isArray(draft.routes)) {
+    for (const route of draft.routes) {
+      if (route && route.source_type === 'relay' && route.relay_domain) {
+        domains.add(route.relay_domain);
+      }
+    }
+  }
+  for (const domain of domains) {
+    const source = routePoolRelaySourceByDomain(domain);
+    if (source && !source.loaded && !source.loading) {
+      loadRoutePoolRelaySource(domain).then(() => {
+        if (state.viewMode === 'pool') renderRoutePoolDashboard();
+      });
+    }
+  }
 }
 
 function handleRoutePoolSourceTypeChange() {
@@ -1708,6 +1728,7 @@ function renderRoutePoolDashboard() {
   renderRoutePoolSelect();
   renderRoutePoolEditor();
   renderRoutePoolRoutes();
+  loadRoutePoolDraftRelaySources();
   renderRoutePoolStatus();
   const saveBtn = $('#btn-route-pool-save');
   if (saveBtn) saveBtn.disabled = state.routePoolRunning;
@@ -1813,10 +1834,15 @@ function updateRoutePoolHeaderDraft() {
   renumberRoutePoolRoutes(draft.routes);
 }
 
-function addRelayRouteToPool() {
+async function addRelayRouteToPool() {
   const candidates = state.routePoolCandidates || {};
-  const relaySource = selectedRoutePoolRelaySource();
+  let relaySource = selectedRoutePoolRelaySource();
   const relayDomain = (relaySource && relaySource.domain) || selectValue('#route-pool-relay-domain') || candidates.relay_domain || state.lastDomain || '';
+  if (relaySource && !relaySource.loaded && !relaySource.loading) {
+    renderRoutePoolStatus('[INFO] 正在加载中转 route...');
+    await loadRoutePoolRelaySource(relaySource.domain);
+    relaySource = routePoolRelaySourceByDomain(relaySource.domain);
+  }
   const keyId = selectValue('#route-pool-relay-key');
   const endpointUrl = selectValue('#route-pool-relay-endpoint');
   const key = ((relaySource && relaySource.keys) || []).find((item) => String(item.id) === String(keyId));
@@ -1853,10 +1879,10 @@ function addRelayRouteToPool() {
   return true;
 }
 
-function addSelectedRouteToPool() {
+async function addSelectedRouteToPool() {
   const sourceType = selectValue('#route-pool-source-type') || 'custom';
   if (sourceType === 'custom') return addCustomRouteToPool();
-  return addRelayRouteToPool();
+  return await addRelayRouteToPool();
 }
 
 function addCustomRouteToPool() {
@@ -2413,7 +2439,7 @@ async function switchRelay(domain) {
   }
 }
 
-// ---- account dropdown (Keychain-backed) ----
+// ---- account dropdown (local credential cache backed) ----
 
 function openAccountPop() {
   $('#account-pop').classList.remove('hidden');

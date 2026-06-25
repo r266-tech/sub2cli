@@ -64,6 +64,7 @@ PROTOCOL_PROXY_BASE_URL = f"http://127.0.0.1:{PROTOCOL_PROXY_PORT}/v1"
 PROTOCOL_PROXY_LOG = CODEX_HOME / "sub2cli-responses-proxy.log"
 POOL_PLACEHOLDER_API_KEY = "sk-sub2cli-local-route-pool"
 PROXY_STARTED_AT = time.time()
+OPENAI_TRANSIENT_RETRY_DELAYS = (1.0, 2.0)
 CODEX_APP_BUNDLE = Path(os.environ.get("SUB2CLI_CODEX_APP", "/Applications/Codex.app")).expanduser()
 # Derive the bundled CLI from CODEX_APP_BUNDLE so a non-/Applications install
 # (via SUB2CLI_CODEX_APP) still finds the codex binary inside its own bundle.
@@ -76,7 +77,7 @@ FORCE_QUIT_CODEX = os.environ.get("SUB2CLI_CODEX_FORCE_QUIT", "1").lower() not i
     "no",
     "off",
 }
-APP_VERSION = "0.2.7"
+APP_VERSION = "0.2.8"
 APP_URL = os.environ.get(
     "SUB2CLI_URL",
     os.environ.get("CODEX_PROVIDER_URL", "https://github.com/r266-tech/sub2cli"),
@@ -1544,7 +1545,24 @@ def retry_after_seconds(headers: object) -> int | None:
         return None
 
 
-def classify_upstream_status(status: int, body: bytes = b"") -> str:
+def http_error_detail(status: int, reason: str, body: bytes = b"") -> str:
+    message = ""
+    try:
+        payload = json.loads((body or b"").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    info = payload_error_info(payload) if payload is not None else None
+    if info:
+        message = info[0]
+    elif body:
+        message = body[:512].decode("utf-8", errors="replace").strip()
+    base = f"HTTP {status} {reason}".strip()
+    return f"{base}: {message}"[:300] if message else base
+
+
+def classify_upstream_status(status: int, body: bytes = b"", content_type: str = "application/json") -> str:
+    if detect_openai_transient_success_error(body, content_type):
+        return "openai_retryable"
     if status in (401, 403):
         return "blocked"
     if status == 429:
@@ -1554,6 +1572,123 @@ def classify_upstream_status(status: int, body: bytes = b"") -> str:
     if status == 400 and re.search(rb"model|unsupported|not\s+found", body[:4096], re.I):
         return "retryable"
     return "client_error"
+
+
+OPENAI_TRANSIENT_BODY_RE = re.compile(
+    r"("
+    r"selected model is at capacity|"
+    r"\bmodel\b.{0,80}\bat capacity\b|"
+    r"\bat capacity\b.{0,80}\bmodel\b|"
+    r"\bmodel\b.{0,80}\b(overloaded|busy|temporar(?:ily)? unavailable|unavailable)\b|"
+    r"\b(overloaded|busy|temporar(?:ily)? unavailable)\b.{0,80}\bmodel\b|"
+    r"please try a different model"
+    r")",
+    re.I,
+)
+OPENAI_TRANSIENT_CODE_RE = re.compile(
+    r"(model_at_capacity|model_capacity|model_overloaded|model_unavailable)",
+    re.I,
+)
+
+
+def is_openai_transient_success_error(message: str, *, error_type: str = "", error_code: str = "") -> bool:
+    combined = " ".join(part for part in (message, error_type, error_code) if part)
+    return bool(OPENAI_TRANSIENT_BODY_RE.search(combined) or OPENAI_TRANSIENT_CODE_RE.search(combined))
+
+
+def payload_error_info(payload: object) -> tuple[str, str, str] | None:
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = str(error.get("message") or error.get("detail") or error.get("code") or error.get("type") or "").strip()
+        error_type = str(error.get("type") or "").strip()
+        error_code = str(error.get("code") or "").strip()
+        if message or error_type or error_code:
+            return message or error_type or error_code, error_type, error_code
+    elif isinstance(error, str) and error.strip():
+        return error.strip(), "", ""
+
+    response = payload.get("response")
+    if isinstance(response, dict):
+        nested = payload_error_info(response)
+        if nested:
+            return nested
+
+    status = str(payload.get("status") or "").lower()
+    if status in {"failed", "cancelled", "canceled"}:
+        for key in ("message", "detail", "reason"):
+            raw = payload.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip(), str(payload.get("type") or ""), str(payload.get("code") or "")
+
+    return None
+
+
+def iter_sse_json_payloads(raw: bytes):
+    data_lines: list[str] = []
+    for raw_line in raw.decode("utf-8", errors="replace").splitlines():
+        line = raw_line.rstrip("\r")
+        if not line:
+            if data_lines:
+                data = "\n".join(data_lines).strip()
+                data_lines = []
+                if data and data != "[DONE]":
+                    try:
+                        yield json.loads(data)
+                    except ValueError:
+                        pass
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+    if data_lines:
+        data = "\n".join(data_lines).strip()
+        if data and data != "[DONE]":
+            try:
+                yield json.loads(data)
+            except ValueError:
+                pass
+
+
+def detect_openai_transient_success_error(raw: bytes, content_type: str) -> str | None:
+    lowered_type = (content_type or "").lower()
+    payloads: list[object] = []
+    if "text/event-stream" in lowered_type:
+        payloads.extend(iter_sse_json_payloads(raw))
+    else:
+        try:
+            payloads.append(json.loads(raw.decode("utf-8")))
+        except (UnicodeDecodeError, ValueError):
+            payloads = []
+
+    for payload in payloads:
+        info = payload_error_info(payload)
+        if not info:
+            continue
+        message, error_type, error_code = info
+        if is_openai_transient_success_error(message, error_type=error_type, error_code=error_code):
+            return message
+
+    if not payloads and raw:
+        text = raw[:8192].decode("utf-8", errors="replace").strip()
+        if text and is_openai_transient_success_error(text):
+            return text[:240]
+    return None
+
+
+def raise_for_upstream_success_error(route: dict, raw: bytes, content_type: str) -> None:
+    message = detect_openai_transient_success_error(raw, content_type)
+    if not message:
+        return
+    detail = f"upstream 200 openai transient: {message}"[:300]
+    raise UpstreamRouteError(
+        route=route,
+        status=502,
+        body=raw[:1024 * 1024],
+        content_type=content_type or "application/json",
+        kind="openai_retryable",
+        detail=detail,
+    )
 
 
 class UpstreamRouteError(Exception):
@@ -1706,6 +1841,9 @@ class RoutePoolRuntime:
             state["last_status"] = status
             if kind == "client_error":
                 return
+            if kind == "openai_retryable":
+                proxy_log(f"pool route openai retryable {rid} status={status} detail={detail[:160]}")
+                return
             if kind == "blocked":
                 state["blocked"] = True
                 state["open_until"] = now + 24 * 60 * 60
@@ -1816,7 +1954,7 @@ ROUTE_POOL_RUNTIME = RoutePoolRuntime()
 
 def probe_route(route: dict, *, timeout: int = 10) -> None:
     model = str(route.get("model") or "").strip() or DEFAULT_MODEL
-    request_route_response(
+    request_route_response_with_openai_retries(
         route,
         {
             "model": model,
@@ -1826,6 +1964,30 @@ def probe_route(route: dict, *, timeout: int = 10) -> None:
         },
         timeout=timeout,
     )
+
+
+def request_route_response_with_openai_retries(route: dict, responses_body: dict, *, timeout: int) -> tuple[bytes, str]:
+    total = 1 + len(OPENAI_TRANSIENT_RETRY_DELAYS)
+    last_exc: UpstreamRouteError | None = None
+    for attempt in range(total):
+        try:
+            return request_route_response(route, responses_body, timeout=timeout)
+        except UpstreamRouteError as exc:
+            if exc.kind != "openai_retryable":
+                raise
+            last_exc = exc
+            if attempt >= len(OPENAI_TRANSIENT_RETRY_DELAYS):
+                break
+            delay = float(OPENAI_TRANSIENT_RETRY_DELAYS[attempt])
+            proxy_log(
+                f"pool route openai retry {route_id(route)} "
+                f"attempt={attempt + 1}/{total} delay={delay:g}s detail={exc.detail[:160]}"
+            )
+            if delay > 0:
+                time.sleep(delay)
+    if last_exc:
+        raise last_exc
+    return request_route_response(route, responses_body, timeout=timeout)
 
 
 def fetch_route_models(route: dict, *, timeout: int = 30) -> tuple[bytes, str]:
@@ -1842,8 +2004,8 @@ def fetch_route_models(route: dict, *, timeout: int = 30) -> tuple[bytes, str]:
             status=exc.code,
             body=body,
             content_type=exc.headers.get("Content-Type") or "application/json",
-            kind=classify_upstream_status(exc.code, body),
-            detail=f"HTTP {exc.code} {exc.reason}",
+            kind=classify_upstream_status(exc.code, body, exc.headers.get("Content-Type") or "application/json"),
+            detail=http_error_detail(exc.code, exc.reason, body),
             retry_after=retry_after_seconds(exc.headers),
         ) from exc
     except Exception as exc:
@@ -1887,8 +2049,8 @@ def request_route_response(route: dict, responses_body: dict, *, timeout: int) -
                 status=exc.code,
                 body=body_bytes,
                 content_type=exc.headers.get("Content-Type") or "application/json",
-                kind=classify_upstream_status(exc.code, body_bytes),
-                detail=f"HTTP {exc.code} {exc.reason}",
+                kind=classify_upstream_status(exc.code, body_bytes, exc.headers.get("Content-Type") or "application/json"),
+                detail=http_error_detail(exc.code, exc.reason, body_bytes),
                 retry_after=retry_after_seconds(exc.headers),
             ) from exc
         except Exception as exc:
@@ -1900,6 +2062,7 @@ def request_route_response(route: dict, responses_body: dict, *, timeout: int) -
                 kind="retryable",
                 detail=f"{type(exc).__name__}: {exc}",
             ) from exc
+        raise_for_upstream_success_error(route, upstream, upstream_type)
         if "text/event-stream" in upstream_type:
             response = chat_sse_to_response_json(upstream)
         else:
@@ -1922,7 +2085,8 @@ def request_route_response(route: dict, responses_body: dict, *, timeout: int) -
     )
     try:
         with fresh_urlopen(req, timeout=timeout) as resp:
-            return resp.read(), resp.headers.get("Content-Type") or "application/json"
+            upstream = resp.read()
+            upstream_type = resp.headers.get("Content-Type") or "application/json"
     except urlerror.HTTPError as exc:
         body_bytes = exc.read(1024 * 1024)
         raise UpstreamRouteError(
@@ -1930,8 +2094,8 @@ def request_route_response(route: dict, responses_body: dict, *, timeout: int) -
             status=exc.code,
             body=body_bytes,
             content_type=exc.headers.get("Content-Type") or "application/json",
-            kind=classify_upstream_status(exc.code, body_bytes),
-            detail=f"HTTP {exc.code} {exc.reason}",
+            kind=classify_upstream_status(exc.code, body_bytes, exc.headers.get("Content-Type") or "application/json"),
+            detail=http_error_detail(exc.code, exc.reason, body_bytes),
             retry_after=retry_after_seconds(exc.headers),
         ) from exc
     except Exception as exc:
@@ -1943,6 +2107,8 @@ def request_route_response(route: dict, responses_body: dict, *, timeout: int) -
             kind="retryable",
             detail=f"{type(exc).__name__}: {exc}",
         ) from exc
+    raise_for_upstream_success_error(route, upstream, upstream_type)
+    return upstream, upstream_type
 
 
 def pool_error_response(attempts: list[str], error: str = "no usable route") -> dict:
@@ -2024,7 +2190,11 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 self._send_pool_response(cfg, responses_body)
                 return
             try:
-                upstream, content_type = request_route_response(single_route_from_slot(cfg), responses_body, timeout=600)
+                upstream, content_type = request_route_response_with_openai_retries(
+                    single_route_from_slot(cfg),
+                    responses_body,
+                    timeout=600,
+                )
             except UpstreamRouteError as exc:
                 self._send(exc.status or 502, exc.body or str(exc).encode("utf-8"), exc.content_type)
                 return
@@ -2079,7 +2249,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             rid = route_id(route)
             attempted.append(rid)
             try:
-                body, content_type = request_route_response(
+                body, content_type = request_route_response_with_openai_retries(
                     route,
                     responses_body,
                     timeout=int(policy["request_timeout_seconds"]),

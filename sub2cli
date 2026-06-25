@@ -63,6 +63,8 @@ RELAY_FIELDS = (
     "default_endpoint_url",
     "group_model_columns",
 )
+ROUTE_POOL_FIELDS = ("route_pools", "current_route_pool")
+CONFIG_MUTATED_FIELDS_KEY = "__sub2cli_mutated_fields__"
 
 DEFAULT_GROUP_MODEL_COLUMNS = 2
 MODEL_KIND_IMAGE_RE = re.compile(r"(^|[-_/])image($|[-_/])|(^|[-_/])imagen($|[-_/])", re.I)
@@ -806,6 +808,16 @@ def load_config(path: str | None = None) -> dict | None:
 
 def save_config(cfg: dict, path: str | None = None) -> None:
     path = path or default_config_path()
+    mutated_fields = set(cfg.pop(CONFIG_MUTATED_FIELDS_KEY, []) or [])
+    try:
+        with open(path, encoding="utf-8") as f:
+            disk_cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        disk_cfg = None
+    if isinstance(disk_cfg, dict):
+        for field in ROUTE_POOL_FIELDS:
+            if field not in mutated_fields and field in disk_cfg:
+                cfg[field] = disk_cfg[field]
     # 自动把 top-level default_* 同步进 relays[domain]
     domain = cfg.get("domain", "")
     if domain:

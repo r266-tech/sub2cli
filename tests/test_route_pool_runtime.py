@@ -314,6 +314,102 @@ class RoutePoolRuntimeTests(unittest.TestCase):
         self.assertEqual(1, body["max_output_tokens"])
         self.assertEqual(3, timeout)
 
+    def test_openai_capacity_error_retries_same_route_before_returning(self):
+        route = {
+            "id": "primary",
+            "base_url": "https://primary.example",
+            "api_key": "sk-primary",
+            "protocol": "responses",
+        }
+        calls = []
+        original = sub2cli_inject.fresh_urlopen
+        original_delays = sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS
+
+        class FakeResponse:
+            def __init__(self, body):
+                self._body = body
+                self.headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, *_args):
+                return self._body
+
+        def fake_fresh(req, *, timeout):
+            calls.append(req)
+            if len(calls) == 1:
+                return FakeResponse(
+                    b'{"error":{"message":"Selected model is at capacity. Please try a different model."}}'
+                )
+            return FakeResponse(b'{"id":"resp_ok","object":"response","status":"completed","output":[]}')
+
+        sub2cli_inject.fresh_urlopen = fake_fresh
+        sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS = (0,)
+        try:
+            body, content_type = sub2cli_inject.request_route_response_with_openai_retries(
+                route,
+                {"model": "gpt-test", "input": "hi"},
+                timeout=3,
+            )
+        finally:
+            sub2cli_inject.fresh_urlopen = original
+            sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS = original_delays
+
+        self.assertEqual(2, len(calls))
+        self.assertEqual("application/json", content_type)
+        self.assertIn(b'"resp_ok"', body)
+
+    def test_relay_502_does_not_retry_same_route_wrapper(self):
+        route = {
+            "id": "primary",
+            "base_url": "https://primary.example",
+            "api_key": "sk-primary",
+            "protocol": "responses",
+        }
+        calls = []
+        original = sub2cli_inject.fresh_urlopen
+        original_delays = sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS
+
+        def fake_fresh(req, *, timeout):
+            calls.append(req)
+            raise sub2cli_inject.urlerror.HTTPError(
+                req.full_url,
+                502,
+                "Bad Gateway",
+                {"Content-Type": "text/plain"},
+                None,
+            )
+
+        sub2cli_inject.fresh_urlopen = fake_fresh
+        sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS = (0, 0)
+        try:
+            with self.assertRaises(sub2cli_inject.UpstreamRouteError) as raised:
+                sub2cli_inject.request_route_response_with_openai_retries(
+                    route,
+                    {"model": "gpt-test", "input": "hi"},
+                    timeout=3,
+                )
+        finally:
+            sub2cli_inject.fresh_urlopen = original
+            sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS = original_delays
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual("retryable", raised.exception.kind)
+        self.assertEqual(502, raised.exception.status)
+
+    def test_response_failed_sse_capacity_error_is_openai_retryable(self):
+        raw = (
+            'event: response.failed\n'
+            'data: {"response":{"status":"failed","error":{"message":"Selected model is at capacity. Please try a different model."}}}\n\n'
+            'data: [DONE]\n\n'
+        ).encode("utf-8")
+        message = sub2cli_inject.detect_openai_transient_success_error(raw, "text/event-stream")
+        self.assertEqual("Selected model is at capacity. Please try a different model.", message)
+
     def test_upstream_requests_use_fresh_urlopen_instead_of_global_urlopen(self):
         calls = []
         original = sub2cli_inject.fresh_urlopen
