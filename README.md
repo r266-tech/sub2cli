@@ -23,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.8`
+Current desktop version: `v0.2.9`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -178,6 +178,7 @@ cat > /tmp/sub2cli-routes.json <<'JSON'
   "routes": [
     {
       "id": "relay-a-group-a",
+      "source_type": "relay",
       "priority": 10,
       "base_url": "https://relay-a.example.com/v1",
       "api_key_env": "RELAY_A_GROUP_A_KEY",
@@ -187,6 +188,7 @@ cat > /tmp/sub2cli-routes.json <<'JSON'
     },
     {
       "id": "relay-a-group-b",
+      "source_type": "relay",
       "priority": 20,
       "base_url": "https://relay-a.example.com/v1",
       "api_key_env": "RELAY_A_GROUP_B_KEY",
@@ -196,6 +198,7 @@ cat > /tmp/sub2cli-routes.json <<'JSON'
     },
     {
       "id": "custom-url-1",
+      "source_type": "custom",
       "priority": 30,
       "base_url": "https://url1.example.com/v1",
       "api_key_env": "CUSTOM_URL_1_KEY",
@@ -332,6 +335,10 @@ desktop/dist/sub2cli-<version>.dmg
 The current release is unsigned and not notarized.
 
 ## Release Notes
+
+### v0.2.9
+
+- keep route-pool retries scoped to official model-capacity errors while surfacing relay-side errors directly
 
 ### v0.2.8
 

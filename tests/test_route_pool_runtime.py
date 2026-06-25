@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -314,6 +315,19 @@ class RoutePoolRuntimeTests(unittest.TestCase):
         self.assertEqual(1, body["max_output_tokens"])
         self.assertEqual(3, timeout)
 
+    def test_normalize_pool_json_preserves_explicit_source_type(self):
+        routes, _policy, _models = sub2cli_inject.normalize_pool_json({
+            "routes": [{
+                "id": "relay-primary",
+                "source_type": "relay",
+                "base_url": "https://relay.example/v1",
+                "api_key": "sk-relay",
+                "protocol": "responses",
+            }],
+        })
+
+        self.assertEqual("relay", routes[0]["source_type"])
+
     def test_openai_capacity_error_retries_same_route_before_returning(self):
         route = {
             "id": "primary",
@@ -363,6 +377,101 @@ class RoutePoolRuntimeTests(unittest.TestCase):
         self.assertEqual("application/json", content_type)
         self.assertIn(b'"resp_ok"', body)
 
+    def test_relay_source_capacity_error_still_retries_as_official_issue(self):
+        route = {
+            "id": "primary",
+            "source_type": "relay",
+            "base_url": "https://primary.example",
+            "api_key": "sk-primary",
+            "protocol": "responses",
+        }
+        calls = []
+        original = sub2cli_inject.fresh_urlopen
+        original_delays = sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS
+
+        class FakeResponse:
+            def __init__(self, body):
+                self._body = body
+                self.headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, *_args):
+                return self._body
+
+        def fake_fresh(req, *, timeout):
+            calls.append(req)
+            if len(calls) == 1:
+                return FakeResponse(
+                    b'{"error":{"message":"Selected model is at capacity. Please try a different model."}}'
+                )
+            return FakeResponse(b'{"id":"resp_ok","object":"response","status":"completed","output":[]}')
+
+        sub2cli_inject.fresh_urlopen = fake_fresh
+        sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS = (0,)
+        try:
+            body, content_type = sub2cli_inject.request_route_response_with_openai_retries(
+                route,
+                {"model": "gpt-test", "input": "hi"},
+                timeout=3,
+            )
+        finally:
+            sub2cli_inject.fresh_urlopen = original
+            sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS = original_delays
+
+        self.assertEqual(2, len(calls))
+        self.assertEqual("application/json", content_type)
+        self.assertIn(b'"resp_ok"', body)
+
+    def test_relay_source_success_error_payload_is_terminal(self):
+        route = {
+            "id": "relay-primary",
+            "source_type": "relay",
+            "base_url": "https://relay.example",
+            "api_key": "sk-relay",
+            "protocol": "responses",
+        }
+        calls = []
+        original = sub2cli_inject.fresh_urlopen
+        original_delays = sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, *_args):
+                return b'{"error":{"message":"insufficient balance"}}'
+
+        def fake_fresh(req, *, timeout):
+            calls.append(req)
+            return FakeResponse()
+
+        sub2cli_inject.fresh_urlopen = fake_fresh
+        sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS = (0, 0)
+        try:
+            with self.assertRaises(sub2cli_inject.UpstreamRouteError) as raised:
+                sub2cli_inject.request_route_response_with_openai_retries(
+                    route,
+                    {"model": "gpt-test", "input": "hi"},
+                    timeout=3,
+                )
+        finally:
+            sub2cli_inject.fresh_urlopen = original
+            sub2cli_inject.OPENAI_TRANSIENT_RETRY_DELAYS = original_delays
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual("client_error", raised.exception.kind)
+        self.assertIn(b"insufficient balance", raised.exception.body)
+
     def test_relay_502_does_not_retry_same_route_wrapper(self):
         route = {
             "id": "primary",
@@ -400,6 +509,55 @@ class RoutePoolRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertEqual("retryable", raised.exception.kind)
         self.assertEqual(502, raised.exception.status)
+
+    def test_pool_does_not_fail_over_after_relay_source_terminal_error(self):
+        cfg = pool_cfg()
+        cfg["routes"][0]["source_type"] = "relay"
+        cfg["routes"][1]["source_type"] = "relay"
+        calls = []
+        original_request = sub2cli_inject.request_route_response_with_openai_retries
+        original_runtime = sub2cli_inject.ROUTE_POOL_RUNTIME
+
+        class FakeHandler:
+            def __init__(self):
+                self.sent = []
+
+            def _send(self, status, body, content_type):
+                self.sent.append((status, body, content_type))
+
+            def _send_json(self, status, payload):
+                self.sent.append((status, json.dumps(payload).encode("utf-8"), "application/json"))
+
+        def fake_request(route, body, *, timeout):
+            calls.append(route["id"])
+            if route["id"] == "primary":
+                raise sub2cli_inject.UpstreamRouteError(
+                    route=route,
+                    status=502,
+                    body=b'{"error":{"message":"network error: relay upstream reset"}}',
+                    content_type="application/json",
+                    kind="client_error",
+                    detail="HTTP 502: network error: relay upstream reset",
+                )
+            return b'{"id":"resp_ok","object":"response","status":"completed","output":[]}', "application/json"
+
+        sub2cli_inject.request_route_response_with_openai_retries = fake_request
+        sub2cli_inject.ROUTE_POOL_RUNTIME = sub2cli_inject.RoutePoolRuntime()
+        try:
+            handler = FakeHandler()
+            sub2cli_inject.ResponsesProxyHandler._send_pool_response(
+                handler,
+                cfg,
+                {"model": "gpt-test", "input": "hi"},
+            )
+        finally:
+            sub2cli_inject.request_route_response_with_openai_retries = original_request
+            sub2cli_inject.ROUTE_POOL_RUNTIME = original_runtime
+
+        self.assertEqual(["primary"], calls)
+        self.assertEqual(1, len(handler.sent))
+        self.assertEqual(502, handler.sent[0][0])
+        self.assertIn(b"network error", handler.sent[0][1])
 
     def test_response_failed_sse_capacity_error_is_openai_retryable(self):
         raw = (

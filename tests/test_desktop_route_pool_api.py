@@ -267,6 +267,7 @@ class DesktopRoutePoolApiTests(unittest.TestCase):
             result = api.route_pool_config_apply("default-pool")
 
         self.assertTrue(result["ok"])
+        self.assertEqual("relay", captured["routes"][0]["source_type"])
         self.assertEqual("sk-alpha", captured["routes"][0]["api_key"])
         self.assertEqual(["sk-alpha"], captured["secrets"])
 

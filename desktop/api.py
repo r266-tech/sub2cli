@@ -3968,6 +3968,7 @@ class JsApi:
                 resolved = {
                     "id": _route_pool_id_slug(route.get("id") or f"relay-{idx}", f"relay-{idx}"),
                     "label": label,
+                    "source_type": "relay",
                     "priority": int(route.get("priority") or idx * 10),
                     "base_url": base_url,
                     "api_key": api_key,
@@ -3994,6 +3995,7 @@ class JsApi:
                 routes.append({
                     "id": _route_pool_id_slug(route.get("id") or f"custom-{idx}", f"custom-{idx}"),
                     "label": label,
+                    "source_type": "custom",
                     "priority": int(route.get("priority") or idx * 10),
                     "base_url": base_url,
                     "api_key": api_key,
