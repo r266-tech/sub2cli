@@ -49,6 +49,8 @@ const state = {
   lastInjectBackup: null,
   lastInjectChanges: null,
   keySecret: null,
+  relayRefreshToken: 0,
+  relaySnapshots: {},
 };
 
 const PROJECT_URL = 'https://github.com/r266-tech/sub2cli';
@@ -151,6 +153,47 @@ function fmtDurationFromNow(ts) {
   if (days) return `${days}d ${hours}h`;
   if (hours) return `${hours}h ${mins}m`;
   return `${mins}m`;
+}
+
+function fmtIsoDurationFromNow(iso) {
+  if (!iso) return '—';
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return '—';
+  return fmtDurationFromNow(ts / 1000);
+}
+
+function addMonthsPreservingDay(date, count) {
+  const next = new Date(date.getTime());
+  const day = next.getDate();
+  next.setDate(1);
+  next.setMonth(next.getMonth() + count);
+  const lastDay = new Date(
+    next.getFullYear(),
+    next.getMonth() + 1,
+    0,
+    next.getHours(),
+    next.getMinutes(),
+    next.getSeconds(),
+    next.getMilliseconds(),
+  ).getDate();
+  next.setDate(Math.min(day, lastDay));
+  return next;
+}
+
+function subscriptionResetAt(windowStartIso, period) {
+  if (!windowStartIso) return null;
+  const start = new Date(windowStartIso);
+  if (!Number.isFinite(start.getTime())) return null;
+  if (period === 'day') {
+    start.setDate(start.getDate() + 1);
+  } else if (period === 'week') {
+    start.setDate(start.getDate() + 7);
+  } else if (period === 'month') {
+    return addMonthsPreservingDay(start, 1).toISOString();
+  } else {
+    return null;
+  }
+  return start.toISOString();
 }
 
 function fmtRemainingDays(iso) {
@@ -315,6 +358,63 @@ async function persistGroupModelColumns() {
   }
 }
 
+function relaySnapshotFromState() {
+  return {
+    endpoints: state.endpoints || [],
+    groups: state.groups || [],
+    keys: state.keys || [],
+    subscriptions: state.subscriptions || [],
+    defaultKey: state.defaultKey || null,
+    codexKey: state.codexKey || null,
+    defaultEndpoint: state.defaultEndpoint || null,
+    models: state.models || [],
+    groupModels: state.groupModels || {},
+    modelError: state.modelError || null,
+    groupModelColumns: state.groupModelColumns || [],
+    currentEmail: state.currentEmail || null,
+    accountUser: {
+      email: $('#acc-email') ? $('#acc-email').textContent : '',
+      status: $('#acc-status') ? $('#acc-status').textContent : '',
+      balanceText: $('#acc-balance') ? $('#acc-balance').textContent : '',
+      concurrency: $('#acc-concurrency') ? $('#acc-concurrency').textContent : '',
+    },
+  };
+}
+
+function renderRelaySnapshot(snapshot, domain) {
+  if (!snapshot) return false;
+  state.lastDomain = domain || state.lastDomain;
+  state.currentEmail = snapshot.currentEmail || null;
+  state.endpoints = snapshot.endpoints || [];
+  state.groups = snapshot.groups || [];
+  state.keys = snapshot.keys || [];
+  state.subscriptions = snapshot.subscriptions || [];
+  state.defaultKey = snapshot.defaultKey || null;
+  state.codexKey = snapshot.codexKey || null;
+  state.defaultEndpoint = snapshot.defaultEndpoint || null;
+  state.models = uniqueModels(snapshot.models || []);
+  state.groupModels = snapshot.groupModels || {};
+  state.modelError = snapshot.modelError || null;
+  state.groupModelColumns = normalizeGroupModelColumns(snapshot.groupModelColumns || [], state.models);
+
+  const user = snapshot.accountUser || {};
+  $('#acc-email').textContent = user.email || state.currentEmail || '—';
+  const statusRow = $('#acc-status');
+  if (statusRow) {
+    statusRow.textContent = user.status || '—';
+    statusRow.className = 'grid-value' + (user.status === 'Active (正常)' ? ' highlight-green' : '');
+  }
+  $('#acc-balance').textContent = user.balanceText || '—';
+  $('#acc-concurrency').textContent = user.concurrency || '—';
+  renderSubscriptions(state.subscriptions);
+  renderKeys(state.keys, state.groups, state.defaultKey, state.codexKey);
+  renderEndpoints(state.endpoints, state.defaultEndpoint);
+  renderGroups(state.groups, state.keys, state.defaultKey);
+  updateAccountChip(state.currentEmail || user.email || null);
+  updateContextLabels();
+  return true;
+}
+
 // ---- one-mode UI ----
 
 function clearModeState() {
@@ -366,8 +466,10 @@ async function bootstrap(autoRecovered = false) {
 
 async function refresh() {
   setStatus('刷新中…', 'warn');
+  const refreshToken = state.relayRefreshToken;
   try {
     const data = (await window.pywebview.api.refresh()) || {};
+    if (refreshToken !== state.relayRefreshToken) return;
     if (!data.ok) {
       setStatus('刷新失败', 'err');
       if (data.needs_login) {
@@ -409,18 +511,20 @@ function applyBootstrap(data) {
   state.groupModels = data.group_models || {};
   state.modelError = data.model_error || null;
   state.groupModelColumns = normalizeGroupModelColumns(data.group_model_columns || [], state.models);
+  state.currentEmail = (data.user && data.user.email) || null;
   setBrandSubtitle(data.site || data.domain || '');
   renderAccount(data);
   renderSubscriptions(state.subscriptions);
   renderKeys(state.keys, state.groups, data.default_key, state.codexKey);
   renderEndpoints(data.endpoints || [], data.default_endpoint);
   renderGroups(data.groups || [], data.keys || [], data.default_key);
+  if (state.lastDomain) state.relaySnapshots[state.lastDomain] = relaySnapshotFromState();
   refreshSidebar();  // sidebar is independent of bootstrap data
   refreshCodexAccounts();
   refreshCustomApis();
   refreshRoutePools();
   updateContextLabels();
-  updateAccountChip((data.user && data.user.email) || null);
+  updateAccountChip(state.currentEmail);
 }
 
 function refreshNavigationLists() {
@@ -554,46 +658,58 @@ async function refreshSidebar() {
     }
     const relays = applyStoredOrder(r.relays || [], RELAY_ORDER_KEY, (relay) => relay.domain);
     state.relays = relays;
-    const frag = document.createDocumentFragment();
-    for (const relay of relays) {
-      const item = el('div', { className: 'relay-item' + (relay.is_current ? ' active' : '') });
-      suppressSidebarContextMenu(item);
-      makeSortableItem(item, relay.domain);
-      const info = el('div', { className: 'relay-info' });
-      info.appendChild(el('span', { className: 'relay-domain', text: relay.site || relay.domain }));
-      item.appendChild(info);
-      appendSidebarActions(item, [
-        sidebarItemButton('删除', {
-          className: 'danger',
-          title: '删除中转站',
-          onClick: () => {
-            if (confirm(`删除中转站 ${relay.site || relay.domain}?\n会清掉 sub2cli 本地保存的 token 和密码 (不可恢复).`)) {
-              removeRelay(relay.domain);
-            }
-          },
-        }),
-      ]);
-      if (relay.is_current) item.addEventListener('click', () => {
-        if (!state.dragSorting) showRelayDashboard();
-      });
-      else item.addEventListener('click', () => {
-        if (!state.dragSorting) switchRelay(relay.domain);
-      });
-      frag.appendChild(item);
-    }
-    if (!r.relays.length) {
-      frag.appendChild(el('div', { className: 'muted small', text: '(尚无 relay; 跑 ./sub2cli 走 wizard)' }));
-    }
-    list.replaceChildren(frag);
-    installSortableList(list, {
-      onOrder: (order) => {
-        writeOrder(RELAY_ORDER_KEY, order);
-        setStatus('✓ 已保存中转列表顺序', 'ok');
-      },
-    });
+    renderRelayList();
   } catch (err) {
     list.replaceChildren(el('div', { className: 'muted small', text: '错: ' + String(err) }));
   }
+}
+
+function renderRelayList() {
+  const list = $('#sidebar-list');
+  if (!list) return;
+  const relays = applyStoredOrder(state.relays || [], RELAY_ORDER_KEY, (relay) => relay.domain);
+  state.relays = relays;
+  const frag = document.createDocumentFragment();
+  for (const relay of relays) {
+    const active = state.lastDomain ? relay.domain === state.lastDomain : relay.is_current;
+    const item = el('div', { className: 'relay-item' + (active ? ' active' : '') });
+    suppressSidebarContextMenu(item);
+    makeSortableItem(item, relay.domain);
+    const info = el('div', { className: 'relay-info' });
+    info.appendChild(el('span', { className: 'relay-domain', text: relay.site || relay.domain }));
+    item.appendChild(info);
+    appendSidebarActions(item, [
+      sidebarItemButton('删除', {
+        className: 'danger',
+        title: '删除中转站',
+        onClick: () => {
+          if (confirm(`删除中转站 ${relay.site || relay.domain}?\n会清掉 sub2cli 本地保存的 token 和密码 (不可恢复).`)) {
+            removeRelay(relay.domain);
+          }
+        },
+      }),
+    ]);
+    item.addEventListener('click', () => {
+      if (state.dragSorting) return;
+      if (active) showRelayDashboard();
+      else switchRelay(domainFromRelay(relay));
+    });
+    frag.appendChild(item);
+  }
+  if (!relays.length) {
+    frag.appendChild(el('div', { className: 'muted small', text: '(尚无 relay; 跑 ./sub2cli 走 wizard)' }));
+  }
+  list.replaceChildren(frag);
+  installSortableList(list, {
+    onOrder: (order) => {
+      writeOrder(RELAY_ORDER_KEY, order);
+      setStatus('✓ 已保存中转列表顺序', 'ok');
+    },
+  });
+}
+
+function domainFromRelay(relay) {
+  return relay && relay.domain ? relay.domain : '';
 }
 
 async function refreshCodexAccounts() {
@@ -726,6 +842,32 @@ function showRelayDashboard() {
   state.viewMode = 'relay';
   renderMainMode();
   stopRoutePoolStatusRefresh();
+}
+
+function clearRelayDashboardForSwitch(domain) {
+  state.lastDomain = domain;
+  state.currentEmail = null;
+  state.endpoints = [];
+  state.groups = [];
+  state.keys = [];
+  state.subscriptions = [];
+  state.defaultKey = null;
+  state.codexKey = null;
+  state.defaultEndpoint = null;
+  state.pingResults = {};
+  state.groupResults = {};
+  state.groupSelected = {};
+  state.models = [];
+  state.groupModels = {};
+  state.modelError = null;
+  state.groupModelColumns = [];
+  renderAccount({ user: { email: '刷新中…' } });
+  renderSubscriptions([]);
+  renderKeys([], [], null, null);
+  renderEndpoints([], null);
+  renderGroups([], [], null);
+  updateAccountChip(null);
+  updateContextLabels();
 }
 
 async function showRoutePoolDashboard() {
@@ -2411,29 +2553,71 @@ async function removeRelay(domain) {
 }
 
 async function switchRelay(domain) {
-  setStatus(`切到 ${domain}…`, 'warn');
-  showScreen('loading');
+  if (!domain || domain === state.lastDomain) {
+    showRelayDashboard();
+    return;
+  }
+  const refreshToken = ++state.relayRefreshToken;
+  setStatus(`切到 ${domain}, 后台刷新…`, 'warn');
+  state.relays = (state.relays || []).map((relay) => ({
+    ...relay,
+    is_current: relay.domain === domain,
+  }));
+  state.viewMode = 'relay';
+  if (!renderRelaySnapshot(state.relaySnapshots[domain], domain)) {
+    clearRelayDashboardForSwitch(domain);
+  }
+  renderRelayList();
+  renderMainMode();
+  showScreen('dashboard');
   try {
-    const data = (await window.pywebview.api.switch_relay(domain)) || {};
-    if (!data.ok) {
-      if (data.needs_login) {
-        showLoginError(data.domain || domain, `请先在浏览器登录 ${data.domain || domain}`);
-      } else {
-        state.retryRelayDomain = null;
-        showError('切 relay 失败', data.error);
-      }
+    const switched = (await window.pywebview.api.switch_relay_fast(domain)) || {};
+    if (refreshToken !== state.relayRefreshToken) return;
+    if (!switched.ok) {
+      state.retryRelayDomain = null;
+      await refreshSidebar();
+      showError('切 relay 失败', switched.error || '未知错误');
       setStatus('未就绪', 'err');
       return;
     }
-    state.pingResults = {};
-    state.groupResults = {};
-    state.viewMode = 'relay';
+    let data = (await window.pywebview.api.refresh()) || {};
+    if (refreshToken !== state.relayRefreshToken) return;
+    if (data.needs_login && window.pywebview.api.import_edge_account_for_relay) {
+      try {
+        const imported = await window.pywebview.api.import_edge_account_for_relay(data.domain || domain);
+        if (refreshToken !== state.relayRefreshToken) return;
+        if (imported && imported.ok) {
+          data = (await window.pywebview.api.refresh()) || {};
+          if (refreshToken !== state.relayRefreshToken) return;
+        }
+      } catch (_) {}
+    }
+    if (!data.ok) {
+      setStatus('后台刷新失败', 'err');
+      if (data.needs_login) {
+        state.retryRelayDomain = data.domain || domain;
+        renderAccount({
+          user: {
+            email: data.domain || domain,
+            status: '需重新登录',
+          },
+        });
+      } else {
+        state.retryRelayDomain = null;
+        renderAccount({ user: { email: '刷新失败' } });
+        renderSubscriptions([]);
+      }
+      await refreshSidebar();
+      return;
+    }
     state.retryRelayDomain = null;
     applyBootstrap(data);
+    await refreshRoutePools();
     renderMainMode();
-    showScreen('dashboard');
-    setStatus('✓ 已切 relay', 'ok');
+    setStatus('✓ 已切 relay · 后台已刷新', 'ok');
   } catch (err) {
+    if (refreshToken !== state.relayRefreshToken) return;
+    await refreshSidebar();
     showError('切 relay 失败', err && err.message ? err.message : String(err));
     setStatus('错误', 'err');
   }
@@ -3598,7 +3782,7 @@ function subscriptionIsActive(sub) {
   return !Number.isFinite(expiresMs) || expiresMs > Date.now();
 }
 
-function buildSubscriptionUsage(label, used, limit) {
+function buildSubscriptionUsage(label, used, limit, resetAt) {
   const usedNum = asNumber(used);
   const limitNum = asNumber(limit);
   const pct = usedNum == null || !limitNum || limitNum <= 0
@@ -3613,6 +3797,10 @@ function buildSubscriptionUsage(label, used, limit) {
     className: 'subscription-usage-value',
     text: `${fmtUsd(usedNum)}/${fmtUsd(limitNum)}`,
   }));
+  row.appendChild(el('span', {
+    className: 'subscription-reset',
+    text: resetAt ? `${fmtIsoDurationFromNow(resetAt)} 后重置` : '—',
+  }));
   return row;
 }
 
@@ -3625,9 +3813,24 @@ function buildSubscriptionItem(sub) {
   item.appendChild(head);
 
   const usage = el('div', { className: 'subscription-usage' });
-  usage.appendChild(buildSubscriptionUsage('每日', sub.daily_usage_usd, sub.daily_limit_usd));
-  usage.appendChild(buildSubscriptionUsage('每周', sub.weekly_usage_usd, sub.weekly_limit_usd));
-  usage.appendChild(buildSubscriptionUsage('每月', sub.monthly_usage_usd, sub.monthly_limit_usd));
+  usage.appendChild(buildSubscriptionUsage(
+    '每日',
+    sub.daily_usage_usd,
+    sub.daily_limit_usd,
+    subscriptionResetAt(sub.daily_window_start, 'day'),
+  ));
+  usage.appendChild(buildSubscriptionUsage(
+    '每周',
+    sub.weekly_usage_usd,
+    sub.weekly_limit_usd,
+    subscriptionResetAt(sub.weekly_window_start, 'week'),
+  ));
+  usage.appendChild(buildSubscriptionUsage(
+    '每月',
+    sub.monthly_usage_usd,
+    sub.monthly_limit_usd,
+    subscriptionResetAt(sub.monthly_window_start, 'month'),
+  ));
   item.appendChild(usage);
   return item;
 }

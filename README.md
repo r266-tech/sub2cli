@@ -23,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.9`
+Current desktop version: `v0.2.10`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -335,6 +335,11 @@ desktop/dist/sub2cli-<version>.dmg
 The current release is unsigned and not notarized.
 
 ## Release Notes
+
+### v0.2.10
+
+- show subscription daily/weekly/monthly reset countdowns in the relay dashboard
+- make sidebar relay switching instant by updating selection first and refreshing relay data in the background
 
 ### v0.2.9
 

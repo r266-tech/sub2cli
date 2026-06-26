@@ -2198,7 +2198,7 @@ aside {
 }
 .subscription-usage-row {
   display: grid;
-  grid-template-columns: 30px minmax(42px, 1fr) minmax(92px, auto);
+  grid-template-columns: 30px minmax(42px, 1fr) minmax(92px, auto) minmax(86px, auto);
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -2223,6 +2223,12 @@ aside {
 }
 .subscription-usage-value {
   color: rgba(226, 232, 240, 0.82);
+  font-size: 10px;
+  text-align: right;
+  white-space: nowrap;
+}
+.subscription-reset {
+  color: rgba(13, 240, 155, 0.82);
   font-size: 10px;
   text-align: right;
   white-space: nowrap;

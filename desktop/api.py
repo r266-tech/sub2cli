@@ -2730,6 +2730,9 @@ class JsApi:
             "daily_usage_usd": s.get("daily_usage_usd"),
             "weekly_usage_usd": s.get("weekly_usage_usd"),
             "monthly_usage_usd": s.get("monthly_usage_usd"),
+            "daily_window_start": s.get("daily_window_start"),
+            "weekly_window_start": s.get("weekly_window_start"),
+            "monthly_window_start": s.get("monthly_window_start"),
             "daily_limit_usd": group.get("daily_limit_usd"),
             "weekly_limit_usd": group.get("weekly_limit_usd"),
             "monthly_limit_usd": group.get("monthly_limit_usd"),
@@ -4373,6 +4376,37 @@ class JsApi:
             "needs_login": result.get("needs_login", False),
             "domain": domain,
             "reverted_to": prev_domain,
+        }
+
+    def switch_relay_fast(self, domain: str) -> dict:
+        """Change active relay in local config only.
+
+        Sidebar clicks use this to make selection instant; the UI then refreshes
+        account/key/group data in the background via refresh().
+        """
+        with self._lock:
+            cfg = sub2cli_lib.load_config()
+            if not cfg:
+                return {"ok": False, "error": "尚未配置"}
+            relays = cfg.get("relays") or {}
+            if domain not in relays:
+                return {"ok": False, "error": f"未保存的 relay: {domain}"}
+
+            relay = relays[domain] or {}
+            cfg["domain"] = domain
+            for f in sub2cli_lib.RELAY_FIELDS:
+                cfg[f] = relay.get(f)
+            sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
+            self._ctx = None
+            self._cfg = None
+            self._user = None
+            self._default_key = None
+            self._codex_key = None
+            self._default_ep = None
+        return {
+            "ok": True,
+            "domain": domain,
+            "site": self._relay_site_label(domain),
         }
 
     def remove_relay(self, domain: str) -> dict:
