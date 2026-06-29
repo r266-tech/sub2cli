@@ -1199,6 +1199,7 @@ function routePoolRuntimeState(route) {
 function routePoolRuntimeStatus(route) {
   const runtime = routePoolRuntimeState(route);
   const current = runtime.currentRoute && route && String(route.id) === runtime.currentRoute;
+  const seenByProxy = !!(runtime.state || current);
   const routeState = runtime.state || {};
   const cooldown = Number(routeState.cooldown_remaining || 0);
   const failures = Number(routeState.failures || 0);
@@ -1221,6 +1222,11 @@ function routePoolRuntimeStatus(route) {
     label = 'ACTIVE';
     detail = '当前正在使用';
     symbol = '●';
+  } else if (!seenByProxy) {
+    key = 'syncing';
+    label = 'SYNC';
+    detail = '已保存，等待代理读取';
+    symbol = '…';
   } else if (blocked) {
     key = 'blocked';
     label = 'BLOCKED';
@@ -1288,6 +1294,7 @@ function routePoolRouteDisplay(route, idx) {
 
 function routePoolHealthText(status) {
   if (status.key === 'unknown') return '等待 poolz';
+  if (status.key === 'syncing') return 'pending';
   if (status.current) return 'current';
   if (status.blocked) return 'blocked 24h';
   if (status.cooldown) return `cooldown ${status.cooldown}s`;
@@ -1302,6 +1309,7 @@ function routePoolStateChipText(status) {
     active: 'ACTIVE',
     healthy: 'OK',
     ready: 'READY',
+    syncing: 'SYNC',
     recovering: 'REC',
     cooldown: 'COOL',
     blocked: 'BLOCK',
@@ -1874,8 +1882,6 @@ function renderRoutePoolDashboard() {
   renderRoutePoolStatus();
   const saveBtn = $('#btn-route-pool-save');
   if (saveBtn) saveBtn.disabled = state.routePoolRunning;
-  const restartBtn = $('#btn-route-pool-restart');
-  if (restartBtn) restartBtn.disabled = state.routePoolRunning;
 }
 
 function selectRoutePoolDraft(poolId) {
@@ -2061,6 +2067,10 @@ async function saveRoutePool({ silent = false } = {}) {
   if (!draft.name) draft.name = '连接池';
   state.routePoolRunning = true;
   renderRoutePoolDashboard();
+  if (!silent) {
+    renderRoutePoolStatus('[SYS] 正在保存并热生效连接池...');
+    setStatus('保存连接池中…', 'warn');
+  }
   try {
     const r = await window.pywebview.api.save_route_pool(cloneJson(draft));
     if (!r || !r.ok) {
@@ -2084,8 +2094,13 @@ async function saveRoutePool({ silent = false } = {}) {
     const saved = state.routePools.find((item) => item.id === state.currentRoutePoolId);
     if (saved) state.routePoolDraft = cloneJson(saved);
     if (!silent) {
-      setStatus('✓ 已保存连接池', 'ok');
-      renderRoutePoolStatus(`[READY] 已保存连接池 · ${draftRouteCount} routes`);
+      setStatus('✓ 连接池已保存并生效', 'ok');
+      renderRoutePoolStatus(planLog([
+        `[READY] 已保存并热生效 · ${draftRouteCount} routes`,
+        r.backup_name ? `[INFO] backup: ${r.backup_name}` : null,
+        r.apply_stdout ? `[INFO] stdout:\n${r.apply_stdout}` : null,
+        r.apply_stderr ? `[WARN] stderr:\n${r.apply_stderr}` : null,
+      ]));
     }
     return state.currentRoutePoolId;
   } catch (err) {
@@ -4643,10 +4658,6 @@ const routePoolNew = $('#btn-route-pool-new');
 if (routePoolNew) routePoolNew.addEventListener('click', createRoutePoolDraft);
 const btnRoutePoolToggleAdd = $('#btn-route-pool-toggle-add');
 if (btnRoutePoolToggleAdd) btnRoutePoolToggleAdd.addEventListener('click', toggleRoutePoolEditor);
-const btnRoutePoolRefresh = $('#btn-route-pool-refresh');
-if (btnRoutePoolRefresh) btnRoutePoolRefresh.addEventListener('click', () => refreshRoutePools({ preserveDraft: true }));
-const btnRoutePoolRestart = $('#btn-route-pool-restart');
-if (btnRoutePoolRestart) btnRoutePoolRestart.addEventListener('click', restartRoutePoolProxy);
 const btnRoutePoolSave = $('#btn-route-pool-save');
 if (btnRoutePoolSave) btnRoutePoolSave.addEventListener('click', () => saveRoutePool());
 const btnRoutePoolAddRoute = $('#btn-route-pool-add-route');

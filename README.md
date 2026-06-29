@@ -23,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.10`
+Current desktop version: `v0.2.11`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -335,6 +335,11 @@ desktop/dist/sub2cli-<version>.dmg
 The current release is unsigned and not notarized.
 
 ## Release Notes
+
+### v0.2.11
+
+- hot-apply saved route pools immediately without restarting Codex
+- fail over relay routes on HTTP 429 and relay-wrapped `last status: 429 Too Many Requests` errors
 
 ### v0.2.10
 

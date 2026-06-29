@@ -1472,6 +1472,11 @@ button.primary:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0
   border-color: rgba(13, 240, 155, 0.28);
   color: rgba(13, 240, 155, 0.78);
 }
+.pool-state-badge.state-syncing {
+  border-color: rgba(0, 240, 255, 0.32);
+  background: rgba(0, 240, 255, 0.055);
+  color: rgba(0, 240, 255, 0.82);
+}
 .pool-state-badge.state-cooldown,
 .pool-state-badge.state-recovering {
   border-color: rgba(255, 191, 0, 0.46);

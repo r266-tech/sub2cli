@@ -208,21 +208,81 @@ class DesktopRoutePoolApiTests(unittest.TestCase):
 
     def test_save_route_pool_normalizes_bare_relay_domain(self):
         api = desktop_api.JsApi()
-        result = api.save_route_pool({
-            "id": "default-pool",
-            "routes": [{
-                "id": "relay-bare-domain",
-                "source_type": "relay",
-                "relay_domain": "relay.example",
-                "key_id": 1,
-                "priority": 10,
-            }],
-        })
+        with patch.object(api, "_relay_ctx_for_domain", return_value=FakeRelayContext()), \
+             patch.object(api, "_run_inject_add_pool", return_value={"ok": True, "stdout": "applied"}):
+            result = api.save_route_pool({
+                "id": "default-pool",
+                "routes": [{
+                    "id": "relay-bare-domain",
+                    "source_type": "relay",
+                    "relay_domain": "relay.example",
+                    "key_id": 1,
+                    "priority": 10,
+                }],
+            })
 
         self.assertTrue(result["ok"])
         cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
         route = cfg["route_pools"][0]["routes"][0]
         self.assertEqual("https://relay.example", route["relay_domain"])
+        self.assertTrue(result["applied"])
+
+    def test_save_route_pool_hot_applies_saved_routes(self):
+        api = desktop_api.JsApi()
+        captured = {}
+
+        def fake_apply(pool, routes, secrets):
+            captured["pool"] = pool
+            captured["routes"] = routes
+            captured["secrets"] = secrets
+            return {
+                "ok": True,
+                "stdout": "已更新 route pool",
+                "backup_name": "add-pool-default-pool-1",
+            }
+
+        with patch.object(api, "_relay_ctx_for_domain", return_value=FakeRelayContext()), \
+             patch.object(api, "_run_inject_add_pool", side_effect=fake_apply):
+            result = api.save_route_pool({
+                "id": "default-pool",
+                "routes": [{
+                    "id": "relay-hot",
+                    "source_type": "relay",
+                    "relay_domain": "https://relay.example",
+                    "key_id": 1,
+                    "priority": 10,
+                }],
+            })
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["applied"])
+        self.assertEqual("add-pool-default-pool-1", result["backup_name"])
+        self.assertEqual("default-pool", captured["pool"]["id"])
+        self.assertEqual(["relay-hot"], [route["id"] for route in captured["routes"]])
+        self.assertEqual(["sk-alpha"], captured["secrets"])
+        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual("default-pool", cfg["current_route_pool"])
+
+    def test_save_route_pool_does_not_persist_when_hot_apply_fails(self):
+        api = desktop_api.JsApi()
+        with patch.object(api, "_relay_ctx_for_domain", return_value=FakeRelayContext()), \
+             patch.object(api, "_run_inject_add_pool", return_value={"ok": False, "error": "apply failed"}):
+            result = api.save_route_pool({
+                "id": "default-pool",
+                "routes": [{
+                    "id": "relay-hot",
+                    "source_type": "relay",
+                    "relay_domain": "https://relay.example",
+                    "key_id": 1,
+                    "priority": 10,
+                }],
+            })
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("apply failed", result["error"])
+        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertNotIn("route_pools", cfg)
+        self.assertNotIn("current_route_pool", cfg)
 
     def test_route_pool_relay_source_accepts_bare_domain(self):
         api = desktop_api.JsApi()

@@ -77,7 +77,7 @@ FORCE_QUIT_CODEX = os.environ.get("SUB2CLI_CODEX_FORCE_QUIT", "1").lower() not i
     "no",
     "off",
 }
-APP_VERSION = "0.2.10"
+APP_VERSION = "0.2.11"
 APP_URL = os.environ.get(
     "SUB2CLI_URL",
     os.environ.get("CODEX_PROVIDER_URL", "https://github.com/r266-tech/sub2cli"),
@@ -1579,12 +1579,12 @@ def classify_upstream_status(
 ) -> str:
     if detect_openai_transient_success_error(body, content_type):
         return "openai_retryable"
+    if status == 429 or detect_upstream_rate_limit_error(body, content_type):
+        return "rate_limit"
     if route_source_type(route) == "relay":
         return "client_error"
     if status in (401, 403):
         return "blocked"
-    if status == 429:
-        return "rate_limit"
     if status in (408, 409, 425) or status >= 500:
         return "retryable"
     if status == 400 and re.search(rb"model|unsupported|not\s+found", body[:4096], re.I):
@@ -1607,11 +1607,24 @@ OPENAI_TRANSIENT_CODE_RE = re.compile(
     r"(model_at_capacity|model_capacity|model_overloaded|model_unavailable)",
     re.I,
 )
+UPSTREAM_RATE_LIMIT_BODY_RE = re.compile(
+    r"("
+    r"\b429\b.{0,120}\b(too many requests|rate[\s_-]*limit(?:ed)?)\b|"
+    r"\b(too many requests|rate[\s_-]*limit(?:ed)?)\b.{0,120}\b429\b|"
+    r"\blast status\s*:\s*429\b"
+    r")",
+    re.I,
+)
 
 
 def is_openai_transient_success_error(message: str, *, error_type: str = "", error_code: str = "") -> bool:
     combined = " ".join(part for part in (message, error_type, error_code) if part)
     return bool(OPENAI_TRANSIENT_BODY_RE.search(combined) or OPENAI_TRANSIENT_CODE_RE.search(combined))
+
+
+def is_upstream_rate_limit_error(message: str, *, error_type: str = "", error_code: str = "") -> bool:
+    combined = " ".join(part for part in (message, error_type, error_code) if part)
+    return bool(UPSTREAM_RATE_LIMIT_BODY_RE.search(combined))
 
 
 def payload_error_info(payload: object) -> tuple[str, str, str] | None:
@@ -1706,6 +1719,23 @@ def detect_openai_transient_success_error(raw: bytes, content_type: str) -> str 
     return None
 
 
+def detect_upstream_rate_limit_error(raw: bytes, content_type: str) -> str | None:
+    payloads = success_payloads(raw, content_type)
+    for payload in payloads:
+        info = payload_error_info(payload)
+        if not info:
+            continue
+        message, error_type, error_code = info
+        if is_upstream_rate_limit_error(message, error_type=error_type, error_code=error_code):
+            return message or error_code or error_type
+
+    if not payloads and raw:
+        text = raw[:8192].decode("utf-8", errors="replace").strip()
+        if text and is_upstream_rate_limit_error(text):
+            return text[:240]
+    return None
+
+
 def detect_relay_success_error(raw: bytes, content_type: str) -> str | None:
     for message, _error_type, _error_code in iter_success_error_info(raw, content_type):
         return message
@@ -1725,6 +1755,17 @@ def raise_for_upstream_success_error(route: dict, raw: bytes, content_type: str)
             detail=detail,
         )
     if route_source_type(route) == "relay":
+        message = detect_upstream_rate_limit_error(raw, content_type)
+        if message:
+            detail = f"relay returned rate limit payload: {message}"[:300]
+            raise UpstreamRouteError(
+                route=route,
+                status=429,
+                body=raw[:1024 * 1024],
+                content_type=content_type or "application/json",
+                kind="rate_limit",
+                detail=detail,
+            )
         message = detect_relay_success_error(raw, content_type)
         if message:
             detail = f"relay returned error payload: {message}"[:300]

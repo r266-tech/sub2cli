@@ -510,6 +510,108 @@ class RoutePoolRuntimeTests(unittest.TestCase):
         self.assertEqual("retryable", raised.exception.kind)
         self.assertEqual(502, raised.exception.status)
 
+    def test_relay_http_429_is_rate_limit_not_terminal_client_error(self):
+        route = {
+            "id": "primary",
+            "source_type": "relay",
+            "base_url": "https://primary.example",
+            "api_key": "sk-primary",
+            "protocol": "responses",
+        }
+        kind = sub2cli_inject.classify_upstream_status(
+            429,
+            b'{"error":{"message":"Too Many Requests"}}',
+            "application/json",
+            route=route,
+        )
+
+        self.assertEqual("rate_limit", kind)
+
+    def test_relay_wrapped_429_payload_is_rate_limit(self):
+        route = {
+            "id": "primary",
+            "source_type": "relay",
+            "base_url": "https://primary.example",
+            "api_key": "sk-primary",
+            "protocol": "responses",
+        }
+        kind = sub2cli_inject.classify_upstream_status(
+            502,
+            b'{"error":{"message":"exceeded retry limit, last status: 429 Too Many Requests"}}',
+            "application/json",
+            route=route,
+        )
+
+        self.assertEqual("rate_limit", kind)
+
+    def test_relay_success_error_wrapped_429_payload_is_rate_limit(self):
+        route = {
+            "id": "primary",
+            "source_type": "relay",
+            "base_url": "https://primary.example",
+            "api_key": "sk-primary",
+            "protocol": "responses",
+        }
+
+        with self.assertRaises(sub2cli_inject.UpstreamRouteError) as raised:
+            sub2cli_inject.raise_for_upstream_success_error(
+                route,
+                b'{"error":{"message":"exceeded retry limit, last status: 429 Too Many Requests"}}',
+                "application/json",
+            )
+
+        self.assertEqual("rate_limit", raised.exception.kind)
+        self.assertEqual(429, raised.exception.status)
+
+    def test_pool_fails_over_after_relay_source_rate_limit(self):
+        cfg = pool_cfg()
+        cfg["routes"][0]["source_type"] = "relay"
+        cfg["routes"][1]["source_type"] = "relay"
+        calls = []
+        original_request = sub2cli_inject.request_route_response_with_openai_retries
+        original_runtime = sub2cli_inject.ROUTE_POOL_RUNTIME
+
+        class FakeHandler:
+            def __init__(self):
+                self.sent = []
+
+            def _send(self, status, body, content_type):
+                self.sent.append((status, body, content_type))
+
+            def _send_json(self, status, payload):
+                self.sent.append((status, json.dumps(payload).encode("utf-8"), "application/json"))
+
+        def fake_request(route, body, *, timeout):
+            calls.append(route["id"])
+            if route["id"] == "primary":
+                raise sub2cli_inject.UpstreamRouteError(
+                    route=route,
+                    status=429,
+                    body=b'{"error":{"message":"Too Many Requests"}}',
+                    content_type="application/json",
+                    kind="rate_limit",
+                    detail="HTTP 429 Too Many Requests",
+                )
+            return b'{"id":"resp_ok","object":"response","status":"completed","output":[]}', "application/json"
+
+        sub2cli_inject.request_route_response_with_openai_retries = fake_request
+        sub2cli_inject.ROUTE_POOL_RUNTIME = sub2cli_inject.RoutePoolRuntime()
+        try:
+            handler = FakeHandler()
+            sub2cli_inject.ResponsesProxyHandler._send_pool_response(
+                handler,
+                cfg,
+                {"model": "gpt-test", "input": "hi"},
+            )
+        finally:
+            sub2cli_inject.request_route_response_with_openai_retries = original_request
+            sub2cli_inject.ROUTE_POOL_RUNTIME = original_runtime
+
+        self.assertEqual(["primary", "fallback"], calls)
+        self.assertEqual(1, len(handler.sent))
+        self.assertEqual(200, handler.sent[0][0])
+        self.assertIn(b"resp_ok", handler.sent[0][1])
+
     def test_pool_does_not_fail_over_after_relay_source_terminal_error(self):
         cfg = pool_cfg()
         cfg["routes"][0]["source_type"] = "relay"

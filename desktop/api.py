@@ -3736,7 +3736,7 @@ class JsApi:
             tmp.close()
             slot = _route_pool_id_slug(pool.get("id") or pool.get("name") or "pool")
             display = f"Codex - {pool.get('name') or slot} route pool"
-            cmd = [inject_bin, "add-pool", slot, "--routes-json", tmp.name, "--display", display]
+            cmd = [inject_bin, "add-pool", slot, "--routes-json", tmp.name, "--display", display, "--no-restart"]
             model = str(pool.get("model") or "").strip()
             if model:
                 cmd.extend(["--model", model])
@@ -3901,7 +3901,7 @@ class JsApi:
         }
 
     def save_route_pool(self, pool: dict) -> dict:
-        """Create/update a saved route pool. Secrets are intentionally omitted."""
+        """Create/update a saved route pool and hot-apply it to the Codex slot."""
         with self._lock:
             cfg = sub2cli_lib.load_config() or {}
             submitted_routes = (pool or {}).get("routes") if isinstance(pool, dict) else []
@@ -3924,10 +3924,22 @@ class JsApi:
                     "error": f"保存失败: {submitted_count} 条 route 中只有 {len(clean.get('routes') or [])} 条有效，请检查来源/名称/分组是否已加载",
                 }
             cfg["current_route_pool"] = clean["id"]
+            routes, secrets, error = self._resolve_route_pool_routes(cfg, clean)
+            if error:
+                return {"ok": False, "error": error}
+            apply_result = self._run_inject_add_pool(clean, routes, secrets)
+            if not apply_result.get("ok"):
+                apply_result.setdefault("error", "连接池热生效失败，未保存")
+                return apply_result
             _mark_route_pool_config_changed(cfg)
             sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
         listing = self.list_route_pools()
         listing["saved_id"] = clean["id"]
+        listing["applied"] = True
+        listing["apply_stdout"] = apply_result.get("stdout", "")
+        listing["apply_stderr"] = apply_result.get("stderr", "")
+        listing["backup_name"] = apply_result.get("backup_name")
+        listing["rollback_command"] = apply_result.get("rollback_command")
         return listing
 
     def _resolve_route_pool_routes(self, cfg: dict, pool: dict) -> tuple[list[dict], list[str], str | None]:
