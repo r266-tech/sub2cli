@@ -2336,6 +2336,87 @@ def _unique_custom_api_id(base: str, used: set[str]) -> str:
     return fallback
 
 
+def _custom_api_protocol(entry: dict | None, default: str = "chat") -> str:
+    protocol = str((entry or {}).get("protocol") or default).strip().lower()
+    return protocol if protocol in {"responses", "chat"} else default
+
+
+def _custom_api_provider_kind(entry: dict | None) -> str:
+    kind = str((entry or {}).get("provider_kind") or "openai-compatible").strip().lower()
+    aliases = {
+        "newapi": "new-api",
+        "new_api": "new-api",
+        "openai": "openai-compatible",
+        "openai_compatible": "openai-compatible",
+    }
+    kind = aliases.get(kind, kind)
+    return kind if kind in {"new-api", "openai-compatible"} else "openai-compatible"
+
+
+def _detect_custom_api_protocol(base_url: str, api_key: str, models: list[str]) -> tuple[str, str | None]:
+    text_models = [m for m in models if not sub2cli_lib.model_is_image(m)]
+    model = sub2cli_lib.best_default_model(text_models, sub2cli_lib.DEFAULT_FALLBACK_MODEL)
+    result = sub2cli_lib.test_model(base_url, api_key, model=model, text_probe="responses")
+    if result.get("ok"):
+        return "responses", None
+    summary = result.get("summary") or result.get("error") or "Responses API probe failed"
+    return "chat", str(summary)
+
+
+def _custom_api_root_url(base_url: str) -> str:
+    root = (base_url or "").strip().rstrip("/")
+    if root.lower().endswith("/v1"):
+        root = root[:-3].rstrip("/")
+    return root
+
+
+def _new_api_usage_endpoint(base_url: str) -> str:
+    root = _custom_api_root_url(base_url)
+    return f"{root}/api/usage/token/" if root else ""
+
+
+def _fetch_custom_api_usage(base_url: str, api_key: str, timeout: float = 8.0) -> tuple[dict | None, str | None, bool]:
+    url = _new_api_usage_endpoint(base_url)
+    if not url:
+        return None, "missing endpoint", False
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+    is_new_api = False
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        is_new_api = bool(r.headers.get("X-New-Api-Version") or r.headers.get("x-new-api-version"))
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}", is_new_api
+        payload = r.json()
+    except (requests.RequestException, ValueError) as exc:
+        return None, f"{type(exc).__name__}: {exc}", is_new_api
+    if not isinstance(payload, dict):
+        return None, "invalid payload", is_new_api
+    data = payload.get("data")
+    if not isinstance(data, dict) or data.get("object") != "token_usage":
+        return None, "not new-api usage", is_new_api
+    return {
+        "object": "token_usage",
+        "name": data.get("name"),
+        "total_granted": data.get("total_granted"),
+        "total_used": data.get("total_used"),
+        "total_available": data.get("total_available"),
+        "unlimited_quota": bool(data.get("unlimited_quota")),
+        "model_limits": data.get("model_limits") if isinstance(data.get("model_limits"), dict) else {},
+        "model_limits_enabled": bool(data.get("model_limits_enabled")),
+        "expires_at": data.get("expires_at"),
+    }, None, True
+
+
+def _detect_custom_api_provider_kind(base_url: str, api_key: str) -> tuple[str, dict | None, str | None]:
+    usage, usage_error, is_new_api = _fetch_custom_api_usage(base_url, api_key)
+    if usage or is_new_api:
+        return "new-api", usage, usage_error
+    return "openai-compatible", None, usage_error
+
+
 # ---- route pools (priority-ordered local failover/fallback targets) ----
 #
 # Saved pool metadata keeps only route references: relay key ids or custom API
@@ -2445,18 +2526,19 @@ def _sanitize_route_pool_route(route: dict, index: int) -> dict | None:
         priority = int(route.get("priority", index * 10))
     except (TypeError, ValueError):
         priority = index * 10
-    protocol = str(route.get("protocol") or ("chat" if source_type == "custom" else "responses")).strip().lower()
+    protocol = str(route.get("protocol") or ("responses" if source_type == "relay" else "")).strip().lower()
     if protocol not in {"responses", "chat"}:
-        protocol = "chat" if source_type == "custom" else "responses"
+        protocol = "" if source_type == "custom" else "responses"
     clean = {
         "id": route_id,
         "label": label[:120],
         "source_type": source_type,
         "priority": max(1, min(100000, priority)),
-        "protocol": protocol,
         "model": str(route.get("model") or "").strip(),
         "notes": str(route.get("notes") or "").strip()[:240],
     }
+    if protocol:
+        clean["protocol"] = protocol
     if source_type == "relay":
         key_id = route.get("key_id")
         if key_id in (None, ""):
@@ -2747,6 +2829,11 @@ class JsApi:
             "id": api_id,
             "name": entry.get("name") or entry.get("id") or "?",
             "base_url": entry.get("base_url", ""),
+            "provider_kind": _custom_api_provider_kind(entry),
+            "protocol": _custom_api_protocol(entry),
+            "protocol_error": entry.get("protocol_error"),
+            "usage": entry.get("usage") if isinstance(entry.get("usage"), dict) else None,
+            "usage_error": entry.get("usage_error"),
             "key_masked": _mask_api_key(key) if key else "(未保存)",
             "has_key": bool(key),
             "model_columns": entry.get("model_columns") or [],
@@ -4014,7 +4101,7 @@ class JsApi:
                     "priority": int(route.get("priority") or idx * 10),
                     "base_url": base_url,
                     "api_key": api_key,
-                    "protocol": route.get("protocol") or "chat",
+                    "protocol": route.get("protocol") or _custom_api_protocol(entry),
                     "model": route.get("model") or pool.get("model") or "",
                     "notes": route.get("notes") or "custom-api",
                 })
@@ -4192,6 +4279,17 @@ class JsApi:
         probe = Sub2Context(domain)
         is_sub2api, sub_msg = probe.settings_reachable_anonymous()
         if not is_sub2api:
+            models, model_error = sub2cli_lib.fetch_models(domain, None, timeout=8)
+            if models or (model_error and model_error.startswith(("HTTP 401", "HTTP 403"))):
+                return {
+                    "ok": True,
+                    "is_sub2api": False,
+                    "is_openai_compatible": True,
+                    "domain": domain,
+                    "model_count": len(models),
+                    "model_error": model_error,
+                    "insecure_warning": insecure_warning,
+                }
             return {
                 "ok": False,
                 "is_sub2api": False,
@@ -5346,6 +5444,8 @@ class JsApi:
         models, err = sub2cli_lib.fetch_models(base_url, api_key, timeout=8)
         if err and not models:
             return {"ok": False, "error": f"无法连通: {err}", "base_url": base_url}
+        protocol, protocol_error = _detect_custom_api_protocol(base_url, api_key, models)
+        provider_kind, usage, usage_error = _detect_custom_api_provider_kind(base_url, api_key)
         with self._lock:
             cfg = sub2cli_lib.load_config() or {}
             apis = _custom_apis(cfg)
@@ -5357,15 +5457,32 @@ class JsApi:
                 "id": api_id,
                 "name": name or _custom_api_base_slug(base_url, name),
                 "base_url": base_url,
+                "provider_kind": provider_kind,
+                "protocol": protocol,
                 "model_columns": sub2cli_lib.normalize_group_model_columns(None, models),
                 "created_at": int(time.time()),
             }
+            if protocol_error:
+                entry["protocol_error"] = protocol_error[:240]
+            if usage:
+                entry["usage"] = usage
+                entry.pop("usage_error", None)
+            elif provider_kind == "new-api" and usage_error:
+                entry["usage_error"] = usage_error[:240]
             apis.append(entry)
             cfg["current_custom_api"] = api_id
             sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
         listing = self.list_custom_apis()
         listing["added_id"] = api_id
         listing["models"] = models
+        listing["provider_kind"] = provider_kind
+        listing["protocol"] = protocol
+        if usage:
+            listing["usage"] = usage
+        elif provider_kind == "new-api" and usage_error:
+            listing["usage_error"] = usage_error
+        if protocol_error:
+            listing["protocol_error"] = protocol_error
         return listing
 
     def remove_custom_api(self, api_id: str) -> dict:
@@ -5424,11 +5541,35 @@ class JsApi:
             return {"ok": False, "error": f"未保存的自定义 API: {api_id}"}
         api_key = _kc_custom_api_get(api_id) or ""
         models, err = sub2cli_lib.fetch_models(entry.get("base_url", ""), api_key or None, timeout=8)
+        previous_kind = _custom_api_provider_kind(entry)
+        provider_kind, usage, usage_error = _detect_custom_api_provider_kind(entry.get("base_url", ""), api_key) if api_key else (
+            _custom_api_provider_kind(entry), None, "missing api key"
+        )
+        if previous_kind == "new-api" and not usage:
+            provider_kind = "new-api"
+        should_persist_provider = provider_kind == "new-api" or entry.get("provider_kind") or usage
+        if should_persist_provider:
+            with self._lock:
+                fresh_cfg = sub2cli_lib.load_config() or {}
+                fresh_entry = _find_custom_api(fresh_cfg, api_id)
+                if fresh_entry:
+                    fresh_entry["provider_kind"] = provider_kind
+                    if usage:
+                        fresh_entry["usage"] = usage
+                        fresh_entry.pop("usage_error", None)
+                    elif provider_kind == "new-api" and usage_error:
+                        fresh_entry["usage_error"] = usage_error[:240]
+                    sub2cli_lib.save_config(fresh_cfg, sub2cli_lib.default_config_path())
+        display_usage = usage or (entry.get("usage") if isinstance(entry.get("usage"), dict) else None)
         return {
             "ok": True,
             "models": models,
             "model_error": err,
             "model_columns": entry.get("model_columns") or [],
+            "provider_kind": provider_kind,
+            "protocol": _custom_api_protocol(entry),
+            "usage": display_usage,
+            "usage_error": usage_error if provider_kind == "new-api" else None,
         }
 
     def test_custom_api_model(self, api_id: str, model: str) -> dict:
@@ -5443,11 +5584,16 @@ class JsApi:
         api_key = _kc_custom_api_get(api_id) or ""
         if not api_key:
             return {"ok": False, "error": "Keychain 里没有这个自定义 API 的 Key"}
-        result = sub2cli_lib.test_model(entry.get("base_url", ""), api_key, model=model)
+        result = sub2cli_lib.test_model(
+            entry.get("base_url", ""),
+            api_key,
+            model=model,
+            text_probe=_custom_api_protocol(entry),
+        )
         return {"ok": True, "model": model, "result": result}
 
-    def _custom_api_inject_target(self, api_id: str) -> tuple[str, str, str, list[str], str] | None:
-        """Return (base_url, api_key, label, models, selected_model) for configuring Codex."""
+    def _custom_api_inject_target(self, api_id: str) -> tuple[str, str, str, list[str], str, str] | None:
+        """Return (base_url, api_key, label, models, selected_model, protocol)."""
         cfg = sub2cli_lib.load_config() or {}
         entry = _find_custom_api(cfg, api_id)
         if not entry:
@@ -5463,14 +5609,14 @@ class JsApi:
             models = saved_models
         selected_model = saved_models[0] if saved_models else (models[0] if models else "")
         label = f"自定义 API · {entry.get('name') or api_id} · {base_url}"
-        return base_url, api_key, label, models, selected_model
+        return base_url, api_key, label, models, selected_model, _custom_api_protocol(entry)
 
     def custom_api_config_plan(self, api_id: str) -> dict:
         """Dry-run configuring Codex to a saved custom API."""
         target = self._custom_api_inject_target(api_id)
         if not target:
             return {"ok": False, "error": "未找到自定义 API 或缺少 Key"}
-        url, api_key, label, models, selected_model = target
+        url, api_key, label, models, selected_model, protocol = target
         display = f"Codex - {api_id} custom API"
         result = self._run_inject_add_api(
             url,
@@ -5478,7 +5624,7 @@ class JsApi:
             models,
             dry_run=True,
             model=selected_model,
-            protocol="chat",
+            protocol=protocol,
             slot=api_id,
             display=display,
         )
@@ -5492,14 +5638,14 @@ class JsApi:
         target = self._custom_api_inject_target(api_id)
         if not target:
             return {"ok": False, "error": "未找到自定义 API 或缺少 Key"}
-        url, api_key, _label, models, selected_model = target
+        url, api_key, _label, models, selected_model, protocol = target
         return self._run_inject_add_api(
             url,
             api_key,
             models,
             dry_run=False,
             model=selected_model,
-            protocol="chat",
+            protocol=protocol,
             slot=api_id,
             display=f"Codex - {api_id} custom API",
         )

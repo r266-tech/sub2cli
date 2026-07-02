@@ -391,11 +391,18 @@ def toml_quote(value: str) -> str:
 
 def normalize_base_url(value: str) -> str:
     base_url = value.strip().rstrip("/")
-    if base_url.lower().endswith("/v1"):
-        base_url = base_url[:-3].rstrip("/")
     if not base_url.startswith(("http://", "https://")):
         fail(f"base_url must start with http:// or https://: {value!r}")
-    return base_url
+    if base_url.lower().endswith("/v1"):
+        return base_url
+    return f"{base_url}/v1"
+
+
+def api_base_url_for_codex(value: str) -> str:
+    base_url = value.strip().rstrip("/")
+    if not base_url:
+        return ""
+    return base_url if base_url.lower().endswith("/v1") else f"{base_url}/v1"
 
 
 def slot_from_url(base_url: str) -> str:
@@ -968,7 +975,7 @@ def ensure_initialized() -> None:
 
 def probe_relay(base_url: str, api_key: str, timeout: float = 12.0) -> tuple[bool, str]:
     req = urlrequest.Request(
-        base_url.rstrip("/") + "/v1/models",
+        models_endpoint(base_url),
         headers={
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json",
@@ -988,7 +995,7 @@ def probe_relay(base_url: str, api_key: str, timeout: float = 12.0) -> tuple[boo
         if exc.code == 403:
             return False, "403 Forbidden - key 权限不足，或中转拒绝当前网络"
         if exc.code == 404:
-            return False, "404 Not Found - base URL 可能不对，通常不要带 /v1"
+            return False, "404 Not Found - base URL 可能不对，通常使用站点根或 /v1 API base"
         return False, f"HTTP {exc.code} {exc.reason}"
     except urlerror.URLError as exc:
         return False, f"无法访问中转：{exc.reason}"
@@ -2676,7 +2683,7 @@ def patch_config(
     if mode == "relay":
         if not relay_base_url:
             fail("relay_base_url is required for relay mode")
-        codex_base_url = PROTOCOL_PROXY_BASE_URL if protocol in {"chat", "pool"} else relay_base_url.rstrip("/")
+        codex_base_url = PROTOCOL_PROXY_BASE_URL if protocol in {"chat", "pool"} else api_base_url_for_codex(relay_base_url)
         block = (
             f"\n[model_providers.{RELAY_PROVIDER}]\n"
             f'name = "{RELAY_PROVIDER}"\n'
@@ -2734,7 +2741,7 @@ def config_clean_for_slot(cfg: dict) -> bool:
         return False
     relay_url = relay_block_base_url(text)
     if mode == "relay":
-        expected_url = PROTOCOL_PROXY_BASE_URL if cfg.get("protocol") in {"chat", "pool"} else str(cfg.get("base_url", "")).rstrip("/")
+        expected_url = PROTOCOL_PROXY_BASE_URL if cfg.get("protocol") in {"chat", "pool"} else api_base_url_for_codex(str(cfg.get("base_url", "")))
         return (
             relay_url == expected_url
             and top_level_bool_value(text, "disable_response_storage") is True
@@ -4586,7 +4593,7 @@ def menu_init() -> None:
 def menu_add_relay() -> None:
     clear_screen()
     print("新增 API 渠道\n")
-    base_url = prompt_line("中转 base URL，不要带 /v1", required=True)
+    base_url = prompt_line("API base URL（站点根或 /v1 都可）", required=True)
     api_key = getpass.getpass("API key（隐藏输入）: ").strip()
     slot = prompt_line("渠道名（空着则自动从域名取）", default="")
     switch_now = yes_no("现在切到这个渠道", default=True)

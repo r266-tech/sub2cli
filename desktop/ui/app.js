@@ -1573,7 +1573,7 @@ function applyCustomApiToRoute(route, api) {
   route.custom_api_id = api.id;
   route.custom_api_name = customApiName(api);
   route.base_url = api.base_url || '';
-  route.protocol = 'chat';
+  route.protocol = api.protocol || 'chat';
   route.model = (api.model_columns && api.model_columns[0]) || '';
   route.label = customApiName(api);
   route.relay_domain = '';
@@ -2051,7 +2051,7 @@ function addCustomRouteToPool() {
     custom_api_name: customApiName(api),
     base_url: api.base_url || '',
     priority: routePoolNextPriority(),
-    protocol: 'chat',
+    protocol: api.protocol || 'chat',
     model: (api.model_columns && api.model_columns[0]) || draft.model || '',
   });
   state.routePoolEditorOpen = false;
@@ -2183,6 +2183,39 @@ function customApiName(api) {
   return api.name || api.base_url || api.id || '未命名 API';
 }
 
+function mergeCustomApiProbeResult(apiId, r) {
+  if (!r || !apiId) return;
+  const patch = {};
+  for (const key of ['provider_kind', 'protocol', 'protocol_error', 'usage', 'usage_error']) {
+    if (Object.prototype.hasOwnProperty.call(r, key)) patch[key] = r[key];
+  }
+  if (!Object.keys(patch).length) return;
+  state.customApis = (state.customApis || []).map((api) => (
+    api.id === apiId ? { ...api, ...patch } : api
+  ));
+  if (state.currentCustomApi && state.currentCustomApi.id === apiId) {
+    state.currentCustomApi = { ...state.currentCustomApi, ...patch };
+  }
+  state.routePoolCandidates = {
+    ...(state.routePoolCandidates || {}),
+    custom_apis: ((state.routePoolCandidates || {}).custom_apis || []).map((api) => (
+      api.id === apiId ? { ...api, ...patch } : api
+    )),
+  };
+}
+
+function preserveCustomApiRuntimeFields(nextApis) {
+  const previous = new Map((state.customApis || []).map((api) => [api.id, api]));
+  return (nextApis || []).map((api) => {
+    const old = previous.get(api.id) || {};
+    const preserved = {};
+    for (const key of ['usage', 'usage_error']) {
+      if (api[key] == null && old[key] != null) preserved[key] = old[key];
+    }
+    return { ...api, ...preserved };
+  });
+}
+
 async function refreshCustomApis() {
   const list = $('#custom-api-list');
   if (!list) return;
@@ -2195,7 +2228,7 @@ async function refreshCustomApis() {
       updateContextLabels();
       return;
     }
-    state.customApis = r.apis || [];
+    state.customApis = preserveCustomApiRuntimeFields(r.apis || []);
     const found = state.customApis.find((a) => a.id === r.current_id);
     if (state.currentCustomApi) {
       const stillThere = state.customApis.find((a) => a.id === state.currentCustomApi.id);
@@ -2258,7 +2291,7 @@ async function selectCustomApi(id) {
   try {
     const r = await window.pywebview.api.select_custom_api(id);
     if (r && r.ok) {
-      state.customApis = r.apis || state.customApis;
+      state.customApis = preserveCustomApiRuntimeFields(r.apis || state.customApis);
       const next = state.customApis.find((a) => a.id === id);
       if (next) state.currentCustomApi = next;
       renderCustomApiList();
@@ -2272,6 +2305,7 @@ async function loadCustomApiModels(id) {
     const r = await window.pywebview.api.refresh_custom_api_models(id);
     if (!r || !r.ok) return;
     if (!state.currentCustomApi || state.currentCustomApi.id !== id) return;
+    mergeCustomApiProbeResult(id, r);
     state.customApiModels = uniqueModels([...(r.models || []), ...state.customApiColumns]);
     state.customApiModelError = r.model_error || null;
     if ((r.model_columns || []).length && !state.customApiColumns.length) {
@@ -2461,7 +2495,7 @@ async function removeCustomApi(id) {
       state.currentCustomApi = null;
       if (state.viewMode === 'custom') showRelayDashboard();
     }
-    state.customApis = r.apis || [];
+    state.customApis = preserveCustomApiRuntimeFields(r.apis || []);
     renderCustomApiList();
     updateContextLabels();
     setStatus('✓ 已删除自定义 API', 'ok');
@@ -2526,8 +2560,9 @@ async function submitAddCustomApi() {
       btn.textContent = '创建';
       return;
     }
-    state.customApis = r.apis || [];
+    state.customApis = preserveCustomApiRuntimeFields(r.apis || []);
     state.customApiModels = uniqueModels(r.models || []);
+    if (r.added_id) mergeCustomApiProbeResult(r.added_id, r);
     closeAddCustomApiModal();
     if (r.added_id) {
       await selectCustomApi(r.added_id);
@@ -3138,7 +3173,7 @@ function startCustomConfig() {
   window.pywebview.api.select_custom_api(id)
     .then((r) => {
       if (r && r.ok) {
-        state.customApis = r.apis || state.customApis;
+        state.customApis = preserveCustomApiRuntimeFields(r.apis || state.customApis);
         state.currentCustomApi = (state.customApis || []).find((api) => api.id === id) || state.currentCustomApi;
         renderCustomApiList();
         renderConfigTargetChoices();
@@ -4762,12 +4797,14 @@ $('#btn-test-selected-groups').addEventListener('click', testSelectedGroups);
 
 // ---- add-relay modal (probe-first stepped flow) ----
 
-let addRelayStage = 'probe';  // 'probe' | 'edge' | 'creds'
+let addRelayStage = 'probe';  // 'probe' | 'edge' | 'creds' | 'api-key'
 
 function openAddRelayModal() {
   $('#add-relay-url').value = '';
   $('#add-relay-email').value = '';
   $('#add-relay-password').value = '';
+  $('#add-relay-api-key').value = '';
+  $('#add-relay-api-name').value = '';
   resetAddRelayUI();
   $('#add-relay-modal').classList.remove('hidden');
   setTimeout(() => $('#add-relay-url').focus(), 50);
@@ -4785,6 +4822,8 @@ function resetAddRelayUI() {
   $('#add-relay-email-row').classList.add('hidden');
   $('#add-relay-pw-row').classList.add('hidden');
   $('#add-relay-creds-hint').classList.add('hidden');
+  $('#add-relay-api-key-row').classList.add('hidden');
+  $('#add-relay-api-name-row').classList.add('hidden');
   $('#add-relay-error').classList.add('hidden');
   $('#add-relay-error').textContent = '';
   $('#add-relay-url').disabled = false;
@@ -4797,7 +4836,7 @@ async function actionAddRelay() {
   if (addRelayStage === 'probe') {
     return probeRelay();
   }
-  return submitAddRelay();
+  return addRelayStage === 'api-key' ? submitAddRelayApiKey() : submitAddRelay();
 }
 
 async function probeRelay() {
@@ -4822,7 +4861,18 @@ async function probeRelay() {
       return;
     }
     const result = $('#add-relay-probe-result');
-    if (r.has_edge_session && r.edge_email) {
+    if (r.is_openai_compatible) {
+      addRelayStage = 'api-key';
+      result.className = 'probe-result probe-info';
+      result.textContent = '✓ 站点可用。';
+      result.classList.remove('hidden');
+      $('#add-relay-url').disabled = true;
+      $('#add-relay-api-key-row').classList.remove('hidden');
+      $('#add-relay-api-name-row').classList.remove('hidden');
+      btn.textContent = '添加';
+      btn.disabled = false;
+      setTimeout(() => $('#add-relay-api-key').focus(), 50);
+    } else if (r.has_edge_session && r.edge_email) {
       addRelayStage = 'edge';
       result.className = 'probe-result probe-success';
       result.textContent = `✓ 检测到浏览器已登录 ${r.edge_email}`;
@@ -4856,6 +4906,45 @@ async function probeRelay() {
     errBox.classList.remove('hidden');
     btn.disabled = false;
     btn.textContent = '检测';
+  }
+}
+
+async function submitAddRelayApiKey() {
+  const url = $('#add-relay-url').value.trim();
+  const key = $('#add-relay-api-key').value.trim();
+  const name = $('#add-relay-api-name').value.trim();
+  const errBox = $('#add-relay-error');
+  errBox.classList.add('hidden');
+  errBox.textContent = '';
+  if (!key) {
+    errBox.textContent = 'API Key 必填';
+    errBox.classList.remove('hidden');
+    return;
+  }
+  const btn = $('#btn-add-relay-action');
+  btn.disabled = true;
+  btn.textContent = '添加中…';
+  try {
+    const r = await window.pywebview.api.add_custom_api(url, key, name);
+    if (!r || !r.ok) {
+      errBox.textContent = (r && r.error) || '添加失败';
+      errBox.classList.remove('hidden');
+      btn.disabled = false;
+      btn.textContent = '添加';
+      return;
+    }
+    state.customApis = preserveCustomApiRuntimeFields(r.apis || []);
+    state.customApiModels = uniqueModels(r.models || []);
+    if (r.added_id) mergeCustomApiProbeResult(r.added_id, r);
+    closeAddRelayModal();
+    if (r.added_id) await selectCustomApi(r.added_id);
+    else await refreshCustomApis();
+    setStatus(`✓ 已添加自定义 API · ${(r.models || []).length} 个模型`, 'ok');
+  } catch (err) {
+    errBox.textContent = err && err.message ? err.message : String(err);
+    errBox.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = '添加';
   }
 }
 
@@ -4906,7 +4995,7 @@ $('#add-relay-url').addEventListener('input', () => {
 $('#add-relay-modal').addEventListener('click', (e) => {
   if (e.target.id === 'add-relay-modal') closeAddRelayModal();
 });
-['add-relay-url', 'add-relay-email', 'add-relay-password'].forEach((id) => {
+['add-relay-url', 'add-relay-email', 'add-relay-password', 'add-relay-api-key', 'add-relay-api-name'].forEach((id) => {
   $('#' + id).addEventListener('keydown', (e) => {
     if (e.key === 'Enter') actionAddRelay();
     else if (e.key === 'Escape') closeAddRelayModal();

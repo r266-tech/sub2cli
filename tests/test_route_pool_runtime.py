@@ -328,6 +328,57 @@ class RoutePoolRuntimeTests(unittest.TestCase):
 
         self.assertEqual("relay", routes[0]["source_type"])
 
+    def test_normalize_base_url_keeps_openai_api_base_with_v1(self):
+        self.assertEqual(
+            "https://relay.example/v1",
+            sub2cli_inject.normalize_base_url("https://relay.example"),
+        )
+        self.assertEqual(
+            "https://relay.example/v1",
+            sub2cli_inject.normalize_base_url("https://relay.example/v1"),
+        )
+
+    def test_probe_relay_uses_single_v1_models_path(self):
+        calls = []
+        original = sub2cli_inject.fresh_urlopen
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, *_args):
+                return b'{"data":[]}'
+
+        def fake_fresh(req, *, timeout):
+            calls.append((req.full_url, timeout))
+            return FakeResponse()
+
+        sub2cli_inject.fresh_urlopen = fake_fresh
+        try:
+            ok, message = sub2cli_inject.probe_relay("https://relay.example/v1", "sk-test", timeout=5)
+        finally:
+            sub2cli_inject.fresh_urlopen = original
+
+        self.assertTrue(ok)
+        self.assertIn("/v1/models", message)
+        self.assertEqual([("https://relay.example/v1/models", 5)], calls)
+
+    def test_patch_config_adds_v1_for_legacy_root_slot(self):
+        _home, codex_home, _app_support = self.with_isolated_codex_home()
+
+        sub2cli_inject.patch_config(
+            mode="relay",
+            model=sub2cli_inject.DEFAULT_MODEL,
+            relay_base_url="https://relay.example",
+            protocol="responses",
+        )
+
+        text = (codex_home / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('base_url = "https://relay.example/v1"', text)
+
     def test_openai_capacity_error_retries_same_route_before_returning(self):
         route = {
             "id": "primary",

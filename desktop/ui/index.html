@@ -473,6 +473,14 @@
         <input type="password" id="add-relay-password" autocomplete="off" />
       </div>
       <div class="form-hint hidden" id="add-relay-creds-hint">(可选) 填中转站账号密码，sub2cli 会本地保存凭据并自动续登，避免反复触发系统密码弹窗。</div>
+      <div class="form-row hidden" id="add-relay-api-key-row">
+        <label>API Key <span class="required">*</span></label>
+        <input type="password" id="add-relay-api-key" placeholder="sk-..." autocomplete="off" />
+      </div>
+      <div class="form-row hidden" id="add-relay-api-name-row">
+        <label>名称 <span class="optional">(可选)</span></label>
+        <input type="text" id="add-relay-api-name" placeholder="留空则用域名" autocomplete="off" />
+      </div>
 
       <div class="form-error hidden" id="add-relay-error"></div>
     </div>

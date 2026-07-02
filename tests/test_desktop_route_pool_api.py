@@ -331,6 +331,179 @@ class DesktopRoutePoolApiTests(unittest.TestCase):
         self.assertEqual("sk-alpha", captured["routes"][0]["api_key"])
         self.assertEqual(["sk-alpha"], captured["secrets"])
 
+    def test_route_pool_custom_route_inherits_saved_api_protocol(self):
+        self.config_path.write_text(json.dumps({
+            "domain": "https://relay.example",
+            "relays": {"https://relay.example": {}},
+            "custom_apis": [{
+                "id": "newapi",
+                "name": "newapi",
+                "base_url": "https://newapi.example",
+                "protocol": "responses",
+                "model_columns": ["gpt-5.5"],
+            }],
+            "route_pools": [{
+                "id": "default-pool",
+                "name": "连接池",
+                "routes": [{
+                    "id": "custom-newapi",
+                    "source_type": "custom",
+                    "custom_api_id": "newapi",
+                    "priority": 10,
+                }],
+            }],
+        }), encoding="utf-8")
+        api = desktop_api.JsApi()
+        captured = {}
+
+        def fake_run(pool, routes, secrets):
+            captured["routes"] = routes
+            captured["secrets"] = secrets
+            return {"ok": True, "stdout": "ok"}
+
+        with patch.object(desktop_api, "_kc_custom_api_get", return_value="sk-newapi"), \
+             patch.object(api, "_run_inject_add_pool", side_effect=fake_run):
+            result = api.route_pool_config_apply("default-pool")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("responses", captured["routes"][0]["protocol"])
+        self.assertEqual(["sk-newapi"], captured["secrets"])
+
+    def test_add_custom_api_prefers_native_responses_when_probe_passes(self):
+        api = desktop_api.JsApi()
+        with patch.object(desktop_api.sub2cli_lib, "fetch_models", return_value=(["gpt-5.5"], None)), \
+             patch.object(desktop_api.sub2cli_lib, "test_model", return_value={"ok": True, "summary": "responses ok"}) as test_model, \
+             patch.object(desktop_api, "_detect_custom_api_provider_kind", return_value=("openai-compatible", None, None)), \
+             patch.object(desktop_api, "_kc_custom_api_set", return_value=True), \
+             patch.object(desktop_api, "_kc_custom_api_get", return_value="sk-newapi"):
+            result = api.add_custom_api("https://newapi.example", "sk-newapi", "newapi")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("responses", result["protocol"])
+        test_model.assert_called_once()
+        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual("responses", cfg["custom_apis"][0]["protocol"])
+
+    def test_add_custom_api_falls_back_to_chat_when_responses_probe_fails(self):
+        api = desktop_api.JsApi()
+        with patch.object(desktop_api.sub2cli_lib, "fetch_models", return_value=(["gpt-5.5"], None)), \
+             patch.object(desktop_api.sub2cli_lib, "test_model", return_value={"ok": False, "summary": "not responses"}), \
+             patch.object(desktop_api, "_detect_custom_api_provider_kind", return_value=("openai-compatible", None, None)), \
+             patch.object(desktop_api, "_kc_custom_api_set", return_value=True), \
+             patch.object(desktop_api, "_kc_custom_api_get", return_value="sk-chat"):
+            result = api.add_custom_api("https://chat.example", "sk-chat", "chat")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("chat", result["protocol"])
+        self.assertIn("protocol_error", result)
+        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual("chat", cfg["custom_apis"][0]["protocol"])
+
+    def test_probe_relay_routes_openai_compatible_site_to_api_key_flow(self):
+        api = desktop_api.JsApi()
+        with patch.object(desktop_api.Sub2Context, "settings_reachable_anonymous", return_value=(False, "HTTP 404")), \
+             patch.object(desktop_api.sub2cli_lib, "fetch_models", return_value=([], "HTTP 401")):
+            result = api.probe_relay("https://newapi.example")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["is_sub2api"])
+        self.assertTrue(result["is_openai_compatible"])
+        self.assertEqual("https://newapi.example", result["domain"])
+
+    def test_add_custom_api_records_new_api_usage_capability(self):
+        api = desktop_api.JsApi()
+        usage = {
+            "object": "token_usage",
+            "name": "codex",
+            "total_granted": 1200,
+            "total_used": 200,
+            "total_available": 1000,
+            "unlimited_quota": False,
+            "model_limits": {"gpt-5.5": True},
+            "model_limits_enabled": True,
+            "expires_at": 0,
+        }
+        with patch.object(desktop_api.sub2cli_lib, "fetch_models", return_value=(["gpt-5.5"], None)), \
+             patch.object(desktop_api.sub2cli_lib, "test_model", return_value={"ok": True}), \
+             patch.object(desktop_api, "_detect_custom_api_provider_kind", return_value=("new-api", usage, None)), \
+             patch.object(desktop_api, "_kc_custom_api_set", return_value=True), \
+             patch.object(desktop_api, "_kc_custom_api_get", return_value="sk-newapi"):
+            result = api.add_custom_api("https://newapi.example", "sk-newapi", "newapi")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("new-api", result["provider_kind"])
+        self.assertEqual(1000, result["usage"]["total_available"])
+        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual("new-api", cfg["custom_apis"][0]["provider_kind"])
+        self.assertEqual(200, cfg["custom_apis"][0]["usage"]["total_used"])
+
+    def test_refresh_custom_api_models_updates_new_api_usage(self):
+        self.config_path.write_text(json.dumps({
+            "domain": "https://relay.example",
+            "relays": {"https://relay.example": {}},
+            "custom_apis": [{
+                "id": "newapi",
+                "name": "newapi",
+                "base_url": "https://newapi.example",
+                "protocol": "responses",
+                "model_columns": ["gpt-5.5"],
+            }],
+        }), encoding="utf-8")
+        api = desktop_api.JsApi()
+        usage = {
+            "object": "token_usage",
+            "name": "codex",
+            "total_granted": 20,
+            "total_used": 8,
+            "total_available": 12,
+            "unlimited_quota": False,
+            "model_limits": {},
+            "model_limits_enabled": False,
+            "expires_at": 0,
+        }
+        with patch.object(desktop_api.sub2cli_lib, "fetch_models", return_value=(["gpt-5.5"], None)), \
+             patch.object(desktop_api, "_detect_custom_api_provider_kind", return_value=("new-api", usage, None)), \
+             patch.object(desktop_api, "_kc_custom_api_get", return_value="sk-newapi"):
+            result = api.refresh_custom_api_models("newapi")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("new-api", result["provider_kind"])
+        self.assertEqual(12, result["usage"]["total_available"])
+        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual("new-api", cfg["custom_apis"][0]["provider_kind"])
+        self.assertEqual(8, cfg["custom_apis"][0]["usage"]["total_used"])
+
+    def test_new_api_usage_endpoint_detects_provider_from_version_header(self):
+        class FakeResponse:
+            status_code = 401
+            headers = {"X-New-Api-Version": "0.9-test"}
+
+            def json(self):
+                return {"success": False, "message": "bad key"}
+
+        with patch.object(desktop_api.requests, "get", return_value=FakeResponse()) as request_get:
+            kind, usage, usage_error = desktop_api._detect_custom_api_provider_kind("https://newapi.example/v1", "sk-test")
+
+        self.assertEqual("new-api", kind)
+        self.assertIsNone(usage)
+        self.assertEqual("HTTP 401", usage_error)
+        self.assertEqual("https://newapi.example/api/usage/token/", request_get.call_args.args[0])
+
+    def test_new_api_usage_header_survives_bad_json(self):
+        class FakeResponse:
+            status_code = 200
+            headers = {"X-New-Api-Version": "0.9-test"}
+
+            def json(self):
+                raise ValueError("bad json")
+
+        with patch.object(desktop_api.requests, "get", return_value=FakeResponse()):
+            kind, usage, usage_error = desktop_api._detect_custom_api_provider_kind("https://newapi.example", "sk-test")
+
+        self.assertEqual("new-api", kind)
+        self.assertIsNone(usage)
+        self.assertIn("ValueError", usage_error)
+
     def test_list_route_pools_preloads_saved_route_relay_sources(self):
         self.config_path.write_text(json.dumps({
             "domain": "https://relay.example",
