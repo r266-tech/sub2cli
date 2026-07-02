@@ -23,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.11`
+Current desktop version: `v0.2.12`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -335,6 +335,12 @@ desktop/dist/sub2cli-<version>.dmg
 The current release is unsigned and not notarized.
 
 ## Release Notes
+
+### v0.2.12
+
+- support New API / OpenAI-compatible API-key channels from the add-relay flow
+- detect and preserve Responses vs Chat protocol for custom API routes
+- accept both site roots and `/v1` API base URLs without generating duplicate `/v1/v1` model probes
 
 ### v0.2.11
 
