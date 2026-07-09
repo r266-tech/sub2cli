@@ -4274,7 +4274,7 @@ def cmd_list() -> int:
     slots = data.get("slots", {})
     if not slots:
         print("还没有渠道")
-        print("  添加 API：  sub2cli-inject add-api https://relay.example.com sk-...")
+        print("  添加 API：  printf '%s' \"$OPENAI_API_KEY\" | sub2cli-inject add-api https://relay.example.com/v1 --api-key-stdin")
         print("  添加账号： sub2cli-inject add-account work")
         return 0
     for key, cfg in slots.items():

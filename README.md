@@ -102,6 +102,25 @@ The UI follows the v2 dark industrial style selected for this project: monospace
 
 ## CLI Install
 
+One-command Codex API setup for a fresh Mac with Codex already installed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh \
+  | SUB2CLI_API_URL='https://www.codex2api.com/v1' SUB2CLI_API_KEY='sk-xxx' sh
+```
+
+For a reusable command, only change `SUB2CLI_API_URL` and `SUB2CLI_API_KEY`.
+If Python 3.10+ exists, the installer uses `sub2cli-inject` with rollback/slot
+support. If the Mac has no Python environment, it still writes the minimal Codex
+API config directly and backs up the old `~/.codex` files first.
+
+Safer prompt form, so the key is not typed into shell history:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh \
+  | SUB2CLI_API_URL='https://www.codex2api.com/v1' sh
+```
+
 Install from GitHub:
 
 ```bash
@@ -230,7 +249,9 @@ Route pool slots are different: Codex is configured once to `http://127.0.0.1:18
 ## Requirements
 
 - macOS 12+
-- Python 3.10+
+- Python 3.10+ for the full CLI / `sub2cli-inject` path. The one-command
+  Codex API bootstrap can fall back to direct `~/.codex` config writes without
+  Python.
 - Codex CLI / Codex App installed locally
 - Edge or Chromium with remote debugging on `127.0.0.1:9222`, unless you pass `SUB2CLI_TOKEN`
 - Python packages for the CLI: `requests`, `websocket-client`
