@@ -102,23 +102,38 @@ The UI follows the v2 dark industrial style selected for this project: monospace
 
 ## CLI Install
 
-One-command Codex API setup for a fresh Mac with Codex already installed:
+Recommended one-command Codex API setup for a fresh machine with Codex already
+installed. These prompt for the API key without writing it into shell history.
+
+macOS Terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh \
+  | SUB2CLI_API_URL='https://www.codex2api.com/v1' sh
+```
+
+Windows PowerShell:
+
+```powershell
+$env:SUB2CLI_API_URL='https://www.codex2api.com/v1'; irm https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.ps1 | iex
+```
+
+For reusable commands, only change `SUB2CLI_API_URL`; the installer asks for
+the key interactively. Both installers share the same environment variable names.
+On macOS, if Python 3.10+ exists, the installer uses `sub2cli-inject` with
+rollback/slot support. If the Mac has no Python environment, it still writes the
+minimal Codex API config directly and backs up the old `~/.codex` files first.
+The Windows installer is native PowerShell and does not require Python.
+
+Non-interactive forms, if you explicitly want the key inside the command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh \
   | SUB2CLI_API_URL='https://www.codex2api.com/v1' SUB2CLI_API_KEY='sk-xxx' sh
 ```
 
-For a reusable command, only change `SUB2CLI_API_URL` and `SUB2CLI_API_KEY`.
-If Python 3.10+ exists, the installer uses `sub2cli-inject` with rollback/slot
-support. If the Mac has no Python environment, it still writes the minimal Codex
-API config directly and backs up the old `~/.codex` files first.
-
-Safer prompt form, so the key is not typed into shell history:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh \
-  | SUB2CLI_API_URL='https://www.codex2api.com/v1' sh
+```powershell
+$env:SUB2CLI_API_URL='https://www.codex2api.com/v1'; $env:SUB2CLI_API_KEY='sk-xxx'; irm https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.ps1 | iex
 ```
 
 Install from GitHub:
@@ -305,6 +320,7 @@ desktop/         pywebview + WKWebView desktop app
 sub2cli          terminal REPL and Sub2API/codex2api REST client
 sub2cli-inject   Codex config/account switcher
 install.sh       CLI installer
+install.ps1      Windows Codex API bootstrap
 docs/images/     README screenshots
 ```
 

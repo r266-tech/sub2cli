@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -52,6 +53,69 @@ class InstallBootstrapTests(unittest.TestCase):
             )
             self.assertTrue((dest / "sub2cli").exists())
             self.assertTrue((dest / "sub2cli-inject").exists())
+
+            auth = json.loads((codex_home / "auth.json").read_text())
+            self.assertEqual(
+                {"OPENAI_API_KEY": 'sk-test"quote\\slash', "auth_mode": "apikey"},
+                auth,
+            )
+
+            config = (codex_home / "config.toml").read_text()
+            self.assertIn('model = "gpt-test"', config)
+            self.assertIn('model_provider = "OpenAI"', config)
+            self.assertIn('base_url = "https://relay.example/v1"', config)
+            self.assertIn('wire_api = "responses"', config)
+
+            backups = list((codex_home / "provider-switch-backups").glob("install-api-*"))
+            self.assertEqual(1, len(backups))
+            self.assertEqual('{"old": true}\n', (backups[0] / "auth.json").read_text())
+            self.assertEqual('model = "old"\n', (backups[0] / "config.toml").read_text())
+
+    def test_windows_powershell_bootstrap_writes_codex_config(self):
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            self.skipTest("PowerShell is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            codex_home = tmp_root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "auth.json").write_text('{"old": true}\n')
+            (codex_home / "config.toml").write_text('model = "old"\n')
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CODEX_HOME": str(codex_home),
+                    "SUB2CLI_API_NO_RESTART": "1",
+                    "SUB2CLI_API_URL": "https://relay.example///",
+                    "SUB2CLI_API_KEY": 'sk-test"quote\\slash',
+                    "SUB2CLI_API_MODEL": "gpt-test",
+                }
+            )
+
+            command = [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ROOT / "install.ps1"),
+            ]
+            result = subprocess.run(
+                command,
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+
+            self.assertEqual(
+                0,
+                result.returncode,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
 
             auth = json.loads((codex_home / "auth.json").read_text())
             self.assertEqual(

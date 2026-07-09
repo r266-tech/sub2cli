@@ -9,7 +9,7 @@
 #
 # One-command Codex API setup:
 #   curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh \
-#     | SUB2CLI_API_URL='https://www.codex2api.com/v1' SUB2CLI_API_KEY='sk-...' sh
+#     | SUB2CLI_API_URL='https://www.codex2api.com/v1' sh
 #
 # Integrity:
 #   These binaries write ~/.codex credentials and shell out to codex/osascript,
