@@ -24,6 +24,30 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstallBootstrapTests(unittest.TestCase):
+    def test_readme_keeps_stable_main_bootstrap_contract(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        shell_script = (ROOT / "install.sh").read_text(encoding="utf-8")
+        start_marker = "<!-- stable-bootstrap-contract:start -->"
+        end_marker = "<!-- stable-bootstrap-contract:end -->"
+
+        self.assertEqual(1, readme.count(start_marker))
+        self.assertEqual(1, readme.count(end_marker))
+        contract = readme.split(start_marker, 1)[1].split(end_marker, 1)[0]
+
+        self.assertIn(
+            "https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh",
+            contract,
+        )
+        self.assertIn(
+            "https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.ps1",
+            contract,
+        )
+        self.assertIn("SUB2CLI_API_URL", contract)
+        self.assertIn("SUB2CLI_API_KEY", contract)
+        self.assertNotRegex(contract, r"/v\d+\.\d+\.\d+/install\.(?:sh|ps1)")
+        self.assertNotIn("SUB2CLI_REF=", contract)
+        self.assertIn('REF="${SUB2CLI_REF:-main}"', shell_script)
+
     def test_installers_default_to_current_sol_model(self):
         shell_script = (ROOT / "install.sh").read_text(encoding="utf-8")
         powershell_script = (ROOT / "install.ps1").read_text(encoding="utf-8")

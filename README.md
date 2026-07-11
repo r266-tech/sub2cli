@@ -100,66 +100,61 @@ Use it when you want to:
 
 The UI follows the v2 dark industrial style selected for this project: monospace console layout, cyan accent, status lights and `[SYS]` / `[INFO]` style operational tags.
 
-## CLI Install
+## Stable One-Command Bootstrap
 
-Recommended one-command ChatGPT API setup for a fresh machine with the ChatGPT app
-(or legacy Codex app) installed. These prompt for the API key without writing it
-into shell history.
+<!-- stable-bootstrap-contract:start -->
+
+The one-command ChatGPT API bootstrap is a maintained public interface, not a
+version-specific example. Friends should keep using the same `main` URLs across
+sub2cli releases; maintainers update and test the implementation behind those
+URLs. The only per-relay inputs are `SUB2CLI_API_URL` and `SUB2CLI_API_KEY`.
+
+Babata Relay on macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh | SUB2CLI_API_URL='https://sub2api.babata.icu' SUB2CLI_API_KEY='sk-REPLACE_ME' sh
+```
+
+Babata Relay on Windows PowerShell:
+
+```powershell
+$env:SUB2CLI_API_URL='https://sub2api.babata.icu'; $env:SUB2CLI_API_KEY='sk-REPLACE_ME'; try { & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.ps1'))) } finally { Remove-Item -Path Env:SUB2CLI_API_URL,Env:SUB2CLI_API_KEY -ErrorAction SilentlyContinue }
+```
+
+This contract means:
+
+- the public `main/install.sh` and `main/install.ps1` entrypoints remain stable
+  when the project version changes
+- `SUB2CLI_API_URL` and `SUB2CLI_API_KEY` retain their meaning across releases
+- changes to either installer must pass the fresh-profile, refusal, rollback,
+  transaction-race and Windows PowerShell 5.1 tests before reaching `main`
+- a fresh profile receives the minimal API-key configuration; an existing
+  `config.toml` or connection pool is never silently overwritten
+- version-tagged commands are rollback and reproducibility tools, not the
+  command distributed to ordinary users
+
+The ChatGPT desktop app must already be installed. On a completely blank
+Windows machine, install the current Microsoft Store package first with
+`winget install Codex -s msstore`; despite the package name, it opens the
+integrated ChatGPT/Codex desktop experience. The Windows bootstrap itself is
+native PowerShell and does not require Python, Git or an existing sub2cli install.
+
+Embedding a key in either command leaves it in shell history. For a hidden
+prompt, omit `SUB2CLI_API_KEY`; issue each friend a separate key with an expiry
+and spending limits.
+
+<!-- stable-bootstrap-contract:end -->
+
+For a reproducible rollback or investigation, pin both the installer URL and
+`SUB2CLI_REF` to a known release such as `v0.2.15`. Do not use a pinned command
+as the long-lived public onboarding command.
 
 The URL + API-key bootstrap writes the same minimal API-key configuration on
 every machine; installed Python versions do not change its authentication mode.
 Use `sub2cli-inject` explicitly for saved provider slots, route pools, and
 official-account switching.
 
-macOS Terminal:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.sh \
-  | SUB2CLI_REF='v0.2.15' SUB2CLI_API_URL='https://www.codex2api.com/v1' sh
-```
-
-Windows PowerShell:
-
-```powershell
-$env:SUB2CLI_API_URL='https://www.codex2api.com/v1'; try { & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.ps1'))) } finally { Remove-Item -Path Env:SUB2CLI_API_URL -ErrorAction SilentlyContinue }
-```
-
-On a completely blank Windows machine, install the official Microsoft Store app
-first with `winget install Codex -s msstore`; the current package opens the
-integrated ChatGPT/Codex desktop experience.
-
-For reusable commands, only change `SUB2CLI_API_URL`; the installer asks for
-the key interactively. Both installers share the same environment variable names.
-Both write the minimal API-key config directly on a fresh profile and back up an
-existing `auth.json` first. If any `config.toml` or connection-pool state
-already exists, they stop without changing it and direct the user to
-`sub2cli-inject add-api`. The Windows installer is native PowerShell and does not
-require Python.
-
-Non-interactive forms, if you explicitly want the key inside the command:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.sh \
-  | SUB2CLI_REF='v0.2.15' SUB2CLI_API_URL='https://www.codex2api.com/v1' SUB2CLI_API_KEY='sk-xxx' sh
-```
-
-```powershell
-$env:SUB2CLI_API_URL='https://www.codex2api.com/v1'; $env:SUB2CLI_API_KEY='sk-xxx'; try { & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.ps1'))) } finally { Remove-Item -Path Env:SUB2CLI_API_URL,Env:SUB2CLI_API_KEY -ErrorAction SilentlyContinue }
-```
-
-Embedding a key in either command leaves it in shell history. Rotate any key
-that has been pasted into a public chat, and give each friend a separate key
-with an expiry and spending limits.
-
-Babata Relay example (replace the placeholder with a newly issued key):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.sh | SUB2CLI_REF='v0.2.15' SUB2CLI_API_URL='https://sub2api.babata.icu' SUB2CLI_API_KEY='sk-REPLACE_ME' sh
-```
-
-```powershell
-$env:SUB2CLI_API_URL='https://sub2api.babata.icu'; $env:SUB2CLI_API_KEY='sk-REPLACE_ME'; try { & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.ps1'))) } finally { Remove-Item -Path Env:SUB2CLI_API_URL,Env:SUB2CLI_API_KEY -ErrorAction SilentlyContinue }
-```
+## CLI Install
 
 Install from GitHub:
 
