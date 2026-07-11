@@ -23,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.13`
+Current desktop version: `v0.2.14`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -377,6 +377,12 @@ desktop/dist/sub2cli-<version>.dmg
 The current release is unsigned and not notarized.
 
 ## Release Notes
+
+### v0.2.14
+
+- support route pools with or without an official ChatGPT login, preserving the official account when present and using API-key compatibility when absent
+- normalize relay `[DONE]` and incomplete `response.completed` SSE markers into the terminal event Codex expects, while keeping real EOF/reset failures visible
+- isolate route-pool tests from the live Codex / ChatGPT App so automated verification cannot restart the user's desktop session
 
 ### v0.2.13
 
