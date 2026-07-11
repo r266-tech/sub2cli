@@ -56,6 +56,7 @@ cp "$REPO_ROOT/sub2cli-inject" "$INJECT_ENTRY"
 echo "→ pyinstaller sub2cli-inject (output: $INJECT_BIN)"
 "$VENV/bin/pyinstaller" --noconfirm --onefile \
   --name sub2cli-inject-bundle \
+  --target-architecture arm64 \
   --distpath "$INJECT_DIST" \
   --workpath "$BUILD_ROOT/inject-build" \
   --specpath "$BUILD_ROOT" \
@@ -76,6 +77,21 @@ mkdir -p "$APP_PYSCRIPTS"
 rm -f "$APP_INJECT_BIN"
 cp "$INJECT_BIN" "$APP_INJECT_BIN"
 chmod 755 "$APP_INJECT_BIN"
+
+for binary in "dist/sub2cli.app/Contents/MacOS/sub2cli" "$APP_INJECT_BIN"; do
+  archs="$(lipo -archs "$binary")"
+  [[ "$archs" == "arm64" ]] || {
+    echo "✗ release binary must be arm64: $binary ($archs)"
+    exit 1
+  }
+done
+
+minimum_system_version="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' dist/sub2cli.app/Contents/Info.plist)"
+[[ "$minimum_system_version" == "26.0" ]] || {
+  echo "✗ release app must require macOS 26.0: got $minimum_system_version"
+  exit 1
+}
+
 sign_app_bundle
 if [[ "${SUB2CLI_SKIP_SMOKE:-0}" == "1" ]]; then
   echo "↷ bundled injector smoke skipped (SUB2CLI_SKIP_SMOKE=1)"
@@ -185,6 +201,7 @@ optional signed distribution later (requires Apple Developer credentials):
   xcrun stapler staple dist/sub2cli.app
 
   # GitHub release (gh CLI)
-  gh release create "v$VERSION" "$DMG_PATH" \\
-    --title "sub2cli desktop $VERSION" --notes "Unsigned macOS desktop build."
+  gh release create "v$VERSION" "$DMG_PATH" "$ZIP_PATH" "$REPO_ROOT/SHA256SUMS" \\
+    --title "sub2cli desktop $VERSION" \\
+    --notes "Unsigned macOS 26+ Apple Silicon desktop build."
 EOF

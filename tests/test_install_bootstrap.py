@@ -11,6 +11,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstallBootstrapTests(unittest.TestCase):
+    def test_installers_default_to_current_sol_model(self):
+        shell_script = (ROOT / "install.sh").read_text(encoding="utf-8")
+        powershell_script = (ROOT / "install.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('SUB2CLI_API_MODEL:-gpt-5.6-sol', shell_script)
+        self.assertIn('$DefaultModel = "gpt-5.6-sol"', powershell_script)
+
     def test_direct_bootstrap_writes_codex_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_root = Path(tmp)

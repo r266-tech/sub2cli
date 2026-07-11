@@ -59,7 +59,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    target_arch=None,  # native arch; build.sh sets `arch -arm64` / `-x86_64`
+    target_arch='arm64',  # release artifact is Apple Silicon only
 )
 
 coll = COLLECT(
@@ -81,9 +81,9 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'sub2cli',
         'CFBundleDisplayName': 'sub2cli',
-        'CFBundleShortVersionString': '0.2.12',
-        'CFBundleVersion': '0.2.12',
-        'LSMinimumSystemVersion': '12.0',
+        'CFBundleShortVersionString': '0.2.13',
+        'CFBundleVersion': '0.2.13',
+        'LSMinimumSystemVersion': '26.0',
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,
         'CFBundleIdentifier': 'com.r266-tech.sub2cli',

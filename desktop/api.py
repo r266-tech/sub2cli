@@ -52,6 +52,7 @@ CODEX_PROVIDER_HOME_PATH = Path(os.environ.get("CODEX_PROVIDER_HOME", str(Path.h
 CODEX_HOME_PATH = Path(os.environ.get("CODEX_HOME", str(CODEX_PROVIDER_HOME_PATH / ".codex"))).expanduser()
 PROVIDER_SLOTS_PATH = CODEX_HOME_PATH / "provider-slots.json"
 ROUTE_POOL_LOG_PATH = CODEX_HOME_PATH / "sub2cli-responses-proxy.log"
+PROXY_BEARER_TOKEN_NAME = "sub2cli-proxy-token"
 CODEX_APP_SUPPORT_PATH = CODEX_PROVIDER_HOME_PATH / "Library" / "Application Support"
 CODEXBAR_MANAGED_ACCOUNTS_PATH = (
     CODEX_APP_SUPPORT_PATH / "CodexBar" / "managed-codex-accounts.json"
@@ -81,7 +82,50 @@ CODEX_CLI_FALLBACK_GLOBS = (
     "~/.nvm/versions/node/*/bin/codex",
     "~/.local/share/fnm/node-versions/*/installation/bin/codex",
 )
-CODEX_APP_BUNDLED_CLI = "/Applications/Codex.app/Contents/Resources/codex"
+
+
+def _bundle_main_markers(bundle: Path) -> tuple[str, ...]:
+    markers: list[str] = []
+    for leaf in ("ChatGPT", "Codex"):
+        main = bundle.expanduser() / "Contents" / "MacOS" / leaf
+        for value in (str(main), str(main.resolve(strict=False))):
+            if value not in markers:
+                markers.append(value)
+    return tuple(markers)
+
+
+def _command_runs_bundle_main(command: str, bundle: Path) -> bool:
+    value = str(command or "").strip()
+    return any(value == marker or value.startswith(marker + " ") for marker in _bundle_main_markers(bundle))
+
+
+def _codex_app_bundle() -> Path:
+    explicit = os.environ.get("SUB2CLI_CODEX_APP", "").strip()
+    candidates = [Path(explicit).expanduser()] if explicit else []
+    candidates.extend((Path("/Applications/Codex.app"), Path("/Applications/ChatGPT.app")))
+    installed = [bundle for bundle in candidates if bundle.is_dir()]
+    if installed:
+        try:
+            proc = subprocess.run(
+                ["ps", "-axww", "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            running = [
+                bundle for bundle in installed
+                if any(_command_runs_bundle_main(line, bundle) for line in proc.stdout.splitlines())
+            ]
+            if running:
+                return running[0]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return installed[0]
+    return Path("/Applications/Codex.app")
+
+
+CODEX_APP_BUNDLE = _codex_app_bundle()
+CODEX_APP_BUNDLED_CLI = str(CODEX_APP_BUNDLE / "Contents" / "Resources" / "codex")
 
 
 # Cross-THREAD exclusion within this process. pywebview dispatches each JsApi
@@ -1285,8 +1329,78 @@ def _parse_use_plan_changes(plan_text: str, slot: str) -> list[dict[str, Any]]:
     return changes
 
 
+def _codex_auth_file_is_chatgpt(path: Path) -> bool:
+    payload = _read_json_file(path)
+    if not payload or payload.get("auth_mode") == "apikey":
+        return False
+    tokens = payload.get("tokens")
+    return isinstance(tokens, dict) and any(
+        isinstance(tokens.get(key), str) and bool(tokens.get(key))
+        for key in ("access_token", "refresh_token", "id_token")
+    )
+
+
+def _auth_files_equal(left: Path, right: Path) -> bool:
+    try:
+        return left.read_bytes() == right.read_bytes()
+    except OSError:
+        return False
+
+
+def _live_oauth_slot_state(data: dict) -> tuple[list[str], bool, bool, list[str]]:
+    """Return registered slots matching live ChatGPT auth and proof quality."""
+    live_path = CODEX_HOME_PATH / "auth.json"
+    if not _codex_auth_file_is_chatgpt(live_path):
+        return [], False, False, []
+    slots = data.get("slots") or {}
+    live_ident = _codex_auth_identity(str(live_path))
+    live_key = (live_ident.get("account_id") or live_ident.get("email") or "").strip().lower()
+    matches: list[str] = []
+    uncertain: list[str] = []
+    for name, cfg in slots.items():
+        if (cfg or {}).get("mode") != "oauth":
+            continue
+        auth_path = Path(str((cfg or {}).get("auth_file") or "")).expanduser()
+        if not _codex_auth_file_is_chatgpt(auth_path):
+            continue
+        if live_key:
+            ident = _codex_auth_identity(str(auth_path))
+            slot_key = (ident.get("account_id") or ident.get("email") or "").strip().lower()
+            if slot_key == live_key:
+                matches.append(name)
+            elif not slot_key:
+                uncertain.append(name)
+        elif auth_path and _auth_files_equal(live_path, auth_path):
+            matches.append(name)
+        else:
+            # Refreshed opaque tokens can differ while representing the same
+            # account. Without an account/email hint they are not safe to
+            # classify as a different identity.
+            uncertain.append(name)
+    return matches, True, bool(live_key), uncertain
+
+
 def _official_slot_name(data: dict) -> str | None:
     slots = data.get("slots") or {}
+    live_matches, live_chatgpt, _identity_known, _uncertain = _live_oauth_slot_state(data)
+    if live_chatgpt:
+        for field in (
+            "active_oauth_slot",
+            "preferred_official_slot",
+            "current",
+            "app_history_slot",
+        ):
+            candidate = (data.get(field) or "").strip()
+            if candidate in live_matches:
+                return candidate
+        if live_matches:
+            return live_matches[0]
+        # A live but newly logged-in ChatGPT identity invalidates stale slot
+        # pointers. Discovery below will surface the live account directly.
+        return None
+    active = (data.get("active_oauth_slot") or "").strip()
+    if active and active in slots and (slots.get(active) or {}).get("mode") == "oauth":
+        return active
     preferred = (data.get("preferred_official_slot") or "").strip()
     if preferred and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,30}", preferred):
         if preferred not in slots or (slots.get(preferred) or {}).get("mode") == "oauth":
@@ -1611,6 +1725,18 @@ def _discover_codex_accounts(data: dict | None = None, official_override: str | 
     accounts = list(accounts_by_key.values())
     if official and not any(account.get("slot") == official for account in accounts):
         official = None
+    if not official:
+        live_ident = _codex_auth_identity(str(CODEX_HOME_PATH / "auth.json"))
+        live_key = _identity_key_from_ident(live_ident)
+        if live_key and _codex_auth_file_is_chatgpt(CODEX_HOME_PATH / "auth.json"):
+            official = next(
+                (
+                    account.get("slot")
+                    for account in accounts
+                    if str(account.get("identity_key") or "").strip().lower() == live_key
+                ),
+                None,
+            )
     if not official and accounts:
         official = accounts[0].get("slot")
     for account in accounts:
@@ -2135,13 +2261,31 @@ def _kc_delete(domain: str, email: str, *, allow_prompt: bool = False) -> None:
         pass
 
 
+def _set_relay_authenticated_token(ctx: Any, token: str, email: str) -> None:
+    """Set a relay token together with the identity that owns it."""
+    ctx.set_token(token)
+    inner = getattr(ctx, "_ctx", None)
+    if inner is not None:
+        getattr(ctx, "__dict__", {}).pop("_sub2cli_authenticated_email", None)
+        setattr(inner, "_sub2cli_authenticated_email", email)
+    else:
+        setattr(ctx, "_sub2cli_authenticated_email", email)
+
+
 def _try_relogin_with_saved_creds(ctx: Any, cfg: dict) -> bool:
     """If the current relay has saved email+password, try logging in.
 
     Sets ctx token + writes the new token on success. Returns True iff
     a token was obtained. Tries current first, then any saved email.
     """
-    ad = (cfg.get("accounts") or {}).get(ctx.domain) or {}
+    accounts = cfg.get("accounts")
+    if not isinstance(accounts, dict):
+        accounts = {}
+        cfg["accounts"] = accounts
+    ad = accounts.get(ctx.domain)
+    if not isinstance(ad, dict):
+        ad = {"current": None, "saved": []}
+        accounts[ctx.domain] = ad
     candidates: list[str] = []
     cur = ad.get("current")
     if cur:
@@ -2157,7 +2301,17 @@ def _try_relogin_with_saved_creds(ctx: Any, cfg: dict) -> bool:
         token, _err = _sub2_login(ctx.domain, email, pw)
         if token:
             _kc_set(ctx.domain, email, token, allow_prompt=False)
-            ctx.set_token(token)
+            _set_relay_authenticated_token(ctx, token, email)
+            if ad.get("current") != email:
+                ad["current"] = email
+                config_path = getattr(ctx, "config_path", None)
+                if config_path:
+                    try:
+                        sub2cli_lib.save_config(cfg, config_path)
+                    except OSError:
+                        # Authentication succeeded; keep the in-memory identity
+                        # even if config persistence is temporarily unavailable.
+                        pass
             return True
     return False
 
@@ -2201,9 +2355,13 @@ class _AutoReloginContext:
 
     def set_token(self, token: str) -> None:
         self._ctx.set_token(token)
+        self.__dict__.pop("_sub2cli_authenticated_email", None)
+        getattr(self._ctx, "__dict__", {}).pop("_sub2cli_authenticated_email", None)
 
     def clear_token(self) -> None:
         self._ctx.clear_token()
+        self.__dict__.pop("_sub2cli_authenticated_email", None)
+        getattr(self._ctx, "__dict__", {}).pop("_sub2cli_authenticated_email", None)
 
     def _call(self, method: str, *args: Any, stale: Any = None, **kwargs: Any) -> Any:
         fn = getattr(self._ctx, method)
@@ -2353,14 +2511,18 @@ def _custom_api_provider_kind(entry: dict | None) -> str:
     return kind if kind in {"new-api", "openai-compatible"} else "openai-compatible"
 
 
-def _detect_custom_api_protocol(base_url: str, api_key: str, models: list[str]) -> tuple[str, str | None]:
+def _detect_custom_api_protocol(
+    base_url: str,
+    api_key: str,
+    models: list[str],
+) -> tuple[str, str | None, dict[str, bool]]:
     text_models = [m for m in models if not sub2cli_lib.model_is_image(m)]
     model = sub2cli_lib.best_default_model(text_models, sub2cli_lib.DEFAULT_FALLBACK_MODEL)
     result = sub2cli_lib.test_model(base_url, api_key, model=model, text_probe="responses")
     if result.get("ok"):
-        return "responses", None
+        return "responses", None, {model: result.get("supports_service_tier") is True}
     summary = result.get("summary") or result.get("error") or "Responses API probe failed"
-    return "chat", str(summary)
+    return "chat", str(summary), {}
 
 
 def _custom_api_root_url(base_url: str) -> str:
@@ -2423,6 +2585,137 @@ def _detect_custom_api_provider_kind(base_url: str, api_key: str) -> tuple[str, 
 # ids, endpoint/model/protocol/policy, and user-facing labels. API keys are
 # resolved only when applying the pool, then passed to sub2cli-inject through a
 # short-lived 0600 temp JSON file that is deleted immediately after use.
+
+RELAY_SERVICE_TIER_CAPABILITIES_KEY = "relay_service_tier_capabilities"
+
+
+def _service_tier_endpoint_key(endpoint: str) -> str:
+    return sub2cli_lib.normalize_endpoint_url(str(endpoint or ""))
+
+
+def _service_tier_group_key(group_id: Any) -> str:
+    try:
+        return str(int(group_id))
+    except (TypeError, ValueError):
+        return str(group_id or "").strip()
+
+
+def _service_tier_model_capabilities(value: Any) -> dict[str, bool]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(model).strip(): supported
+        for model, supported in value.items()
+        if str(model).strip() and isinstance(supported, bool)
+    }
+
+
+def _verified_service_tier_models(value: Any) -> list[str]:
+    return [
+        model
+        for model, supported in _service_tier_model_capabilities(value).items()
+        if supported
+    ]
+
+
+def _relay_service_tier_account_key(
+    cfg: dict,
+    domain: str,
+    ctx: Any | None = None,
+) -> str:
+    authenticated = str(
+        getattr(ctx, "_sub2cli_authenticated_email", "") if ctx is not None else ""
+    ).strip().lower()
+    if authenticated:
+        return authenticated
+    domain_key = sub2cli_lib._normalize_domain(str(domain or ""))
+    accounts = cfg.get("accounts")
+    account_data = accounts.get(domain_key) if isinstance(accounts, dict) else None
+    current = account_data.get("current") if isinstance(account_data, dict) else None
+    return str(current or "").strip().lower()
+
+
+def _relay_service_tier_capabilities(
+    cfg: dict,
+    domain: str,
+    account_key: str | None = None,
+) -> dict:
+    root = cfg.get(RELAY_SERVICE_TIER_CAPABILITIES_KEY)
+    if not isinstance(root, dict):
+        return {}
+    domain_key = sub2cli_lib._normalize_domain(str(domain or ""))
+    domain_capabilities = root.get(domain_key)
+    if not isinstance(domain_capabilities, dict):
+        return {}
+    key = account_key or _relay_service_tier_account_key(cfg, domain_key)
+    capabilities = domain_capabilities.get(key)
+    return capabilities if isinstance(capabilities, dict) else {}
+
+
+def _relay_service_tier_model_capabilities(
+    cfg: dict,
+    domain: str,
+    endpoint: str,
+    group_id: Any,
+    account_key: str | None = None,
+) -> dict[str, bool]:
+    endpoint_capabilities = _relay_service_tier_capabilities(cfg, domain, account_key).get(
+        _service_tier_endpoint_key(endpoint)
+    )
+    if not isinstance(endpoint_capabilities, dict):
+        return {}
+    value = endpoint_capabilities.get(_service_tier_group_key(group_id))
+    return _service_tier_model_capabilities(value)
+
+
+def _set_relay_service_tier_capabilities(
+    cfg: dict,
+    domain: str,
+    endpoint: str,
+    group_id: Any,
+    capabilities: dict[str, bool],
+    account_key: str | None = None,
+) -> None:
+    domain_key = sub2cli_lib._normalize_domain(str(domain or ""))
+    account_key = account_key or _relay_service_tier_account_key(cfg, domain_key)
+    endpoint_key = _service_tier_endpoint_key(endpoint)
+    group_key = _service_tier_group_key(group_id)
+    observations = _service_tier_model_capabilities(capabilities)
+    if not domain_key or not account_key or not endpoint_key or not group_key or not observations:
+        return
+    root = cfg.setdefault(RELAY_SERVICE_TIER_CAPABILITIES_KEY, {})
+    if not isinstance(root, dict):
+        root = {}
+        cfg[RELAY_SERVICE_TIER_CAPABILITIES_KEY] = root
+    domain_capabilities = root.setdefault(domain_key, {})
+    if not isinstance(domain_capabilities, dict):
+        domain_capabilities = {}
+        root[domain_key] = domain_capabilities
+    account_capabilities = domain_capabilities.setdefault(account_key, {})
+    if not isinstance(account_capabilities, dict):
+        account_capabilities = {}
+        domain_capabilities[account_key] = account_capabilities
+    endpoint_capabilities = account_capabilities.setdefault(endpoint_key, {})
+    if not isinstance(endpoint_capabilities, dict):
+        endpoint_capabilities = {}
+        account_capabilities[endpoint_key] = endpoint_capabilities
+    group_capabilities = endpoint_capabilities.setdefault(group_key, {})
+    if not isinstance(group_capabilities, dict):
+        group_capabilities = {}
+        endpoint_capabilities[group_key] = group_capabilities
+    group_capabilities.update(observations)
+    mutated_fields = cfg.get(sub2cli_lib.CONFIG_MUTATED_FIELDS_KEY)
+    if not isinstance(mutated_fields, list):
+        mutated_fields = []
+    if RELAY_SERVICE_TIER_CAPABILITIES_KEY not in mutated_fields:
+        mutated_fields.append(RELAY_SERVICE_TIER_CAPABILITIES_KEY)
+    cfg[sub2cli_lib.CONFIG_MUTATED_FIELDS_KEY] = mutated_fields
+
+
+def _route_service_tier_override(route: dict) -> bool | None:
+    value = route.get("supports_service_tier")
+    return value if isinstance(value, bool) else None
+
 
 def _route_pools(cfg: dict) -> list[dict]:
     pools = cfg.get("route_pools")
@@ -2510,6 +2803,14 @@ def _route_pool_log_lines(limit: int = 120) -> list[str]:
         return [f"[WARN] route pool log read failed: {type(exc).__name__}: {exc}"]
 
 
+def _route_pool_proxy_token() -> str | None:
+    try:
+        token = (CODEX_HOME_PATH / PROXY_BEARER_TOKEN_NAME).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return token or None
+
+
 def _is_route_pool_event_log(line: str) -> bool:
     return bool(re.search(r"\bpool (?:route|monitor)\b", str(line), flags=re.IGNORECASE))
 
@@ -2529,14 +2830,35 @@ def _sanitize_route_pool_route(route: dict, index: int) -> dict | None:
     protocol = str(route.get("protocol") or ("responses" if source_type == "relay" else "")).strip().lower()
     if protocol not in {"responses", "chat"}:
         protocol = "" if source_type == "custom" else "responses"
+    raw_model = str(route.get("model") or "").strip()
+    raw_model_source = str(route.get("model_source") or "").strip().lower()
+    if not raw_model_source:
+        raw_model_source = (
+            "manual"
+            if raw_model and raw_model.lower() not in {"auto", "*", "latest", "newest", "default"}
+            else "auto"
+        )
     clean = {
         "id": route_id,
         "label": label[:120],
         "source_type": source_type,
         "priority": max(1, min(100000, priority)),
-        "model": str(route.get("model") or "").strip(),
+        "model": raw_model,
+        "model_source": raw_model_source,
         "notes": str(route.get("notes") or "").strip()[:240],
     }
+    service_tier_override = _route_service_tier_override(route)
+    if service_tier_override is not None:
+        # Missing inherits verified source metadata; a bool is an intentional
+        # whole-route override, including explicit false.
+        clean["supports_service_tier"] = service_tier_override
+    if clean["model_source"] not in {"auto", "manual"}:
+        clean["model_source"] = "auto"
+    if clean["model_source"] != "manual" or not clean["model"] or clean["model"].lower() in {
+        "auto", "*", "latest", "newest", "default",
+    }:
+        clean["model"] = ""
+        clean["model_source"] = "auto"
     if protocol:
         clean["protocol"] = protocol
     if source_type == "relay":
@@ -2668,7 +2990,7 @@ class JsApi:
             if current_email:
                 saved_token = _kc_get(ctx.domain, current_email)
                 if saved_token:
-                    ctx.set_token(saved_token)
+                    _set_relay_authenticated_token(ctx, saved_token, current_email)
         self._ctx = _AutoReloginContext(ctx, cfg)
         self._cfg = cfg
         return self._ctx, cfg
@@ -2730,7 +3052,7 @@ class JsApi:
         for email in self._relay_saved_emails(cfg, domain):
             token = _kc_get(domain, email)
             if token:
-                ctx.set_token(token)
+                _set_relay_authenticated_token(ctx, token, email)
                 return _AutoReloginContext(ctx, cfg)
         if _try_relogin_with_saved_creds(ctx, cfg):
             return _AutoReloginContext(ctx, cfg)
@@ -2739,6 +3061,7 @@ class JsApi:
     def _route_pool_relay_source(self, cfg: dict, domain: str, *, load: bool = False) -> dict:
         relays = cfg.get("relays") or {}
         relay_cfg = relays.get(domain) or {}
+        service_tier_account = _relay_service_tier_account_key(cfg, domain)
         source = {
             "domain": domain,
             "site": self._relay_site_label(domain),
@@ -2749,6 +3072,12 @@ class JsApi:
             "endpoints": [],
             "current_endpoint_url": relay_cfg.get("default_endpoint_url") or "",
             "current_endpoint_name": relay_cfg.get("default_endpoint_name") or "",
+            "service_tier_account": service_tier_account,
+            "service_tier_capabilities": _relay_service_tier_capabilities(
+                cfg,
+                domain,
+                service_tier_account,
+            ),
             "error": "",
         }
         if not load:
@@ -2761,6 +3090,8 @@ class JsApi:
             groups = ctx.fetch_groups()
             settings = ctx.fetch_settings() or {}
             endpoints = sub2cli_lib.collect_endpoints(settings, fallback_site=ctx.domain)
+            # fetch_* may have auto-relogged into a fallback saved account.
+            service_tier_account = _relay_service_tier_account_key(cfg, domain, ctx)
             source.update({
                 "loaded": True,
                 "keys": [self._serialize_key(k) for k in keys],
@@ -2768,6 +3099,12 @@ class JsApi:
                 "endpoints": [self._serialize_endpoint(e) for e in endpoints],
                 "current_endpoint_url": relay_cfg.get("default_endpoint_url") or "",
                 "current_endpoint_name": relay_cfg.get("default_endpoint_name") or "",
+                "service_tier_account": service_tier_account,
+                "service_tier_capabilities": _relay_service_tier_capabilities(
+                    cfg,
+                    domain,
+                    service_tier_account,
+                ),
                 "error": "",
             })
         except Exception as exc:  # noqa: BLE001
@@ -2825,7 +3162,7 @@ class JsApi:
         api_id = entry.get("id")
         if key is None:
             key = _kc_custom_api_get(api_id) or ""
-        return {
+        serialized = {
             "id": api_id,
             "name": entry.get("name") or entry.get("id") or "?",
             "base_url": entry.get("base_url", ""),
@@ -2839,6 +3176,11 @@ class JsApi:
             "model_columns": entry.get("model_columns") or [],
             "is_current": api_id == current_id,
         }
+        if isinstance(entry.get("service_tier_capabilities"), dict):
+            capabilities = _service_tier_model_capabilities(entry["service_tier_capabilities"])
+            serialized["service_tier_capabilities"] = capabilities
+            serialized["service_tier_models"] = _verified_service_tier_models(capabilities)
+        return serialized
 
     def _import_edge_account_for_domain(self, domain: str) -> dict:
         with self._lock:
@@ -2858,6 +3200,7 @@ class JsApi:
             if not user or not user.get("email"):
                 return {"ok": False, "error": "/auth/me 拿不到 email", "needs_login": True, "domain": domain}
             email = user["email"]
+            _set_relay_authenticated_token(ctx, token, email)
             _kc_set(domain, email, token)
             ad = _accounts_for_domain(cfg, domain)
             existing = next((a for a in ad["saved"] if a.get("email") == email), None)
@@ -2869,7 +3212,7 @@ class JsApi:
             ad["current"] = email
             sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
             if self._ctx is not None and self._ctx.domain == domain:
-                self._ctx.set_token(token)
+                _set_relay_authenticated_token(self._ctx, token, email)
                 self._cfg = cfg
                 self._user = user
             return {"ok": True, "email": email, "domain": domain}
@@ -3823,7 +4166,9 @@ class JsApi:
             tmp.close()
             slot = _route_pool_id_slug(pool.get("id") or pool.get("name") or "pool")
             display = f"Codex - {pool.get('name') or slot} route pool"
-            cmd = [inject_bin, "add-pool", slot, "--routes-json", tmp.name, "--display", display, "--no-restart"]
+            # provider/account/model_catalog_json are loaded at Codex startup.
+            # Let the injector restart once when those startup inputs changed.
+            cmd = [inject_bin, "add-pool", slot, "--routes-json", tmp.name, "--display", display]
             model = str(pool.get("model") or "").strip()
             if model:
                 cmd.extend(["--model", model])
@@ -3988,7 +4333,7 @@ class JsApi:
         }
 
     def save_route_pool(self, pool: dict) -> dict:
-        """Create/update a saved route pool and hot-apply it to the Codex slot."""
+        """Create/update a saved route pool and apply it to the Codex slot."""
         with self._lock:
             cfg = sub2cli_lib.load_config() or {}
             submitted_routes = (pool or {}).get("routes") if isinstance(pool, dict) else []
@@ -4016,7 +4361,7 @@ class JsApi:
                 return {"ok": False, "error": error}
             apply_result = self._run_inject_add_pool(clean, routes, secrets)
             if not apply_result.get("ok"):
-                apply_result.setdefault("error", "连接池热生效失败，未保存")
+                apply_result.setdefault("error", "连接池应用失败，未保存")
                 return apply_result
             _mark_route_pool_config_changed(cfg)
             sub2cli_lib.save_config(cfg, sub2cli_lib.default_config_path())
@@ -4066,7 +4411,26 @@ class JsApi:
                 api_key = key.get("key") or ""
                 base_url = route.get("base_url") or relay_cfg.get("default_endpoint_url") or sub2cli_lib.normalize_v1(_ctx.domain)
                 group = key.get("group") or {}
+                group_id = key.get("group_id")
+                if group_id in (None, ""):
+                    group_id = route.get("group_id") if route.get("group_id") not in (None, "") else group.get("id")
                 label = route.get("label") or f"{key.get('name') or key_id} · {group.get('name') or 'default'}"
+                # Default auto: do not pin a stale model id on the route. Proxy
+                # picks newest from the live catalog / Codex request body.
+                raw_model = str(route.get("model") or "").strip()
+                model_source = str(route.get("model_source") or "").strip().lower()
+                if model_source != "manual" or not raw_model or raw_model.lower() in {"auto", "*", "latest", "newest", "default"}:
+                    raw_model = ""
+                    model_source = "auto"
+                service_tier_override = _route_service_tier_override(route)
+                service_tier_account = _relay_service_tier_account_key(cfg, domain, _ctx)
+                service_tier_capabilities = _relay_service_tier_model_capabilities(
+                    cfg,
+                    domain,
+                    base_url,
+                    group_id,
+                    service_tier_account,
+                )
                 resolved = {
                     "id": _route_pool_id_slug(route.get("id") or f"relay-{idx}", f"relay-{idx}"),
                     "label": label,
@@ -4075,11 +4439,17 @@ class JsApi:
                     "base_url": base_url,
                     "api_key": api_key,
                     "protocol": route.get("protocol") or "responses",
-                    "model": route.get("model") or pool.get("model") or "",
+                    "model": raw_model,
+                    "model_source": model_source or "auto",
+                    "service_tier_models": _verified_service_tier_models(
+                        service_tier_capabilities
+                    ),
                     "group": route.get("group_name") or group.get("name"),
-                    "group_id": route.get("group_id") or group.get("id"),
+                    "group_id": group_id,
                     "endpoint": route.get("endpoint_name") or relay_cfg.get("default_endpoint_name"),
                 }
+                if service_tier_override is not None:
+                    resolved["supports_service_tier"] = service_tier_override
                 routes.append(resolved)
                 secrets.append(api_key)
                 continue
@@ -4094,7 +4464,13 @@ class JsApi:
                     return [], secrets, f"Keychain 里没有自定义 API 的 Key: {api_id}"
                 base_url = entry.get("base_url") or route.get("base_url") or ""
                 label = route.get("label") or entry.get("name") or api_id
-                routes.append({
+                raw_model = str(route.get("model") or "").strip()
+                model_source = str(route.get("model_source") or "").strip().lower()
+                if model_source != "manual" or not raw_model or raw_model.lower() in {"auto", "*", "latest", "newest", "default"}:
+                    raw_model = ""
+                    model_source = "auto"
+                service_tier_override = _route_service_tier_override(route)
+                resolved = {
                     "id": _route_pool_id_slug(route.get("id") or f"custom-{idx}", f"custom-{idx}"),
                     "label": label,
                     "source_type": "custom",
@@ -4102,9 +4478,16 @@ class JsApi:
                     "base_url": base_url,
                     "api_key": api_key,
                     "protocol": route.get("protocol") or _custom_api_protocol(entry),
-                    "model": route.get("model") or pool.get("model") or "",
+                    "model": raw_model,
+                    "model_source": model_source or "auto",
+                    "service_tier_models": _verified_service_tier_models(
+                        entry.get("service_tier_capabilities")
+                    ),
                     "notes": route.get("notes") or "custom-api",
-                })
+                }
+                if service_tier_override is not None:
+                    resolved["supports_service_tier"] = service_tier_override
+                routes.append(resolved)
                 secrets.append(api_key)
                 continue
 
@@ -4141,8 +4524,15 @@ class JsApi:
         """Best-effort snapshot from the local pool proxy."""
         url = "http://127.0.0.1:18765/poolz"
         logs = _route_pool_log_lines()
+        token = _route_pool_proxy_token()
+        if not token:
+            return {"ok": False, "error": "本地代理认证令牌不存在", "logs": logs}
         try:
-            req = urllib.request.Request(url, method="GET")
+            req = urllib.request.Request(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                method="GET",
+            )
             with urllib.request.urlopen(req, timeout=0.8) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
             data = json.loads(body)
@@ -4668,7 +5058,7 @@ class JsApi:
             ad["current"] = email
             sub2cli_lib.save_config(cfg, ctx.config_path)
             self._cfg = cfg
-            ctx.set_token(token)
+            _set_relay_authenticated_token(ctx, token, email)
             self._user = None
             self._default_key = None
             self._codex_key = None
@@ -4707,7 +5097,7 @@ class JsApi:
                 if not token:
                     return {"ok": False, "error": f"{email} 没保存密码且本地没有 token, 请重新添加账号"}
 
-            ctx.set_token(token)
+            _set_relay_authenticated_token(ctx, token, email)
             ad["current"] = email
             for a in ad["saved"]:
                 if a.get("email") == email:
@@ -4851,6 +5241,18 @@ class JsApi:
                 existing = slots.get(slot)
                 if data.get("current") == slot or (account and account.get("is_current_provider")):
                     return {"ok": False, "error": "该官方账号当前正在 Codex 使用中，请先切到中转或其他账号后再删除。"}
+                current_cfg = slots.get(data.get("current")) or {}
+                if current_cfg.get("mode") == "relay":
+                    live_matches, live_chatgpt, identity_known, uncertain = _live_oauth_slot_state(data)
+                    if slot in live_matches or slot in uncertain or (
+                        not live_chatgpt and _official_slot_name(data) == slot
+                    ):
+                        return {"ok": False, "error": "该官方账号正作为当前连接池的 ChatGPT 身份，请先切换身份后再删除。"}
+                    if live_chatgpt and not identity_known and not live_matches:
+                        return {
+                            "ok": False,
+                            "error": "无法确认当前连接池使用的 ChatGPT 身份，已拒绝删除任何官方账号。请先切换身份后重试。",
+                        }
 
                 provider_changed = False
                 if existing:
@@ -4897,7 +5299,16 @@ class JsApi:
                         data.pop("preferred_official_slot", None)
                     provider_changed = True
                 if data.get("app_history_slot") == slot:
-                    data["app_history_slot"] = replacement
+                    if replacement:
+                        data["app_history_slot"] = replacement
+                    else:
+                        data.pop("app_history_slot", None)
+                    provider_changed = True
+                if data.get("active_oauth_slot") == slot:
+                    if replacement:
+                        data["active_oauth_slot"] = replacement
+                    else:
+                        data.pop("active_oauth_slot", None)
                     provider_changed = True
                 if provider_changed:
                     _write_json_file(PROVIDER_SLOTS_PATH, data)
@@ -5061,7 +5472,7 @@ class JsApi:
         checks: list[dict] = []
 
         # 1. Codex App installed?
-        app_path = Path("/Applications/Codex.app")
+        app_path = CODEX_APP_BUNDLE
         if app_path.is_dir():
             version = "?"
             try:
@@ -5083,8 +5494,8 @@ class JsApi:
                 "name": "Codex App",
                 "ok": False,
                 "severity": "warn",
-                "message": "未在 /Applications/Codex.app 找到",
-                "fix_hint": "从 https://openai.com/codex/ 安装 Codex; 若装在非默认位置可忽略",
+                "message": f"未找到 {app_path}",
+                "fix_hint": "从 https://openai.com/codex/ 安装 Codex; 非默认位置可设置 SUB2CLI_CODEX_APP",
             })
 
         # 2. codex CLI. Finder-launched macOS apps often do not inherit the
@@ -5304,6 +5715,7 @@ class JsApi:
                     (cfg or {}).get("default_endpoint_url")
                     or sub2cli_lib.normalize_v1(ctx.domain)
                 )
+                service_tier_account = _relay_service_tier_account_key(cfg, ctx.domain, ctx)
                 codex_key = self._codex_key or sub2cli_lib.find_codex_key(keys, cfg)
 
                 if (
@@ -5374,7 +5786,30 @@ class JsApi:
                     self._default_key = default_key
                     self._codex_key = codex_key
 
-                return {
+                service_tier_capabilities = {
+                    model: result.get("supports_service_tier") is True
+                    for model, result in results.items()
+                    if (
+                        isinstance(result, dict)
+                        and result.get("ok")
+                        and not sub2cli_lib.model_is_image(model)
+                    )
+                }
+                if service_tier_capabilities and service_tier_account:
+                    fresh_cfg = sub2cli_lib.load_config() or cfg
+                    _set_relay_service_tier_capabilities(
+                        fresh_cfg,
+                        ctx.domain,
+                        ep_url,
+                        target_group_id,
+                        service_tier_capabilities,
+                        service_tier_account,
+                    )
+                    sub2cli_lib.save_config(fresh_cfg, ctx.config_path)
+                    cfg = fresh_cfg
+                    self._cfg = fresh_cfg
+
+                response = {
                     "ok": True,
                     "group_id": target_group_id,
                     "results": results,
@@ -5384,6 +5819,17 @@ class JsApi:
                     "codex_key": self._serialize_key(codex_key) if codex_key else None,
                     "keys": [self._serialize_key(k) for k in keys],
                 }
+                if service_tier_capabilities and service_tier_account:
+                    response.update({
+                        "relay_domain": sub2cli_lib._normalize_domain(ctx.domain),
+                        "service_tier_account": service_tier_account,
+                        "service_tier_endpoint": _service_tier_endpoint_key(ep_url),
+                        "service_tier_capabilities": service_tier_capabilities,
+                        "service_tier_models": _verified_service_tier_models(
+                            service_tier_capabilities
+                        ),
+                    })
+                return response
 
     # ---- custom OpenAI-compatible APIs ----
 
@@ -5444,7 +5890,11 @@ class JsApi:
         models, err = sub2cli_lib.fetch_models(base_url, api_key, timeout=8)
         if err and not models:
             return {"ok": False, "error": f"无法连通: {err}", "base_url": base_url}
-        protocol, protocol_error = _detect_custom_api_protocol(base_url, api_key, models)
+        protocol, protocol_error, service_tier_capabilities = _detect_custom_api_protocol(
+            base_url,
+            api_key,
+            models,
+        )
         provider_kind, usage, usage_error = _detect_custom_api_provider_kind(base_url, api_key)
         with self._lock:
             cfg = sub2cli_lib.load_config() or {}
@@ -5459,6 +5909,7 @@ class JsApi:
                 "base_url": base_url,
                 "provider_kind": provider_kind,
                 "protocol": protocol,
+                "service_tier_capabilities": service_tier_capabilities,
                 "model_columns": sub2cli_lib.normalize_group_model_columns(None, models),
                 "created_at": int(time.time()),
             }
@@ -5477,6 +5928,10 @@ class JsApi:
         listing["models"] = models
         listing["provider_kind"] = provider_kind
         listing["protocol"] = protocol
+        listing["service_tier_capabilities"] = service_tier_capabilities
+        listing["service_tier_models"] = _verified_service_tier_models(
+            service_tier_capabilities
+        )
         if usage:
             listing["usage"] = usage
         elif provider_kind == "new-api" and usage_error:
@@ -5568,6 +6023,12 @@ class JsApi:
             "model_columns": entry.get("model_columns") or [],
             "provider_kind": provider_kind,
             "protocol": _custom_api_protocol(entry),
+            "service_tier_capabilities": _service_tier_model_capabilities(
+                entry.get("service_tier_capabilities")
+            ),
+            "service_tier_models": _verified_service_tier_models(
+                entry.get("service_tier_capabilities")
+            ),
             "usage": display_usage,
             "usage_error": usage_error if provider_kind == "new-api" else None,
         }
@@ -5590,7 +6051,31 @@ class JsApi:
             model=model,
             text_probe=_custom_api_protocol(entry),
         )
-        return {"ok": True, "model": model, "result": result}
+        response = {"ok": True, "model": model, "result": result}
+        if (
+            result.get("ok")
+            and _custom_api_protocol(entry) == "responses"
+            and not sub2cli_lib.model_is_image(model)
+        ):
+            capability = {model: result.get("supports_service_tier") is True}
+            service_tier_capabilities = _service_tier_model_capabilities(
+                entry.get("service_tier_capabilities")
+            )
+            with self._lock:
+                fresh_cfg = sub2cli_lib.load_config() or {}
+                fresh_entry = _find_custom_api(fresh_cfg, api_id)
+                if fresh_entry:
+                    service_tier_capabilities = _service_tier_model_capabilities(
+                        fresh_entry.get("service_tier_capabilities")
+                    )
+                    service_tier_capabilities.update(capability)
+                    fresh_entry["service_tier_capabilities"] = service_tier_capabilities
+                    sub2cli_lib.save_config(fresh_cfg, sub2cli_lib.default_config_path())
+            response["service_tier_capabilities"] = service_tier_capabilities
+            response["service_tier_models"] = _verified_service_tier_models(
+                service_tier_capabilities
+            )
+        return response
 
     def _custom_api_inject_target(self, api_id: str) -> tuple[str, str, str, list[str], str, str] | None:
         """Return (base_url, api_key, label, models, selected_model, protocol)."""

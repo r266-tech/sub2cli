@@ -64,6 +64,7 @@ RELAY_FIELDS = (
     "group_model_columns",
 )
 ROUTE_POOL_FIELDS = ("route_pools", "current_route_pool")
+CONCURRENT_PRESERVE_FIELDS = (*ROUTE_POOL_FIELDS, "relay_service_tier_capabilities")
 CONFIG_MUTATED_FIELDS_KEY = "__sub2cli_mutated_fields__"
 
 DEFAULT_GROUP_MODEL_COLUMNS = 2
@@ -73,7 +74,7 @@ MODEL_NON_TEXT_HINTS_RE = re.compile(
     re.I,
 )
 MODEL_SMALL_HINTS_RE = re.compile(r"(^|[-_/])(mini|nano|small|lite|spark)($|[-_/])", re.I)
-DEFAULT_FALLBACK_MODEL = "gpt-5.5"
+DEFAULT_FALLBACK_MODEL = "gpt-5.6-sol"
 DEFAULT_IMAGE_PROBE_MODEL = "gpt-image-2"
 
 
@@ -467,7 +468,18 @@ def model_version_key(model: str) -> tuple:
     small_penalty = 1 if MODEL_SMALL_HINTS_RE.search(text) else 0
     non_text_penalty = 1 if MODEL_NON_TEXT_HINTS_RE.search(text) else 0
     codex_bonus = 1 if re.search(r"(^|[-_/])(codex|code)($|[-_/])", text) else 0
-    return (-non_text_penalty, *padded, -small_penalty, codex_bonus, -len(text), text)
+    sol_bonus = 1 if re.search(r"(^|[-_/])sol($|[-_/])", text) else 0
+    pro_penalty = 1 if re.search(r"(^|[-_/])pro($|[-_/])", text) else 0
+    return (
+        -non_text_penalty,
+        *padded,
+        sol_bonus,
+        -pro_penalty,
+        -small_penalty,
+        codex_bonus,
+        -len(text),
+        text,
+    )
 
 
 def best_default_model(models: list[str], fallback: str = DEFAULT_FALLBACK_MODEL) -> str:
@@ -616,7 +628,7 @@ def _looks_like_responses_payload(body: object) -> bool:
     if not isinstance(body, dict):
         return False
     status = str(body.get("status") or "").lower()
-    if status in {"failed", "cancelled", "canceled", "incomplete"}:
+    if status in {"failed", "cancelled", "canceled"}:
         return False
     if body.get("object") == "response":
         return True
@@ -624,6 +636,31 @@ def _looks_like_responses_payload(body: object) -> bool:
         return True
     resp_id = str(body.get("id") or "")
     return resp_id.startswith("resp_") and bool(body.get("status"))
+
+
+def _rejects_service_tier(body: object, text: str) -> bool:
+    """Whether a Responses error envelope specifically rejected service_tier."""
+    if _looks_like_responses_payload(body):
+        return False
+    evidence_parts: list[str] = []
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            try:
+                evidence_parts.append(json.dumps(error, ensure_ascii=False))
+            except (TypeError, ValueError):
+                pass
+        elif error:
+            evidence_parts.append(str(error))
+        for key in ("message", "detail", "code", "type", "param"):
+            if body.get(key):
+                evidence_parts.append(str(body[key]))
+        if body.get("raw"):
+            evidence_parts.append(str(body["raw"]))
+    else:
+        evidence_parts.append(str(text or ""))
+    evidence = " ".join(evidence_parts).lower()
+    return "service_tier" in evidence or "service tier" in evidence
 
 
 def _looks_like_image_payload(body: object) -> bool:
@@ -659,39 +696,65 @@ def test_codex(base_url: str, api_key: str, model: str = DEFAULT_FALLBACK_MODEL)
         "max_output_tokens": 1,
         "stream": False,
         "store": False,
+        "service_tier": "priority",
     }
     t0 = time.perf_counter()
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=30)
-        dt = int((time.perf_counter() - t0) * 1000)
         try:
             body = r.json()
         except ValueError:
             body = {"raw": r.text[:200]}
+        retried_without_service_tier = False
+        # Some Responses-compatible relays wrap errors in HTTP 200. Retry only
+        # an explicit service_tier rejection so protocol detection does not
+        # incorrectly downgrade the source to Chat.
+        if _rejects_service_tier(body, r.text):
+            retried_without_service_tier = True
+            fallback_payload = {key: value for key, value in payload.items() if key != "service_tier"}
+            r = requests.post(url, headers=headers, json=fallback_payload, timeout=30)
+            try:
+                body = r.json()
+            except ValueError:
+                body = {"raw": r.text[:200]}
+        dt = int((time.perf_counter() - t0) * 1000)
         if r.status_code == 200:
             if _looks_like_responses_payload(body):
-                return {"ok": True, "status": 200, "latency_ms": dt, "summary": "responses ok"}
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "latency_ms": dt,
+                    "summary": "responses ok",
+                    "supports_service_tier": (
+                        not retried_without_service_tier
+                        and isinstance(body, dict)
+                        and str(body.get("service_tier") or "").strip().lower() == "priority"
+                    ),
+                }
             return {
                 "ok": False,
                 "status": 200,
                 "latency_ms": dt,
                 "summary": "200 but not Responses API payload",
+                "supports_service_tier": False,
             }
         return {
             "ok": False,
             "status": r.status_code,
             "latency_ms": dt,
             "summary": _response_error_summary(body, r.text, limit=120),
+            "supports_service_tier": False,
         }
     except requests.RequestException as exc:
         return {
             "ok": False, "status": -1,
             "latency_ms": int((time.perf_counter() - t0) * 1000),
             "summary": f"{type(exc).__name__}: {exc}",
+            "supports_service_tier": False,
         }
 
 
-def test_chat(base_url: str, api_key: str, model: str = "gpt-5.5") -> dict:
+def test_chat(base_url: str, api_key: str, model: str = DEFAULT_FALLBACK_MODEL) -> dict:
     url = openai_api_endpoint(base_url, "chat/completions")
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -815,7 +878,7 @@ def save_config(cfg: dict, path: str | None = None) -> None:
     except (OSError, json.JSONDecodeError):
         disk_cfg = None
     if isinstance(disk_cfg, dict):
-        for field in ROUTE_POOL_FIELDS:
+        for field in CONCURRENT_PRESERVE_FIELDS:
             if field not in mutated_fields and field in disk_cfg:
                 cfg[field] = disk_cfg[field]
     # 自动把 top-level default_* 同步进 relays[domain]

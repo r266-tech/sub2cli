@@ -1,7 +1,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$DefaultModel = "gpt-5.5"
+$DefaultModel = "gpt-5.6-sol"
 $DefaultApiBaseUrl = "https://api.openai.com/v1"
 
 function Test-Truthy {

@@ -15,7 +15,7 @@
 #   These binaries write ~/.codex credentials and shell out to codex/osascript,
 #   so downloads are verified against a SHA-256 manifest when one is available.
 #   - REF pins which git ref to fetch from (default: main). Set SUB2CLI_REF to a
-#     release tag (e.g. v0.2.12) for a reproducible, version-matched install.
+#     release tag (e.g. v0.2.13) for a reproducible, version-matched install.
 #   - The manifest (SHA256SUMS) is fetched from the same REF; each binary's
 #     digest is checked before install. If the manifest is absent the installer
 #     prints a clear UNVERIFIED warning instead of silently trusting the bytes.
@@ -214,7 +214,7 @@ restart_codex_if_needed() {
 write_direct_codex_api_config() {
   api_url="$1"
   api_key="$2"
-  model="${SUB2CLI_API_MODEL:-gpt-5.5}"
+  model="${SUB2CLI_API_MODEL:-gpt-5.6-sol}"
   codex_home="${CODEX_HOME:-${HOME}/.codex}"
   auth_json="$codex_home/auth.json"
   config_toml="$codex_home/config.toml"

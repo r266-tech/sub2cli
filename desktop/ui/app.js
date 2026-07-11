@@ -1541,6 +1541,31 @@ function routePoolEndpointForSource(source, route = {}) {
     || null;
 }
 
+function routePoolEndpointKey(endpoint) {
+  return String(endpoint || '').trim().replace(/\/+$/, '');
+}
+
+function mergeRelayServiceTierCapability(result) {
+  if (!result || !result.service_tier_capabilities || typeof result.service_tier_capabilities !== 'object') return;
+  const source = routePoolRelaySourceByDomain(result.relay_domain || '');
+  const endpointKey = routePoolEndpointKey(result.service_tier_endpoint);
+  if (
+    !source
+    || !endpointKey
+    || result.group_id == null
+    || (result.service_tier_account && source.service_tier_account !== result.service_tier_account)
+  ) return;
+  const capabilities = { ...(source.service_tier_capabilities || {}) };
+  capabilities[endpointKey] = {
+    ...(capabilities[endpointKey] || {}),
+    [String(result.group_id)]: {
+      ...(capabilities[endpointKey]?.[String(result.group_id)] || {}),
+      ...result.service_tier_capabilities,
+    },
+  };
+  upsertRoutePoolRelaySource({ ...source, service_tier_capabilities: capabilities });
+}
+
 function applyRelayKeyToRoute(route, source, key) {
   if (!route || !source || !key) return;
   const endpoint = routePoolEndpointForSource(source, route);
@@ -2019,6 +2044,7 @@ async function addRelayRouteToPool() {
     priority: routePoolNextPriority(),
     protocol: 'responses',
     model: state.groupModelColumns[0] || state.models[0] || '',
+    model_source: 'auto',
   };
   draft.routes.push(route);
   state.routePoolEditorOpen = false;
@@ -2053,6 +2079,7 @@ function addCustomRouteToPool() {
     priority: routePoolNextPriority(),
     protocol: api.protocol || 'chat',
     model: (api.model_columns && api.model_columns[0]) || draft.model || '',
+    model_source: 'auto',
   });
   state.routePoolEditorOpen = false;
   state.routePoolMessage = '';
@@ -2068,7 +2095,7 @@ async function saveRoutePool({ silent = false } = {}) {
   state.routePoolRunning = true;
   renderRoutePoolDashboard();
   if (!silent) {
-    renderRoutePoolStatus('[SYS] 正在保存并热生效连接池...');
+    renderRoutePoolStatus('[SYS] 正在保存并应用连接池...');
     setStatus('保存连接池中…', 'warn');
   }
   try {
@@ -2096,7 +2123,7 @@ async function saveRoutePool({ silent = false } = {}) {
     if (!silent) {
       setStatus('✓ 连接池已保存并生效', 'ok');
       renderRoutePoolStatus(planLog([
-        `[READY] 已保存并热生效 · ${draftRouteCount} routes`,
+        `[READY] 已保存并应用 · ${draftRouteCount} routes`,
         r.backup_name ? `[INFO] backup: ${r.backup_name}` : null,
         r.apply_stdout ? `[INFO] stdout:\n${r.apply_stdout}` : null,
         r.apply_stderr ? `[WARN] stderr:\n${r.apply_stderr}` : null,
@@ -2114,35 +2141,11 @@ async function saveRoutePool({ silent = false } = {}) {
 
 async function applyRoutePoolToCodex() {
   if (state.routePoolRunning) return;
-  const savedId = await saveRoutePool({ silent: true });
-  if (!savedId) return;
-  state.routePoolRunning = true;
-  renderRoutePoolDashboard();
-  renderRoutePoolStatus('[SYS] 正在配置连接池到 Codex...');
-  setStatus('配置连接池中…', 'warn');
-  try {
-    const r = await window.pywebview.api.route_pool_config_apply(savedId);
-    const log = buildApplyLog(r || {}, '连接池');
-    if (r && r.ok) {
-      state.lastInjectBackup = r.backup_name || null;
-      setStatus('✓ 连接池已配置到 Codex', 'ok');
-      renderRoutePoolStatus(planLog([
-        `[READY] 连接池已配置到 Codex`,
-        r.backup_name ? `[INFO] backup: ${r.backup_name}` : null,
-        r.stdout ? `[INFO] stdout:\n${r.stdout}` : null,
-      ]));
-      await refreshRoutePools();
-      return;
-    }
-    setStatus('连接池配置失败', 'err');
-    renderRoutePoolStatus(log);
-  } catch (err) {
-    setStatus('连接池配置调用失败', 'err');
-    renderRoutePoolStatus(`[ERR] ${err && err.message ? err.message : String(err)}`);
-  } finally {
-    state.routePoolRunning = false;
-    renderRoutePoolDashboard();
-  }
+  // save_route_pool already persists and applies through the injector. Calling
+  // route_pool_config_apply again caused two snapshots and (now that catalog
+  // changes require restart) could quit/relaunch Codex twice.
+  const savedId = await saveRoutePool({ silent: false });
+  if (savedId) await refreshRoutePools();
 }
 
 async function restartRoutePoolProxy() {
@@ -2186,7 +2189,7 @@ function customApiName(api) {
 function mergeCustomApiProbeResult(apiId, r) {
   if (!r || !apiId) return;
   const patch = {};
-  for (const key of ['provider_kind', 'protocol', 'protocol_error', 'usage', 'usage_error']) {
+  for (const key of ['provider_kind', 'protocol', 'protocol_error', 'service_tier_capabilities', 'service_tier_models', 'usage', 'usage_error']) {
     if (Object.prototype.hasOwnProperty.call(r, key)) patch[key] = r[key];
   }
   if (!Object.keys(patch).length) return;
@@ -2475,6 +2478,7 @@ async function testCustomApiModels(models) {
       state.customApiResults[model] = (r && r.ok && r.result)
         ? r.result
         : { ok: false, status: 'err', summary: (r && r.error) || '调用失败' };
+      if (r && r.ok) mergeCustomApiProbeResult(api.id, r);
     } catch (err) {
       state.customApiResults[model] = { ok: false, status: 'err', summary: String(err) };
     }
@@ -4228,6 +4232,7 @@ async function testSelectedGroups() {
           );
         } else {
           state.groupResults[id] = r.results || {};
+          mergeRelayServiceTierCapability(r);
           if (r.restore_error) {
             for (const model of columns) {
               if (state.groupResults[id][model]) {

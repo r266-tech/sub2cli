@@ -23,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.12`
+Current desktop version: `v0.2.13`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -217,7 +217,8 @@ cat > /tmp/sub2cli-routes.json <<'JSON'
       "base_url": "https://relay-a.example.com/v1",
       "api_key_env": "RELAY_A_GROUP_A_KEY",
       "protocol": "responses",
-      "model": "gpt-5.5",
+      "model": "gpt-5.6-sol",
+      "model_source": "manual",
       "group": "A"
     },
     {
@@ -227,7 +228,8 @@ cat > /tmp/sub2cli-routes.json <<'JSON'
       "base_url": "https://relay-a.example.com/v1",
       "api_key_env": "RELAY_A_GROUP_B_KEY",
       "protocol": "responses",
-      "model": "gpt-5.5",
+      "model": "",
+      "model_source": "auto",
       "group": "B"
     },
     {
@@ -237,7 +239,8 @@ cat > /tmp/sub2cli-routes.json <<'JSON'
       "base_url": "https://url1.example.com/v1",
       "api_key_env": "CUSTOM_URL_1_KEY",
       "protocol": "chat",
-      "model": "gpt-5.5"
+      "model": "",
+      "model_source": "auto"
     }
   ]
 }
@@ -258,12 +261,14 @@ sub2cli-inject rollback latest
 
 `sub2cli-inject` rejects positional API keys intentionally. Use `--api-key-stdin` or the hidden prompt.
 
+For route JSON, `model_source: "auto"` leaves `model` empty and follows the client/live catalog; `model_source: "manual"` pins the supplied model. `service_tier_models` may list only model IDs whose one-token Responses probe echoed top-level `service_tier: "priority"`. Omit it when unverified. A boolean `supports_service_tier` remains an explicit legacy override for the whole route.
+
 When Codex is relaunched after `add-api` or `use`, sub2cli only updates local Codex config files and opens the app through the native macOS app launch path.
-Route pool slots are different: Codex is configured once to `http://127.0.0.1:18765/v1`, then the local proxy performs priority failover internally. Higher-priority routes are probed more often, lower-priority fallback routes are probed less often, and recovered higher-priority routes preempt after the configured dwell/recovery thresholds.
+Route pool slots point Codex at `http://127.0.0.1:18765/v1`, then the local proxy performs priority failover internally. Saving a pool applies it immediately; Codex may restart when startup-loaded provider or model-catalog inputs change. Higher-priority routes are probed more often, lower-priority fallback routes are probed less often, and recovered higher-priority routes preempt after the configured dwell/recovery thresholds.
 
 ## Requirements
 
-- macOS 12+
+- Desktop app: macOS 26+ on Apple Silicon (arm64)
 - Python 3.10+ for the full CLI / `sub2cli-inject` path. The one-command
   Codex API bootstrap can fall back to direct `~/.codex` config writes without
   Python.
@@ -373,6 +378,16 @@ The current release is unsigned and not notarized.
 
 ## Release Notes
 
+### v0.2.13
+
+- declare the packaged desktop build's macOS 26+ Apple Silicon requirement explicitly
+- preserve the native ChatGPT account experience while authenticated local proxy traffic uses route pools
+- stream native Responses and preserve `/responses/compact`, with pre-commit SSE error classification and route failover
+- expose rich Sol reasoning metadata and Fast only for models whose upstream priority tier was verified
+- support explicit manual model pins and auto-follow routes without leaking unrelated models into pool catalogs
+- require the per-install local bearer for Responses, model discovery, and route-pool status endpoints
+- harden OAuth ownership, rollback durability, private credentials/logs, and proxy process ownership checks
+
 ### v0.2.12
 
 - support New API / OpenAI-compatible API-key channels from the add-relay flow
@@ -381,7 +396,7 @@ The current release is unsigned and not notarized.
 
 ### v0.2.11
 
-- hot-apply saved route pools immediately without restarting Codex
+- apply saved route pools immediately; restart Codex when startup-loaded provider or model-catalog inputs change
 - fail over relay routes on HTTP 429 and relay-wrapped `last status: 429 Too Many Requests` errors
 
 ### v0.2.10
