@@ -163,7 +163,7 @@ FORCE_QUIT_CODEX = os.environ.get("SUB2CLI_CODEX_FORCE_QUIT", "1").lower() not i
     "no",
     "off",
 }
-APP_VERSION = "0.2.13"
+APP_VERSION = "0.2.14"
 APP_URL = os.environ.get(
     "SUB2CLI_URL",
     os.environ.get("CODEX_PROVIDER_URL", "https://github.com/r266-tech/sub2cli"),
@@ -3471,13 +3471,86 @@ def _sse_event_complete(event: bytes) -> bool:
     return event.endswith(b"\n\n") or event.endswith(b"\r\n\r\n")
 
 
+def _sse_json_payloads(raw: bytes) -> list[dict]:
+    payloads: list[dict] = []
+    for event in re.split(rb"\r?\n\r?\n", raw):
+        data_lines = []
+        for line in event.splitlines():
+            if line.lower().startswith(b"data:"):
+                data_lines.append(line.split(b":", 1)[1].lstrip())
+        if not data_lines:
+            continue
+        data = b"\n".join(data_lines).strip()
+        if not data or data.lower() == b"[done]":
+            continue
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
 def _sse_has_terminal_event(raw: bytes) -> bool:
-    lowered = raw.lower()
-    return (
-        b"event: response.completed" in lowered
-        or b"event: response.incomplete" in lowered
-        or b"data: [done]" in lowered
+    for payload in _sse_json_payloads(raw):
+        payload_type = str(payload.get("type") or "").strip().lower()
+        if payload_type in {"response.incomplete", "response.failed"}:
+            return True
+        if payload_type == "response.completed":
+            response = payload.get("response")
+            if isinstance(response, dict) and str(response.get("id") or "").strip():
+                return True
+    return False
+
+
+def _sse_has_completion_signal(raw: bytes) -> bool:
+    if re.search(rb"(?im)^event:\s*response\.completed\s*$", raw) is not None:
+        return True
+    if re.search(rb"(?im)^data:\s*\[done\]\s*$", raw) is not None:
+        return True
+    return any(
+        str(payload.get("type") or "").strip().lower() == "response.completed"
+        for payload in _sse_json_payloads(raw)
     )
+
+
+def _sse_response_id(raw: bytes) -> str | None:
+    for payload in _sse_json_payloads(raw):
+        response = payload.get("response")
+        if isinstance(response, dict):
+            response_id = str(response.get("id") or "").strip()
+            if response_id:
+                return response_id
+        payload_id = str(payload.get("id") or "").strip()
+        payload_type = str(payload.get("type") or "").strip().lower()
+        if payload_id and (
+            payload_type in {"response.created", "response.in_progress", "response.completed"}
+            or payload.get("object") == "response"
+        ):
+            return payload_id
+    return None
+
+
+def _sse_completion_for_signal(raw: bytes, response_id: str | None = None) -> bytes:
+    """Translate an explicit relay completion signal into Codex's terminal event.
+
+    Some relays emit only ``event: response.completed`` or ``data: [DONE]``.
+    Codex requires a JSON ``type`` plus ``response.id``. A bare EOF remains an
+    error so truncated output is never presented as a successful response.
+    """
+    if _sse_has_terminal_event(raw) or not _sse_has_completion_signal(raw):
+        return b""
+    resolved_id = str(response_id or _sse_response_id(raw) or "").strip()
+    if not resolved_id:
+        return b""
+    return _sse(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "response": {"id": resolved_id},
+        },
+    ).encode("utf-8")
 
 
 def _prime_native_response_stream(route: dict, stream: object, content_type: str) -> tuple[bytes, bool]:
@@ -3941,10 +4014,13 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
         cfg: dict | None = None,
     ) -> bool:
         if result.stream is None:
-            self._send(200, result.body or b"", result.content_type)
+            body = result.body or b""
+            if "text/event-stream" in result.content_type.lower():
+                body += _sse_completion_for_signal(body)
+            self._send(200, body, result.content_type)
             if "text/event-stream" not in result.content_type.lower():
                 return True
-            complete = _sse_has_terminal_event(result.body or b"")
+            complete = _sse_has_terminal_event(body)
             if not complete and route is not None and cfg is not None:
                 ROUTE_POOL_RUNTIME.record_failure(
                     route,
@@ -3968,14 +4044,17 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.flush()
             self.close_connection = True
-            if result.body:
+            initial_body = result.body or b""
+            response_id = _sse_response_id(initial_body)
+            initial_body += _sse_completion_for_signal(initial_body, response_id)
+            if initial_body:
                 try:
-                    self.wfile.write(result.body)
+                    self.wfile.write(initial_body)
                     self.wfile.flush()
                 except Exception as exc:
                     proxy_log(f"downstream response stream closed: {type(exc).__name__}")
                     return False
-            inspection_tail = bytearray(result.body or b"")
+            inspection_tail = bytearray(initial_body)
             saw_terminal = _sse_has_terminal_event(bytes(inspection_tail))
             while True:
                 try:
@@ -4009,6 +4088,12 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 inspection_tail.extend(chunk)
                 if len(inspection_tail) > SSE_PRELUDE_MAX_BYTES:
                     del inspection_tail[:-SSE_PRELUDE_MAX_BYTES]
+                if response_id is None:
+                    response_id = _sse_response_id(bytes(inspection_tail))
+                completion = _sse_completion_for_signal(bytes(inspection_tail), response_id)
+                if completion:
+                    chunk += completion
+                    inspection_tail.extend(completion)
                 saw_terminal = saw_terminal or _sse_has_terminal_event(bytes(inspection_tail))
                 late_error: UpstreamRouteError | None = None
                 if route is not None:
@@ -5160,6 +5245,7 @@ def patch_config(
     protocol: str = "responses",
     model_ids: list[str] | None = None,
     slot_cfg: dict | None = None,
+    requires_openai_auth: bool = True,
 ) -> bool:
     text = CONFIG_TOML.read_text() if CONFIG_TOML.exists() else ""
     provider = RELAY_PROVIDER if mode == "relay" else OAUTH_PROVIDER
@@ -5212,9 +5298,10 @@ def patch_config(
             f'name = "{RELAY_PROVIDER}"\n'
             f'base_url = "{toml_quote(codex_base_url)}"\n'
             'wire_api = "responses"\n'
-            # Account state remains ChatGPT, while request auth uses the local
-            # placeholder below (provider bearer takes precedence over OAuth).
-            "requires_openai_auth = true\n"
+            # Preserve ChatGPT account state only when an official identity is
+            # actually present. Pure relay installs must not advertise a login
+            # requirement; request auth still uses the provider bearer below.
+            f"requires_openai_auth = {'true' if requires_openai_auth else 'false'}\n"
             f'experimental_bearer_token = "{toml_quote(local_bearer)}"\n'
         )
         new_text = new_text.rstrip() + "\n" + block
@@ -5314,11 +5401,12 @@ def config_clean_for_slot(cfg: dict) -> bool:
     relay_url = relay_block_base_url(text)
     if mode == "relay":
         expected_url = PROTOCOL_PROXY_BASE_URL
+        expected_openai_auth = live_auth_is_chatgpt()
         return (
             relay_url == expected_url
             and top_level_bool_value(text, "disable_response_storage") is True
             and toml_feature_bool_value(text, REQUEST_COMPRESSION_FEATURE) is False
-            and relay_block_bool_value(text, "requires_openai_auth") is True
+            and relay_block_bool_value(text, "requires_openai_auth") == expected_openai_auth
             and relay_block_string_value(text, "experimental_bearer_token")
             == proxy_bearer_token(create=False)
         )
@@ -6525,6 +6613,7 @@ def cmd_switch(
                 protocol=protocol,
                 model_ids=catalog_models or cfg.get("models") or [selected_model],
                 slot_cfg=cfg,
+                requires_openai_auth=bool(identity_slot),
             )
         else:
             patch_config(mode="oauth", model=slot_config_model(cfg, refresh=False))

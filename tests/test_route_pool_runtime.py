@@ -100,6 +100,10 @@ class RoutePoolRuntimeTests(unittest.TestCase):
             "LOCK_FILE": codex_home / ".sub2cli-inject.lock",
             "PROTOCOL_PROXY_LOG": codex_home / "sub2cli-responses-proxy.log",
             "CODEX_APP_SERVER_CONTROL_SOCKET": codex_home / "app-server-control" / "app-server-control.sock",
+            # Unit tests must never control the user's real Codex/ChatGPT App.
+            "quit_codex": lambda: None,
+            "launch_codex": lambda: None,
+            "stop_codex_cli_app_server": lambda: False,
         }
         original = {name: getattr(sub2cli_inject, name) for name in replacements}
         for name, value in replacements.items():
@@ -260,6 +264,10 @@ class RoutePoolRuntimeTests(unittest.TestCase):
             sub2cli_inject.protocol_proxy_healthy = original_healthy
 
         self.assertEqual(0, rc)
+        self.assertIn(
+            "requires_openai_auth = true",
+            sub2cli_inject.CONFIG_TOML.read_text(encoding="utf-8"),
+        )
         with sqlite3.connect(sub2cli_inject.STATE_DB) as conn:
             providers = [row[0] for row in conn.execute("SELECT model_provider FROM threads")]
         self.assertEqual([sub2cli_inject.RELAY_PROVIDER], providers)
@@ -317,6 +325,7 @@ class RoutePoolRuntimeTests(unittest.TestCase):
         self.assertNotIn("active_oauth_slot", saved)
         config = sub2cli_inject.CONFIG_TOML.read_text(encoding="utf-8")
         self.assertIn("experimental_bearer_token", config)
+        self.assertIn("requires_openai_auth = false", config)
 
     def test_chatgpt_auth_marker_requires_nonempty_tokens(self):
         self.assertFalse(sub2cli_inject.auth_payload_is_chatgpt({"auth_mode": "chatgpt"}))
@@ -1237,6 +1246,36 @@ class RoutePoolRuntimeTests(unittest.TestCase):
         self.assertTrue(token)
         self.assertIn(f'experimental_bearer_token = "{token}"', text)
         self.assertNotIn('base_url = "https://relay.example/v1"', text)
+
+    def test_patch_config_marks_pure_relay_as_not_requiring_openai_login(self):
+        _home, codex_home, _app_support = self.with_isolated_codex_home()
+        cfg = {
+            "mode": "relay",
+            "protocol": "responses",
+            "base_url": "https://relay.example/v1",
+            "model": sub2cli_inject.DEFAULT_MODEL,
+            "model_source": "manual",
+            "models": [sub2cli_inject.DEFAULT_MODEL],
+            "supports_service_tier": False,
+        }
+        sub2cli_inject.write_apikey_auth(
+            sub2cli_inject.AUTH_JSON,
+            sub2cli_inject.LEGACY_POOL_PLACEHOLDER_API_KEY,
+        )
+
+        sub2cli_inject.patch_config(
+            mode="relay",
+            model=sub2cli_inject.DEFAULT_MODEL,
+            relay_base_url="https://relay.example/v1",
+            protocol="responses",
+            slot_cfg=cfg,
+            requires_openai_auth=False,
+        )
+
+        text = (codex_home / "config.toml").read_text(encoding="utf-8")
+        self.assertIn("requires_openai_auth = false", text)
+        self.assertIn("experimental_bearer_token", text)
+        self.assertTrue(sub2cli_inject.config_clean_for_slot(cfg))
 
     def test_patch_config_restores_request_compression_after_oauth_switch(self):
         _home, codex_home, _app_support = self.with_isolated_codex_home()
@@ -2544,7 +2583,12 @@ class RoutePoolRuntimeTests(unittest.TestCase):
 
     def test_proxy_streams_native_responses_before_upstream_completes(self):
         _home, codex_home, _app_support = self.with_isolated_codex_home()
-        first_chunk = b'event: response.output_text.delta\ndata: {"delta":"hello"}\n\n'
+        first_chunk = (
+            b'event: response.created\n'
+            b'data: {"type":"response.created","response":{"id":"resp_streaming"}}\n\n'
+            b'event: response.output_text.delta\n'
+            b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+        )
         final_chunk = b'event: response.completed\ndata: {"status":"completed"}\n\n'
         upstream_started = threading.Event()
         allow_completion = threading.Event()
@@ -2618,7 +2662,10 @@ class RoutePoolRuntimeTests(unittest.TestCase):
                     self.assertEqual(first_chunk, response.read(len(first_chunk)))
                     self.assertFalse(upstream_completed.is_set(), "proxy buffered the first SSE chunk")
                     allow_completion.set()
-                    self.assertEqual(final_chunk, response.read())
+                    tail = response.read()
+                    self.assertTrue(tail.startswith(final_chunk))
+                    self.assertIn(b"event: response.completed", tail)
+                    self.assertIn(b'"type":"response.completed"', tail)
         finally:
             allow_completion.set()
             proxy_server.shutdown()
@@ -2981,7 +3028,7 @@ class RoutePoolRuntimeTests(unittest.TestCase):
             def __init__(self):
                 self.chunks = iter([
                     b"event: response.comple",
-                    b'ted\ndata: {"response":{"status":"completed"}}\n\n',
+                    b'ted\ndata: {"type":"response.completed","response":{"id":"resp_split","status":"completed"}}\n\n',
                 ])
 
             def read1(self, _size):
@@ -3013,16 +3060,102 @@ class RoutePoolRuntimeTests(unittest.TestCase):
             body=b'event: response.output_text.delta\ndata: {"delta":"first"}\n\n',
             stream=SplitTerminalStream(),
         )
+        handler = FakeHandler()
         with patch.object(sub2cli_inject, "ROUTE_POOL_RUNTIME", runtime):
             complete = sub2cli_inject.ResponsesProxyHandler._send_route_stream(
-                FakeHandler(),
+                handler,
                 result,
                 route=route,
                 cfg=cfg,
             )
 
         self.assertTrue(complete)
+        self.assertEqual(1, handler.wfile.getvalue().count(b"event: response.completed"))
         self.assertEqual(0, runtime._state("primary")["failures"])
+
+    def test_native_stream_done_marker_is_completed_for_codex(self):
+        class FakeHandler:
+            def __init__(self):
+                self.wfile = io.BytesIO()
+
+            def _send(self, _status, body, _content_type):
+                self.wfile.write(body)
+
+            def send_response(self, _status):
+                return None
+
+            def send_header(self, _name, _value):
+                return None
+
+            def end_headers(self):
+                return None
+
+        raw = (
+            b'event: response.created\n'
+            b'data: {"type":"response.created","response":{"id":"resp_done"}}\n\n'
+            b'event: response.output_text.delta\n'
+            b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        handler = FakeHandler()
+        complete = sub2cli_inject.ResponsesProxyHandler._send_route_stream(
+            handler,
+            sub2cli_inject.RouteStreamResponse(
+                content_type="text/event-stream",
+                body=raw,
+            ),
+        )
+
+        sent = handler.wfile.getvalue()
+        self.assertTrue(complete)
+        self.assertIn(b"event: response.completed", sent)
+        self.assertIn(b'"type":"response.completed"', sent)
+        self.assertIn(b'"id":"resp_done"', sent)
+
+    def test_streamed_done_marker_is_completed_for_codex(self):
+        class DoneStream:
+            def __init__(self):
+                self.chunks = iter([b"data: [DONE]\n\n", b""])
+
+            def read1(self, _size):
+                return next(self.chunks)
+
+            def close(self):
+                return None
+
+        class FakeHandler:
+            def __init__(self):
+                self.wfile = io.BytesIO()
+                self.close_connection = False
+
+            def send_response(self, _status):
+                return None
+
+            def send_header(self, _name, _value):
+                return None
+
+            def end_headers(self):
+                return None
+
+        handler = FakeHandler()
+        complete = sub2cli_inject.ResponsesProxyHandler._send_route_stream(
+            handler,
+            sub2cli_inject.RouteStreamResponse(
+                content_type="text/event-stream",
+                body=(
+                    b'event: response.created\n'
+                    b'data: {"type":"response.created","response":{"id":"resp_streamed_done"}}\n\n'
+                    b'event: response.output_text.delta\n'
+                    b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+                ),
+                stream=DoneStream(),
+            ),
+        )
+
+        sent = handler.wfile.getvalue()
+        self.assertTrue(complete)
+        self.assertEqual(1, sent.count(b"event: response.completed"))
+        self.assertIn(b'"id":"resp_streamed_done"', sent)
 
     def test_compact_rejects_chat_conversion_without_calling_upstream(self):
         route = {

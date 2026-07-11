@@ -81,8 +81,8 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'sub2cli',
         'CFBundleDisplayName': 'sub2cli',
-        'CFBundleShortVersionString': '0.2.13',
-        'CFBundleVersion': '0.2.13',
+        'CFBundleShortVersionString': '0.2.14',
+        'CFBundleVersion': '0.2.14',
         'LSMinimumSystemVersion': '26.0',
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,
