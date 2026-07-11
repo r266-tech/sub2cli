@@ -1082,7 +1082,9 @@ class InstallBootstrapTests(unittest.TestCase):
             codex_home = Path(tmp) / ".codex"
             codex_home.mkdir()
             auth_before = b'{"auth_mode":"chatgpt","tokens":{"access_token":"keep"}}\n'
-            config_concurrent = b'model = "concurrent-writer"\n'
+            config_concurrent = (
+                f'model = "concurrent-writer"{os.linesep}'.encode("utf-8")
+            )
             auth_json = codex_home / "auth.json"
             config_toml = codex_home / "config.toml"
             auth_json.write_bytes(auth_before)
@@ -1189,7 +1191,9 @@ class InstallBootstrapTests(unittest.TestCase):
             codex_home = Path(tmp) / ".codex"
             codex_home.mkdir()
             auth_before = b'{"auth_mode":"chatgpt","tokens":{"access_token":"keep"}}\n'
-            pool_concurrent = b'{"current":"concurrent","route_pools":{}}\n'
+            pool_concurrent = (
+                f'{{"current":"concurrent","route_pools":{{}}}}{os.linesep}'.encode("utf-8")
+            )
             auth_json = codex_home / "auth.json"
             slots_json = codex_home / "provider-slots.json"
             auth_json.write_bytes(auth_before)
@@ -1247,7 +1251,9 @@ class InstallBootstrapTests(unittest.TestCase):
             codex_home = Path(tmp) / ".codex"
             codex_home.mkdir()
             auth_before = b'{"auth_mode":"chatgpt","tokens":{"access_token":"keep"}}\n'
-            config_concurrent = b'model = "concurrent-after-auth"\n'
+            config_concurrent = (
+                f'model = "concurrent-after-auth"{os.linesep}'.encode("utf-8")
+            )
             auth_json = codex_home / "auth.json"
             config_toml = codex_home / "config.toml"
             auth_json.write_bytes(auth_before)
