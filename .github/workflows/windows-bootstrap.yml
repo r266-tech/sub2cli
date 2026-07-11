@@ -75,10 +75,14 @@ jobs:
           $env:SUB2CLI_API_KEY = 'sk-ci-placeholder'
           $env:SUB2CLI_API_NO_RESTART = '1'
 
-          $ErrorActionPreference = 'Continue'
-          & pwsh -NoProfile -File ./install.ps1 2>$null
-          $installerExit = $LASTEXITCODE
-          $ErrorActionPreference = 'Stop'
+          $stderrPath = Join-Path $env:RUNNER_TEMP 'expected-bootstrap-refusal.stderr'
+          $installer = Start-Process `
+            -FilePath (Get-Command pwsh).Source `
+            -ArgumentList @('-NoProfile', '-File', (Resolve-Path './install.ps1').Path) `
+            -RedirectStandardError $stderrPath `
+            -Wait `
+            -PassThru
+          $installerExit = $installer.ExitCode
           if ($installerExit -eq 0) {
             throw 'installer unexpectedly overwrote an existing profile'
           }
