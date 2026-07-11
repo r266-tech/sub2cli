@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import sqlite3
+import sys
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -114,16 +115,92 @@ class RoutePoolRuntimeTests(unittest.TestCase):
         self.addCleanup(lambda: [setattr(sub2cli_inject, name, value) for name, value in original.items()])
         return home, codex_home, app_support
 
-    def write_chatgpt_auth(self, path: Path, account_id: str = "acct-local"):
+    def write_chatgpt_auth(
+        self,
+        path: Path,
+        account_id: str = "acct-local",
+        *,
+        access_token: str = "test-access-token",
+    ):
         sub2cli_inject.atomic_write_json(path, {
             "auth_mode": "chatgpt",
             "tokens": {
-                "access_token": "test-access-token",
+                "access_token": access_token,
                 "refresh_token": "test-refresh-token",
                 "id_token": "test-id-token",
                 "account_id": account_id,
             },
         })
+
+    def write_fake_codex_auth_probe(
+        self,
+        path: Path,
+        *,
+        auth_token: str | None,
+        persist_refresh: bool = True,
+        refresh_stderr: str = "",
+        stderr_suffix: str = "",
+        concurrent_source_path: Path | None = None,
+        concurrent_access_token: str = "",
+    ):
+        path.write_text(
+            f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+
+auth_token = {auth_token!r}
+persist_refresh = {persist_refresh!r}
+refresh_stderr = {refresh_stderr!r}
+stderr_suffix = {stderr_suffix!r}
+concurrent_source_path = {str(concurrent_source_path) if concurrent_source_path else ''!r}
+concurrent_access_token = {concurrent_access_token!r}
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message.get("id")
+    if request_id == 1:
+        print(json.dumps({{"id": 1, "result": {{}}}}), flush=True)
+    elif request_id == 2:
+        if auth_token and persist_refresh:
+            auth_path = Path(os.environ["CODEX_HOME"]) / "auth.json"
+            payload = json.loads(auth_path.read_text(encoding="utf-8"))
+            payload.setdefault("tokens", {{}})["access_token"] = auth_token
+            auth_path.write_text(json.dumps(payload), encoding="utf-8")
+        if concurrent_source_path:
+            source_path = Path(concurrent_source_path)
+            source_payload = json.loads(source_path.read_text(encoding="utf-8"))
+            source_payload.setdefault("tokens", {{}})["access_token"] = concurrent_access_token
+            source_tmp = source_path.with_suffix(".concurrent.tmp")
+            source_tmp.write_text(json.dumps(source_payload), encoding="utf-8")
+            os.replace(source_tmp, source_path)
+        if refresh_stderr:
+            print(refresh_stderr, file=sys.stderr, flush=True)
+        print(json.dumps({{
+            "id": 2,
+            "result": {{
+                "account": {{
+                    "type": "chatgpt",
+                    "email": "saved@example.com",
+                }},
+                "requiresOpenaiAuth": True,
+            }},
+        }}), flush=True)
+    elif request_id == 3:
+        print(json.dumps({{
+            "id": 3,
+            "result": {{
+                "authMethod": "chatgpt",
+                "authToken": auth_token,
+                "requiresOpenaiAuth": True,
+            }},
+        }}), flush=True)
+        if stderr_suffix:
+            print(stderr_suffix, file=sys.stderr, flush=True)
+""",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
 
     def test_switch_plan_includes_session_normalization_when_provider_tags_drift(self):
         _home, codex_home, app_support = self.with_isolated_codex_home()
@@ -333,6 +410,372 @@ class RoutePoolRuntimeTests(unittest.TestCase):
             "auth_mode": "chatgpt",
             "tokens": {"access_token": "token"},
         }))
+
+    def test_refresh_oauth_rejects_permanent_failure_even_when_account_read_has_email(self):
+        home, codex_home, _app_support = self.with_isolated_codex_home()
+        auth_path = codex_home / "auth.saved.json"
+        self.write_chatgpt_auth(auth_path)
+        original = auth_path.read_bytes()
+        fake_codex = home / "fake-codex"
+        self.write_fake_codex_auth_probe(fake_codex, auth_token=None)
+
+        with patch.object(sub2cli_inject, "find_codex_cli", return_value=str(fake_codex)), \
+             patch.object(sub2cli_inject, "CODEX_AUTH_REFRESH_TIMEOUT", 2):
+            ok, error = sub2cli_inject.refresh_oauth_auth_file(auth_path)
+
+        self.assertFalse(ok)
+        self.assertIn("失效", error)
+        self.assertEqual(original, auth_path.read_bytes())
+
+    def test_refresh_oauth_rejects_permanent_failure_with_cached_account_and_token(self):
+        home, codex_home, _app_support = self.with_isolated_codex_home()
+        auth_path = codex_home / "auth.saved.json"
+        self.write_chatgpt_auth(auth_path, access_token="cached-access-token")
+        original = auth_path.read_bytes()
+        fake_codex = home / "fake-codex"
+        self.write_fake_codex_auth_probe(
+            fake_codex,
+            auth_token="cached-access-token",
+            persist_refresh=False,
+            refresh_stderr=(
+                "ERROR codex_login::auth::manager: Failed to refresh token: "
+                "401 Unauthorized: {\\\"error\\\":{\\\"code\\\":"
+                "\\\"refresh_token_invalidated\\\"}}"
+            ),
+        )
+
+        with patch.object(sub2cli_inject, "find_codex_cli", return_value=str(fake_codex)), \
+             patch.object(sub2cli_inject, "CODEX_AUTH_REFRESH_TIMEOUT", 2):
+            ok, error = sub2cli_inject.refresh_oauth_auth_file(auth_path)
+
+        self.assertFalse(ok)
+        self.assertIn("refresh_token_invalidated", error)
+        self.assertNotIn("cached-access-token", error)
+        self.assertEqual(original, auth_path.read_bytes())
+
+    def test_refresh_oauth_rejects_invalidated_marker_after_large_stderr_prefix(self):
+        home, codex_home, _app_support = self.with_isolated_codex_home()
+        auth_path = codex_home / "auth.saved.json"
+        self.write_chatgpt_auth(auth_path, access_token="cached-access-token")
+        original = auth_path.read_bytes()
+        fake_codex = home / "fake-codex"
+        self.write_fake_codex_auth_probe(
+            fake_codex,
+            auth_token="cached-access-token",
+            persist_refresh=False,
+            refresh_stderr=(
+                ("diagnostic-prefix " * 360)
+                + "\nERROR Failed to refresh token: refresh_token_invalidated"
+            ),
+        )
+
+        with patch.object(sub2cli_inject, "find_codex_cli", return_value=str(fake_codex)), \
+             patch.object(sub2cli_inject, "CODEX_AUTH_REFRESH_TIMEOUT", 2):
+            ok, error = sub2cli_inject.refresh_oauth_auth_file(auth_path)
+
+        self.assertFalse(ok)
+        self.assertIn("refresh_token_invalidated", error)
+        self.assertNotIn("cached-access-token", error)
+        self.assertEqual(original, auth_path.read_bytes())
+
+    def test_refresh_oauth_keeps_invalidated_marker_before_large_stderr_suffix(self):
+        home, codex_home, _app_support = self.with_isolated_codex_home()
+        auth_path = codex_home / "auth.saved.json"
+        self.write_chatgpt_auth(auth_path, access_token="cached-access-token")
+        original = auth_path.read_bytes()
+        fake_codex = home / "fake-codex"
+        self.write_fake_codex_auth_probe(
+            fake_codex,
+            auth_token="cached-access-token",
+            persist_refresh=False,
+            refresh_stderr=(
+                "ERROR Failed to refresh token: refresh_token_invalidated"
+            ),
+            stderr_suffix="diagnostic-noise " * 7000,
+        )
+
+        with patch.object(sub2cli_inject, "find_codex_cli", return_value=str(fake_codex)), \
+             patch.object(sub2cli_inject, "CODEX_AUTH_REFRESH_TIMEOUT", 2):
+            ok, error = sub2cli_inject.refresh_oauth_auth_file(auth_path)
+
+        self.assertFalse(ok)
+        self.assertIn("refresh_token_invalidated", error)
+        self.assertNotIn("cached-access-token", error)
+        self.assertEqual(original, auth_path.read_bytes())
+
+    def test_refresh_oauth_rejects_multiline_401_invalid_grant(self):
+        home, codex_home, _app_support = self.with_isolated_codex_home()
+        auth_path = codex_home / "auth.saved.json"
+        self.write_chatgpt_auth(auth_path, access_token="cached-access-token")
+        original = auth_path.read_bytes()
+        fake_codex = home / "fake-codex"
+        self.write_fake_codex_auth_probe(
+            fake_codex,
+            auth_token="cached-access-token",
+            persist_refresh=False,
+            refresh_stderr=(
+                "ERROR Failed to refresh token:\n"
+                "401 Unauthorized\n"
+                '{"error":{"code":"invalid_grant"}}'
+            ),
+        )
+
+        with patch.object(sub2cli_inject, "find_codex_cli", return_value=str(fake_codex)), \
+             patch.object(sub2cli_inject, "CODEX_AUTH_REFRESH_TIMEOUT", 2):
+            ok, error = sub2cli_inject.refresh_oauth_auth_file(auth_path)
+
+        self.assertFalse(ok)
+        self.assertIn("invalid_grant", error)
+        self.assertNotIn("cached-access-token", error)
+        self.assertEqual(original, auth_path.read_bytes())
+
+    def test_refresh_oauth_persists_verified_refreshed_auth(self):
+        home, codex_home, _app_support = self.with_isolated_codex_home()
+        auth_path = codex_home / "auth.saved.json"
+        self.write_chatgpt_auth(auth_path)
+        fake_codex = home / "fake-codex"
+        self.write_fake_codex_auth_probe(fake_codex, auth_token="refreshed-access-token")
+
+        with patch.object(sub2cli_inject, "find_codex_cli", return_value=str(fake_codex)), \
+             patch.object(sub2cli_inject, "CODEX_AUTH_REFRESH_TIMEOUT", 2):
+            ok, error = sub2cli_inject.refresh_oauth_auth_file(auth_path)
+
+        self.assertTrue(ok, error)
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+        self.assertEqual("refreshed-access-token", payload["tokens"]["access_token"])
+
+    def test_refresh_oauth_preserves_concurrent_live_auth_refresh(self):
+        home, codex_home, _app_support = self.with_isolated_codex_home()
+        auth_path = codex_home / "auth.saved.json"
+        self.write_chatgpt_auth(auth_path, access_token="initial-access-token")
+        fake_codex = home / "fake-codex"
+        self.write_fake_codex_auth_probe(
+            fake_codex,
+            auth_token="isolated-refresh-token",
+            concurrent_source_path=auth_path,
+            concurrent_access_token="concurrent-live-token",
+        )
+
+        with patch.object(sub2cli_inject, "find_codex_cli", return_value=str(fake_codex)), \
+             patch.object(sub2cli_inject, "CODEX_AUTH_REFRESH_TIMEOUT", 2):
+            ok, error = sub2cli_inject.refresh_oauth_auth_file(auth_path)
+
+        self.assertFalse(ok)
+        self.assertIn("并发刷新", error)
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+        self.assertEqual("concurrent-live-token", payload["tokens"]["access_token"])
+        self.assertEqual([], list(codex_home.glob("*.cas-new")))
+        self.assertEqual([], list(codex_home.glob("*.cas-old")))
+
+    def test_cmd_oauth_rejects_invalid_refresh_before_mutating_or_restarting(self):
+        home, codex_home, _app_support = self.with_isolated_codex_home()
+        imported = home / "imported-auth.json"
+        self.write_chatgpt_auth(imported)
+
+        with patch.object(sub2cli_inject, "decode_auth_email", return_value="saved@example.com"), \
+             patch.object(sub2cli_inject, "refresh_oauth_auth_file", return_value=(False, "refresh token revoked")), \
+             patch.object(sub2cli_inject, "quit_codex") as quit_codex, \
+             patch.object(sub2cli_inject, "launch_codex") as launch_codex:
+            with self.assertRaises(SystemExit):
+                sub2cli_inject.cmd_oauth("saved", auth_file=str(imported))
+
+        self.assertFalse((codex_home / "provider-slots.json").exists())
+        self.assertFalse((codex_home / "auth.saved.json").exists())
+        quit_codex.assert_not_called()
+        launch_codex.assert_not_called()
+
+    def test_cmd_oauth_holds_mutation_lock_before_refresh_validation(self):
+        home, _codex_home, _app_support = self.with_isolated_codex_home()
+        imported = home / "imported-auth.json"
+        self.write_chatgpt_auth(imported)
+        observed_lock_depth = []
+
+        def reject_refresh(_path):
+            observed_lock_depth.append(sub2cli_inject.Sub2cliLock._depth)
+            return False, "refresh token revoked"
+
+        with patch.object(sub2cli_inject, "decode_auth_email", return_value="saved@example.com"), \
+             patch.object(sub2cli_inject, "refresh_oauth_auth_file", side_effect=reject_refresh):
+            with self.assertRaises(SystemExit):
+                sub2cli_inject.cmd_oauth("saved", auth_file=str(imported))
+
+        self.assertEqual(1, len(observed_lock_depth))
+        self.assertGreater(observed_lock_depth[0], 0)
+
+    def test_cmd_oauth_preserves_refreshed_auth_when_switching_from_relay(self):
+        _home, codex_home, app_support = self.with_isolated_codex_home()
+        local_auth = codex_home / "auth.local.json"
+        self.write_chatgpt_auth(local_auth, access_token="saved-old-token")
+        self.write_chatgpt_auth(sub2cli_inject.AUTH_JSON, access_token="live-old-token")
+        local_profile = app_support / "Codex.local"
+        local_profile.mkdir()
+        sub2cli_inject.atomic_symlink(sub2cli_inject.APP_PROFILE, local_profile)
+        pool_auth = codex_home / "auth.pool.json"
+        sub2cli_inject.write_apikey_auth(pool_auth, "sk-pool")
+        sub2cli_inject.atomic_write_json(sub2cli_inject.SLOTS_FILE, {
+            "version": 1,
+            "current": "pool",
+            "active_oauth_slot": "local",
+            "preferred_official_slot": "local",
+            "app_history_slot": "local",
+            "slots": {
+                "local": {
+                    "display_name": "Codex local",
+                    "mode": "oauth",
+                    "auth_file": str(local_auth),
+                    "app_profile_dir": str(local_profile),
+                },
+                "pool": {
+                    "display_name": "Codex pool",
+                    "mode": "relay",
+                    "auth_file": str(pool_auth),
+                    "app_profile_dir": str(app_support / "Codex.pool"),
+                    "base_url": "https://relay.example/v1",
+                    "api_key": "sk-pool",
+                    "protocol": "responses",
+                    "model": sub2cli_inject.DEFAULT_MODEL,
+                    "model_source": "manual",
+                    "models": [sub2cli_inject.DEFAULT_MODEL],
+                },
+            },
+        })
+        sub2cli_inject.patch_config(
+            mode="relay",
+            model=sub2cli_inject.DEFAULT_MODEL,
+            relay_base_url="https://relay.example/v1",
+            protocol="responses",
+            requires_openai_auth=True,
+        )
+
+        def refresh(path):
+            self.write_chatgpt_auth(path, access_token="refreshed-token")
+            return True, ""
+
+        with patch.object(sub2cli_inject, "decode_auth_email", return_value="saved@example.com"), \
+             patch.object(sub2cli_inject, "refresh_oauth_auth_file", side_effect=refresh):
+            rc = sub2cli_inject.cmd_oauth(
+                "local",
+                auth_file=str(local_auth),
+                no_restart=True,
+            )
+
+        self.assertEqual(0, rc)
+        live = json.loads(sub2cli_inject.AUTH_JSON.read_text(encoding="utf-8"))
+        saved = json.loads(local_auth.read_text(encoding="utf-8"))
+        self.assertEqual("refreshed-token", live["tokens"]["access_token"])
+        self.assertEqual("refreshed-token", saved["tokens"]["access_token"])
+
+    def test_cmd_oauth_resyncs_refreshed_auth_when_slot_is_already_current(self):
+        _home, codex_home, app_support = self.with_isolated_codex_home()
+        local_auth = codex_home / "auth.local.json"
+        self.write_chatgpt_auth(local_auth, access_token="saved-old-token")
+        self.write_chatgpt_auth(sub2cli_inject.AUTH_JSON, access_token="live-old-token")
+        local_profile = app_support / "Codex.local"
+        local_profile.mkdir()
+        sub2cli_inject.atomic_symlink(sub2cli_inject.APP_PROFILE, local_profile)
+        sub2cli_inject.atomic_write_json(sub2cli_inject.SLOTS_FILE, {
+            "version": 1,
+            "current": "local",
+            "active_oauth_slot": "local",
+            "preferred_official_slot": "local",
+            "app_history_slot": "local",
+            "slots": {
+                "local": {
+                    "display_name": "Codex local",
+                    "mode": "oauth",
+                    "auth_file": str(local_auth),
+                    "app_profile_dir": str(local_profile),
+                },
+            },
+        })
+        sub2cli_inject.patch_config(mode="oauth", model=sub2cli_inject.DEFAULT_MODEL)
+
+        def refresh(path):
+            self.write_chatgpt_auth(path, access_token="refreshed-token")
+            return True, ""
+
+        with patch.object(sub2cli_inject, "decode_auth_email", return_value="saved@example.com"), \
+             patch.object(sub2cli_inject, "refresh_oauth_auth_file", side_effect=refresh):
+            rc = sub2cli_inject.cmd_oauth(
+                "local",
+                auth_file=str(local_auth),
+                no_restart=True,
+            )
+
+        self.assertEqual(0, rc)
+        live = json.loads(sub2cli_inject.AUTH_JSON.read_text(encoding="utf-8"))
+        self.assertEqual("refreshed-token", live["tokens"]["access_token"])
+
+    def test_cmd_oauth_flushes_other_live_identity_before_switching_to_refreshed_slot(self):
+        home, codex_home, app_support = self.with_isolated_codex_home()
+        auth_a = codex_home / "auth.a.json"
+        self.write_chatgpt_auth(auth_a, "account-a", access_token="saved-a-token")
+        self.write_chatgpt_auth(
+            sub2cli_inject.AUTH_JSON,
+            "account-a",
+            access_token="live-a-token",
+        )
+        profile_a = app_support / "Codex.a"
+        profile_a.mkdir()
+        sub2cli_inject.atomic_symlink(sub2cli_inject.APP_PROFILE, profile_a)
+        pool_auth = codex_home / "auth.pool.json"
+        sub2cli_inject.write_apikey_auth(pool_auth, "sk-pool")
+        imported_b = home / "imported-b.json"
+        self.write_chatgpt_auth(imported_b, "account-b", access_token="saved-b-token")
+        sub2cli_inject.atomic_write_json(sub2cli_inject.SLOTS_FILE, {
+            "version": 1,
+            "current": "pool",
+            "active_oauth_slot": "a",
+            "preferred_official_slot": "a",
+            "app_history_slot": "a",
+            "slots": {
+                "a": {
+                    "display_name": "Codex A",
+                    "mode": "oauth",
+                    "auth_file": str(auth_a),
+                    "app_profile_dir": str(profile_a),
+                },
+                "pool": {
+                    "display_name": "Codex pool",
+                    "mode": "relay",
+                    "auth_file": str(pool_auth),
+                    "app_profile_dir": str(app_support / "Codex.pool"),
+                    "base_url": "https://relay.example/v1",
+                    "api_key": "sk-pool",
+                    "protocol": "responses",
+                    "model": sub2cli_inject.DEFAULT_MODEL,
+                    "model_source": "manual",
+                    "models": [sub2cli_inject.DEFAULT_MODEL],
+                },
+            },
+        })
+        sub2cli_inject.patch_config(
+            mode="relay",
+            model=sub2cli_inject.DEFAULT_MODEL,
+            relay_base_url="https://relay.example/v1",
+            protocol="responses",
+            requires_openai_auth=True,
+        )
+
+        def refresh(path):
+            self.write_chatgpt_auth(path, "account-b", access_token="refreshed-b-token")
+            return True, ""
+
+        with patch.object(sub2cli_inject, "decode_auth_email", return_value="b@example.com"), \
+             patch.object(sub2cli_inject, "refresh_oauth_auth_file", side_effect=refresh):
+            rc = sub2cli_inject.cmd_oauth(
+                "b",
+                auth_file=str(imported_b),
+                no_restart=True,
+            )
+
+        self.assertEqual(0, rc)
+        saved_a = json.loads(auth_a.read_text(encoding="utf-8"))
+        saved_b = json.loads((codex_home / "auth.b.json").read_text(encoding="utf-8"))
+        live = json.loads(sub2cli_inject.AUTH_JSON.read_text(encoding="utf-8"))
+        self.assertEqual("live-a-token", saved_a["tokens"]["access_token"])
+        self.assertEqual("refreshed-b-token", saved_b["tokens"]["access_token"])
+        self.assertEqual("refreshed-b-token", live["tokens"]["access_token"])
 
     def test_current_oauth_slot_outranks_stale_active_pointer(self):
         _home, codex_home, _app_support = self.with_isolated_codex_home()

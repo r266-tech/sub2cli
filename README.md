@@ -23,7 +23,7 @@ macOS desktop app + terminal REPL. Unsigned desktop build. CLI remains first-cla
 
 macOS `.dmg`: [GitHub Releases](https://github.com/r266-tech/sub2cli/releases/latest)
 
-Current desktop version: `v0.2.14`
+Current desktop version: `v0.2.15`
 
 The app is currently unsigned. After dragging `sub2cli.app` to `/Applications`, if macOS blocks it:
 
@@ -102,38 +102,63 @@ The UI follows the v2 dark industrial style selected for this project: monospace
 
 ## CLI Install
 
-Recommended one-command Codex API setup for a fresh machine with Codex already
-installed. These prompt for the API key without writing it into shell history.
+Recommended one-command ChatGPT API setup for a fresh machine with the ChatGPT app
+(or legacy Codex app) installed. These prompt for the API key without writing it
+into shell history.
+
+The URL + API-key bootstrap writes the same minimal API-key configuration on
+every machine; installed Python versions do not change its authentication mode.
+Use `sub2cli-inject` explicitly for saved provider slots, route pools, and
+official-account switching.
 
 macOS Terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh \
-  | SUB2CLI_API_URL='https://www.codex2api.com/v1' sh
+curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.sh \
+  | SUB2CLI_REF='v0.2.15' SUB2CLI_API_URL='https://www.codex2api.com/v1' sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-$env:SUB2CLI_API_URL='https://www.codex2api.com/v1'; irm https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.ps1 | iex
+$env:SUB2CLI_API_URL='https://www.codex2api.com/v1'; try { & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.ps1'))) } finally { Remove-Item -Path Env:SUB2CLI_API_URL -ErrorAction SilentlyContinue }
 ```
+
+On a completely blank Windows machine, install the official Microsoft Store app
+first with `winget install Codex -s msstore`; the current package opens the
+integrated ChatGPT/Codex desktop experience.
 
 For reusable commands, only change `SUB2CLI_API_URL`; the installer asks for
 the key interactively. Both installers share the same environment variable names.
-On macOS, if Python 3.10+ exists, the installer uses `sub2cli-inject` with
-rollback/slot support. If the Mac has no Python environment, it still writes the
-minimal Codex API config directly and backs up the old `~/.codex` files first.
-The Windows installer is native PowerShell and does not require Python.
+Both write the minimal API-key config directly on a fresh profile and back up an
+existing `auth.json` first. If any `config.toml` or connection-pool state
+already exists, they stop without changing it and direct the user to
+`sub2cli-inject add-api`. The Windows installer is native PowerShell and does not
+require Python.
 
 Non-interactive forms, if you explicitly want the key inside the command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh \
-  | SUB2CLI_API_URL='https://www.codex2api.com/v1' SUB2CLI_API_KEY='sk-xxx' sh
+curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.sh \
+  | SUB2CLI_REF='v0.2.15' SUB2CLI_API_URL='https://www.codex2api.com/v1' SUB2CLI_API_KEY='sk-xxx' sh
 ```
 
 ```powershell
-$env:SUB2CLI_API_URL='https://www.codex2api.com/v1'; $env:SUB2CLI_API_KEY='sk-xxx'; irm https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.ps1 | iex
+$env:SUB2CLI_API_URL='https://www.codex2api.com/v1'; $env:SUB2CLI_API_KEY='sk-xxx'; try { & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.ps1'))) } finally { Remove-Item -Path Env:SUB2CLI_API_URL,Env:SUB2CLI_API_KEY -ErrorAction SilentlyContinue }
+```
+
+Embedding a key in either command leaves it in shell history. Rotate any key
+that has been pasted into a public chat, and give each friend a separate key
+with an expiry and spending limits.
+
+Babata Relay example (replace the placeholder with a newly issued key):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.sh | SUB2CLI_REF='v0.2.15' SUB2CLI_API_URL='https://sub2api.babata.icu' SUB2CLI_API_KEY='sk-REPLACE_ME' sh
+```
+
+```powershell
+$env:SUB2CLI_API_URL='https://sub2api.babata.icu'; $env:SUB2CLI_API_KEY='sk-REPLACE_ME'; try { & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/r266-tech/sub2cli/v0.2.15/install.ps1'))) } finally { Remove-Item -Path Env:SUB2CLI_API_URL,Env:SUB2CLI_API_KEY -ErrorAction SilentlyContinue }
 ```
 
 Install from GitHub:
@@ -377,6 +402,13 @@ desktop/dist/sub2cli-<version>.dmg
 The current release is unsigned and not notarized.
 
 ## Release Notes
+
+### v0.2.15
+
+- reject revoked official-account refresh tokens before changing the Codex configuration
+- preserve newly refreshed official-account credentials when switching from a relay pool or repairing the current account slot
+- keep fresh-profile API-key setup deterministic, refuse to overwrite existing custom/pool state, and fail closed when rollback backup creation fails
+- best-effort restart the integrated ChatGPT app on macOS or Windows after direct API setup
 
 ### v0.2.14
 

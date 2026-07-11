@@ -163,7 +163,7 @@ FORCE_QUIT_CODEX = os.environ.get("SUB2CLI_CODEX_FORCE_QUIT", "1").lower() not i
     "no",
     "off",
 }
-APP_VERSION = "0.2.14"
+APP_VERSION = "0.2.15"
 APP_URL = os.environ.get(
     "SUB2CLI_URL",
     os.environ.get("CODEX_PROVIDER_URL", "https://github.com/r266-tech/sub2cli"),
@@ -326,6 +326,93 @@ def durable_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
                 pass
         raise
     _fsync_dir(path.parent)
+
+
+def durable_compare_and_swap_bytes(
+    path: Path,
+    expected: bytes,
+    replacement: bytes,
+    *,
+    mode: int = 0o600,
+) -> bool:
+    """Replace ``path`` only if its bytes still equal ``expected``.
+
+    The live file is first moved to a unique same-directory hold path. The new
+    file is then hard-linked into the now-empty live name with no-clobber
+    semantics. A concurrent ChatGPT atomic refresh either fails the expected
+    comparison or wins the live pathname before the link; in both cases it is
+    preserved and this function returns False.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    nonce = f"{os.getpid()}.{time.time_ns()}"
+    stage = path.with_name(f"{path.name}.{nonce}.cas-new")
+    held = path.with_name(f"{path.name}.{nonce}.cas-old")
+    fd = os.open(str(stage), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    moved = False
+    linked = False
+    restore_error: OSError | None = None
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(replacement)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(stage, mode)
+
+        if path.is_symlink():
+            return False
+        try:
+            os.rename(path, held)
+        except FileNotFoundError:
+            return False
+        moved = True
+
+        try:
+            current = held.read_bytes()
+        except OSError:
+            return False
+        if current != expected:
+            return False
+
+        try:
+            os.link(stage, path)
+        except FileExistsError:
+            return False
+        linked = True
+        try:
+            if path.read_bytes() != replacement:
+                # An in-place writer changed the linked live inode. It owns the
+                # resulting state; do not remove it during cleanup.
+                return False
+        except OSError:
+            return False
+        _fsync_dir(path.parent)
+        return True
+    finally:
+        if moved and not linked and not os.path.lexists(path):
+            try:
+                os.link(held, path)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                restore_error = exc
+        if stage.exists() or stage.is_symlink():
+            try:
+                stage.unlink()
+            except OSError:
+                pass
+        if held.exists() or held.is_symlink():
+            if os.path.lexists(path):
+                try:
+                    held.unlink()
+                except OSError:
+                    pass
+            elif restore_error is None:
+                restore_error = OSError(f"auth CAS recovery retained at {held}")
+        _fsync_dir(path.parent)
+        if restore_error is not None:
+            raise RuntimeError(
+                f"auth changed concurrently and automatic restore failed; recovery: {held}"
+            ) from restore_error
 
 
 def atomic_write_json(path: Path, data: dict, *, mode: int = 0o600) -> None:
@@ -997,33 +1084,92 @@ def mask_auth_error(text: str) -> str:
     )
 
 
-def read_available_pipe_text(pipe, limit: int = 4000) -> str:
+def permanent_oauth_refresh_error(stderr: str) -> str | None:
+    """Return a safe error when Codex explicitly reports a permanent refresh failure.
+
+    ``account/read(refreshToken=true)`` does not expose its refresh outcome in
+    the JSON-RPC response. Some Codex versions also keep returning cached
+    account metadata and an access token after the failed refresh. The isolated
+    app-server does, however, log the authority's permanent failure to stderr.
+    Recognize only Codex's stable permanent codes/messages (or an explicit 401)
+    so a transient network/5xx refresh failure is not misclassified.
+    """
+    # tracing/log adapters may wrap one refresh failure across several lines.
+    # Collapse whitespace before matching so "Failed to refresh token", the
+    # HTTP status, and the provider code do not have to share a physical line.
+    normalized = re.sub(r"\s+", " ", str(stderr or "")).strip().lower()
+    if "refresh" not in normalized:
+        return None
+
+    for marker in (
+        "refresh_token_expired",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+        "invalid_grant",
+    ):
+        if marker in normalized:
+            return f"Codex CLI 官方账号 refresh token 已永久失效 ({marker})，请重新登录该账号"
+    for phrase, label in (
+        ("refresh token has expired", "refresh token expired"),
+        ("refresh token was already used", "refresh token reused"),
+        ("refresh token was revoked", "refresh token revoked"),
+    ):
+        if phrase in normalized:
+            return f"Codex CLI 官方账号 refresh token 已永久失效 ({label})，请重新登录该账号"
+    if "failed to refresh token" in normalized and (
+        re.search(r"\b401\b", normalized) or "unauthorized" in normalized
+    ):
+        return "Codex CLI 官方账号 refresh token 已永久失效 (401 Unauthorized)，请重新登录该账号"
+    return None
+
+
+def read_available_pipe_text(
+    pipe,
+    limit: int = 64 * 1024,
+    scan_suffix: str = "",
+) -> tuple[str, str | None, str]:
+    """Drain a pipe while retaining a bounded display tail and sticky auth error.
+
+    Permanent refresh evidence is classified before each newly read chunk can
+    fall out of the bounded tail. ``scan_suffix`` carries a small overlap across
+    separate drains so multiline markers split at a read/exit boundary remain
+    detectable without retaining unbounded stderr.
+    """
+    if limit <= 0:
+        limit = 64 * 1024
     try:
         fd = pipe.fileno()
         old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
     except Exception:
-        return ""
-    chunks: list[bytes] = []
-    total = 0
+        return "", None, scan_suffix[-8192:]
+    tail = bytearray()
+    scan_tail = str(scan_suffix or "")[-8192:]
+    permanent_error: str | None = None
     try:
-        while total < limit:
+        while True:
             try:
-                data = os.read(fd, min(4096, limit - total))
+                data = os.read(fd, 65536)
             except BlockingIOError:
                 break
             if not data:
                 break
-            chunks.append(data)
-            total += len(data)
+            decoded = data.decode(errors="replace")
+            scan_window = scan_tail + decoded
+            if permanent_error is None:
+                permanent_error = permanent_oauth_refresh_error(scan_window)
+            scan_tail = scan_window[-8192:]
+            tail.extend(data)
+            if len(tail) > limit:
+                del tail[:len(tail) - limit]
     except Exception:
-        return b"".join(chunks).decode(errors="replace")
+        return bytes(tail).decode(errors="replace"), permanent_error, scan_tail
     finally:
         try:
             fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
         except Exception:
             pass
-    return b"".join(chunks).decode(errors="replace")
+    return bytes(tail).decode(errors="replace"), permanent_error, scan_tail
 
 
 def refresh_oauth_auth_file(auth_file: Path) -> tuple[bool, str]:
@@ -1036,13 +1182,17 @@ def refresh_oauth_auth_file(auth_file: Path) -> tuple[bool, str]:
     """
     if not auth_file.exists():
         return False, f"auth file not found: {auth_file}"
+    try:
+        original_auth_bytes = auth_file.read_bytes()
+    except OSError as exc:
+        return False, f"无法读取 auth file: {mask_auth_error(str(exc))}"
     codex_cli = find_codex_cli()
     if not codex_cli:
         return False, "找不到 codex CLI，无法校验官方账号登录态"
     try:
         with tempfile.TemporaryDirectory(prefix="sub2cli-auth-refresh.") as tmp:
             tmp_home = Path(tmp)
-            shutil.copy2(auth_file, tmp_home / "auth.json")
+            durable_write_bytes(tmp_home / "auth.json", original_auth_bytes, mode=0o600)
             env = os.environ.copy()
             env["CODEX_HOME"] = str(tmp_home)
             env.setdefault("TERM", "xterm-256color")
@@ -1055,87 +1205,157 @@ def refresh_oauth_auth_file(auth_file: Path) -> tuple[bool, str]:
                 bufsize=1,
                 env=env,
             )
-            requests = [
-                {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "sub2cli", "title": "sub2cli", "version": APP_VERSION}}},
-                {"method": "initialized"},
-                {"id": 2, "method": "account/read", "params": {"refreshToken": True}},
-            ]
-            assert proc.stdin is not None
-            for msg in requests:
-                proc.stdin.write(json.dumps(msg) + "\n")
+            try:
+                requests = [
+                    {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "sub2cli", "title": "sub2cli", "version": APP_VERSION}}},
+                    {"method": "initialized"},
+                    {"id": 2, "method": "account/read", "params": {"refreshToken": True}},
+                ]
+                assert proc.stdin is not None
+                for msg in requests:
+                    proc.stdin.write(json.dumps(msg) + "\n")
+                    proc.stdin.flush()
+
+                assert proc.stdout is not None
+                stdout_fd = proc.stdout.fileno()
+                stdout_buffer = bytearray()
+                pending_responses: dict[int, dict] = {}
+
+                def read_response(request_id: int) -> dict | None:
+                    cached = pending_responses.pop(request_id, None)
+                    if cached is not None:
+                        return cached
+                    deadline = time.time() + CODEX_AUTH_REFRESH_TIMEOUT
+                    while time.time() < deadline:
+                        while b"\n" in stdout_buffer:
+                            raw_line, _, remainder = stdout_buffer.partition(b"\n")
+                            stdout_buffer[:] = remainder
+                            try:
+                                payload = json.loads(raw_line.decode(errors="replace"))
+                            except json.JSONDecodeError:
+                                continue
+                            response_id = payload.get("id")
+                            if response_id == request_id:
+                                return payload
+                            if isinstance(response_id, int):
+                                pending_responses[response_id] = payload
+
+                        ready, _, _ = select.select([stdout_fd], [], [], 0.2)
+                        if not ready:
+                            continue
+                        chunk = os.read(stdout_fd, 65536)
+                        if not chunk:
+                            return None
+                        stdout_buffer.extend(chunk)
+                    return None
+
+                account_response = read_response(2)
+                if account_response is None:
+                    return False, "Codex CLI 校验官方账号超时"
+
+                # account/read intentionally still returns cached account
+                # metadata after a permanent refresh failure. Ask for token
+                # status only after that refresh attempt has completed.
+                proc.stdin.write(json.dumps({
+                    "id": 3,
+                    "method": "getAuthStatus",
+                    "params": {"includeToken": True, "refreshToken": False},
+                }) + "\n")
                 proc.stdin.flush()
-            response = None
-            deadline = time.time() + CODEX_AUTH_REFRESH_TIMEOUT
-            assert proc.stdout is not None
-            while time.time() < deadline and response is None:
-                ready, _, _ = select.select([proc.stdout], [], [], 0.2)
-                if not ready:
-                    continue
-                line = proc.stdout.readline()
-                if not line:
-                    break
+                status_response = read_response(3)
+                if status_response is None:
+                    return False, "Codex CLI 校验官方账号超时"
+
+                stderr_before_exit = ""
+                permanent_before_exit = None
+                stderr_scan_suffix = ""
+                if proc.stderr is not None:
+                    (
+                        stderr_before_exit,
+                        permanent_before_exit,
+                        stderr_scan_suffix,
+                    ) = read_available_pipe_text(proc.stderr)
                 try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if payload.get("id") == 2:
-                    response = payload
-            stderr = read_available_pipe_text(proc.stderr) if proc.stderr is not None else ""
-            if response is None:
+                    proc.stdin.close()
+                except Exception:
+                    pass
                 try:
+                    proc.wait(timeout=5)
+                except Exception:
                     proc.terminate()
                     proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                return False, "Codex CLI 校验官方账号超时"
-            if response.get("error"):
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                return False, mask_auth_error(json.dumps(response.get("error"), ensure_ascii=False))
-            result = response.get("result") or {}
-            account = result.get("account") or {}
-            refreshed_auth = tmp_home / "auth.json"
-            if not account.get("email"):
-                detail = (
-                    mask_auth_error(stderr.strip())
-                    if stderr
-                    else "Codex CLI 未返回有效官方账号，refresh token 可能已失效"
+                stderr_after_exit = ""
+                permanent_after_exit = None
+                if proc.stderr is not None:
+                    (
+                        stderr_after_exit,
+                        permanent_after_exit,
+                        stderr_scan_suffix,
+                    ) = read_available_pipe_text(
+                        proc.stderr,
+                        scan_suffix=stderr_scan_suffix,
+                    )
+                stderr = (stderr_before_exit + stderr_after_exit)[-(64 * 1024):]
+                stderr_display = stderr.strip()[-4000:]
+                responses = {2: account_response, 3: status_response}
+                for response_id in (2, 3):
+                    response = responses[response_id]
+                    if response.get("error"):
+                        return False, mask_auth_error(
+                            json.dumps(response.get("error"), ensure_ascii=False)
+                        )
+
+                permanent_refresh_error = (
+                    permanent_before_exit
+                    or permanent_after_exit
+                    or permanent_oauth_refresh_error(stderr)
                 )
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
+                if permanent_refresh_error:
+                    return False, permanent_refresh_error
+
+                account = (responses[2].get("result") or {}).get("account") or {}
+                if not account.get("email"):
+                    return False, (
+                        mask_auth_error(stderr_display)
+                        if stderr_display
+                        else "Codex CLI 未返回有效官方账号，refresh token 可能已失效"
+                    )
+
+                auth_status = responses[3].get("result") or {}
+                auth_method = str(auth_status.get("authMethod") or "").strip().lower()
+                auth_token = auth_status.get("authToken")
+                if auth_method != "chatgpt" or not isinstance(auth_token, str) or not auth_token:
+                    return False, (
+                        mask_auth_error(stderr_display)
+                        if stderr_display
+                        else "Codex CLI 检测到官方账号登录态已失效，请重新登录该账号"
+                    )
+                refreshed_auth = tmp_home / "auth.json"
+                if not durable_compare_and_swap_bytes(
+                    auth_file,
+                    original_auth_bytes,
+                    refreshed_auth.read_bytes(),
+                    mode=0o600,
+                ):
+                    return False, "auth.json 在校验期间被 ChatGPT 并发刷新；已保留较新登录态，请重试"
+                return True, ""
+            finally:
+                if proc.poll() is None:
                     try:
-                        proc.kill()
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=2)
+                        except Exception:
+                            pass
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    try:
+                        if pipe is not None and not pipe.closed:
+                            pipe.close()
                     except Exception:
                         pass
-                return False, detail
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-            durable_write_bytes(auth_file, refreshed_auth.read_bytes(), mode=0o600)
-            return True, ""
     except FileNotFoundError:
         return False, "找不到 codex CLI，无法校验官方账号登录态"
     except Exception as exc:
@@ -6493,6 +6713,7 @@ def cmd_switch(
     backup_dir: Path | None = None,
     recover_missing_oauth_auth: bool = True,
     refresh_catalog: bool = True,
+    refreshed_oauth_slot: str | None = None,
 ) -> int:
     if dry_run:
         # Read-only; no lock needed. Computed from a one-shot snapshot.
@@ -6536,7 +6757,7 @@ def cmd_switch(
         # exact path rather than re-evaluating mutable identity state.
         identity_slot, resolved_auth_target = effective_auth_target(data, target_slot)
 
-        if slot_is_clean(data, target_slot):
+        if slot_is_clean(data, target_slot) and refreshed_oauth_slot != target_slot:
             print(f"当前已是：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
             if mode == "relay":
                 if ensure_protocol_proxy():
@@ -6575,7 +6796,12 @@ def cmd_switch(
         previous = data.get("current")
         previous_identity_slot = resolve_active_oauth_slot(data)
         previous_identity_auth = oauth_slot_auth_path(data, previous_identity_slot)
-        if live_auth_is_chatgpt() and previous_identity_slot and previous_identity_auth:
+        if (
+            live_auth_is_chatgpt()
+            and previous_identity_slot
+            and previous_identity_auth
+            and previous_identity_slot != refreshed_oauth_slot
+        ):
             try:
                 flush_auth_to_slot(previous_identity_auth)
                 data["active_oauth_slot"] = previous_identity_slot
@@ -7079,6 +7305,19 @@ def cmd_oauth(
     dry_run: bool = False,
 ) -> int:
     slot = validate_slot(slot)
+    if not dry_run and Sub2cliLock._depth == 0:
+        try:
+            with Sub2cliLock():
+                return cmd_oauth(
+                    slot,
+                    display=display,
+                    auth_file=auth_file,
+                    no_switch=no_switch,
+                    no_restart=no_restart,
+                    dry_run=False,
+                )
+        except LockBusy as exc:
+            fail(str(exc), code=4)
     auth_source = Path(auth_file).expanduser() if auth_file else None
     if auth_source and not auth_source.exists():
         fail(f"auth file not found: {auth_source}")
@@ -7160,6 +7399,7 @@ def cmd_oauth(
                 no_restart=no_restart,
                 backup_dir=backup_dir,
                 recover_missing_oauth_auth=auth_source is not None,
+                refreshed_oauth_slot=slot if auth_source is not None else None,
             )
             auth_target = Path(slots[slot]["auth_file"]).expanduser()
             if not auth_target.exists() or auth_target.stat().st_size < 10:
