@@ -212,8 +212,26 @@ class ProviderClient:
     def reveal_key(self, key: UpstreamKey) -> UpstreamKey:
         return key
 
+    def login_with_credentials(self, account: str, password: str) -> None:  # pragma: no cover
+        raise NotImplementedError
+
     def secret_account(self, suffix: str) -> str:
         return f"provider:{self.provider_id}:{suffix}"
+
+    def _stored_login(self) -> tuple[str, str]:
+        account = keychain_get(self.secret_account("login_account"), required=False)
+        password = keychain_get(self.secret_account("login_password"), required=False)
+        if not account or not password:
+            raise ReconcileError(
+                "auth_required",
+                f"{self.provider_id} has no stored API login",
+                next_action=f"run enroll-login --provider {self.provider_id}",
+            )
+        return account, password
+
+    def _login_from_keychain(self) -> None:
+        account, password = self._stored_login()
+        self.login_with_credentials(account, password)
 
 
 class Sub2APIProvider(ProviderClient):
@@ -225,16 +243,47 @@ class Sub2APIProvider(ProviderClient):
         token = keychain_get(self.secret_account("access_token"))
         return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
+    def login_with_credentials(self, account: str, password: str) -> None:
+        response = self.session.post(
+            f"{self.api_base}/auth/login",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json={"email": account, "password": password},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        _require_status(response)
+        data = _response_data(response)
+        if not isinstance(data, dict) or not data.get("access_token") or not data.get(
+            "refresh_token"
+        ):
+            raise ReconcileError(
+                "auth_required",
+                f"{self.provider_id} login did not return a reusable session",
+            )
+        keychain_set(self.secret_account("access_token"), str(data["access_token"]))
+        keychain_set(self.secret_account("refresh_token"), str(data["refresh_token"]))
+
     def _refresh(self) -> None:
-        refresh_token = keychain_get(self.secret_account("refresh_token"))
+        refresh_token = keychain_get(self.secret_account("refresh_token"), required=False)
+        if not refresh_token:
+            self._login_from_keychain()
+            return
         response = self.session.post(
             f"{self.api_base}/auth/refresh",
             headers={"Accept": "application/json", "Content-Type": "application/json"},
             json={"refresh_token": refresh_token},
             timeout=DEFAULT_TIMEOUT,
         )
+        if response.status_code in (400, 401, 403):
+            self._login_from_keychain()
+            return
         _require_status(response)
-        data = _response_data(response)
+        try:
+            data = _response_data(response)
+        except ReconcileError as exc:
+            if exc.code == "upstream_api_error":
+                self._login_from_keychain()
+                return
+            raise
         if not isinstance(data, dict) or not data.get("access_token") or not data.get("refresh_token"):
             raise ReconcileError("auth_refresh_failed", f"{self.provider_id} returned invalid refresh data")
         keychain_set(self.secret_account("access_token"), str(data["access_token"]))
@@ -338,9 +387,16 @@ class Sub2APIProvider(ProviderClient):
             for item in subscriptions
             if isinstance(item, dict) and item.get("status") == "active" and item.get("group_id") is not None
         }
+        excluded_group_ids = {
+            str(value) for value in self.config.get("exclude_group_ids", [])
+        }
         resources: list[UpstreamResource] = []
         for group_ref, group in groups.items():
+            if group_ref in excluded_group_ids:
+                continue
             subscription_group = group.get("subscription_type") == "subscription"
+            if self.config.get("subscription_only", False) and not subscription_group:
+                continue
             if subscription_group and group_ref not in active_subscription_groups:
                 continue
             source_class = "subscription" if subscription_group else "metered"
@@ -418,6 +474,32 @@ class NewAPIProvider(ProviderClient):
             "New-Api-User": str(keychain_get(self.secret_account("uid"))),
         }
 
+    def login_with_credentials(self, account: str, password: str) -> None:
+        response = self.session.post(
+            f"{self.api_base}/api/user/login",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json={"username": account, "password": password},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        _require_status(response)
+        data = _response_data(response)
+        if not isinstance(data, dict):
+            raise ReconcileError(
+                "auth_required", f"{self.provider_id} login returned invalid user data"
+            )
+        nested_user = data.get("user") if isinstance(data.get("user"), dict) else {}
+        uid = data.get("id") or nested_user.get("id")
+        cookie_header = "; ".join(
+            f"{item.name}={item.value}" for item in self.session.cookies
+        )
+        if uid is None or not cookie_header:
+            raise ReconcileError(
+                "auth_required",
+                f"{self.provider_id} login did not return a reusable session",
+            )
+        keychain_set(self.secret_account("uid"), str(uid))
+        keychain_set(self.secret_account("cookie"), cookie_header)
+
     def _request(
         self,
         method: str,
@@ -439,10 +521,15 @@ class NewAPIProvider(ProviderClient):
             timeout=DEFAULT_TIMEOUT,
         )
         if response.status_code in (401, 403):
-            raise ReconcileError(
-                "auth_required",
-                f"{self.provider_id} browser session expired",
-                next_action="log in again in Edge and run enroll-edge",
+            self._login_from_keychain()
+            response = _request_with_retries(
+                self.session,
+                method,
+                f"{self.api_base}{path}",
+                retryable=retryable,
+                headers=self._headers(),
+                json=body,
+                timeout=DEFAULT_TIMEOUT,
             )
         if allow_missing and response.status_code == 404:
             return None

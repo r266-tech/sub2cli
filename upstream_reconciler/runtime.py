@@ -136,6 +136,28 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
         if provider.get("type") == "new-api" and not provider.get("include_group_regex"):
             raise ReconcileError("invalid_config", f"{provider_id}.include_group_regex is required")
+        if "subscription_only" in provider:
+            if provider.get("type") != "sub2api" or not isinstance(
+                provider.get("subscription_only"), bool
+            ):
+                raise ReconcileError(
+                    "invalid_config",
+                    f"{provider_id}.subscription_only is supported only as a boolean for sub2api",
+                )
+        if "exclude_group_ids" in provider:
+            excluded = provider.get("exclude_group_ids")
+            if provider.get("type") != "sub2api" or not isinstance(excluded, list):
+                raise ReconcileError(
+                    "invalid_config",
+                    f"{provider_id}.exclude_group_ids is supported only as a list for sub2api",
+                )
+            if any(
+                isinstance(value, bool) or not isinstance(value, (int, str))
+                for value in excluded
+            ):
+                raise ReconcileError(
+                    "invalid_config", f"{provider_id}.exclude_group_ids has an invalid id"
+                )
         adoption_resources: set[str] = set()
         for adoption in provider.get("adopt", []):
             if not isinstance(adoption, dict) or not adoption.get("resource_id"):
@@ -1210,6 +1232,25 @@ def enroll_from_edge(
         rotate_existing=rotate_target_admin_key,
     )
     return {"ok": True, "providers": enrolled, "target": "enrolled"}
+
+
+def enroll_provider_login(
+    provider_id: str,
+    account: str,
+    password: str,
+    config_path: Path | None = None,
+) -> dict[str, Any]:
+    config = load_config(config_path)
+    provider_config = next(
+        (item for item in config["providers"] if str(item["id"]) == provider_id), None
+    )
+    if provider_config is None:
+        raise ReconcileError("invalid_config", f"unknown provider: {provider_id}")
+    client = provider_from_config(provider_config)
+    client.login_with_credentials(account, password)
+    keychain_set(client.secret_account("login_account"), account)
+    keychain_set(client.secret_account("login_password"), password)
+    return {"ok": True, "provider": provider_id, "auth": "api-login-enrolled"}
 
 
 def rollback_snapshot(snapshot_path: Path, config_path: Path | None = None) -> dict[str, Any]:

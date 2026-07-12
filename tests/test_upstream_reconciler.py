@@ -184,6 +184,77 @@ class ProviderNormalizationTests(unittest.TestCase):
             snapshot = client.scan()
         self.assertEqual(snapshot.resources[0].multiplier, Decimal("0.065"))
 
+    def test_sub2api_subscription_only_excludes_metered_groups(self) -> None:
+        config = {
+            "id": "subscription-site",
+            "type": "sub2api",
+            "api_base": "https://example.test/api/v1",
+            "include_platform": "openai",
+            "subscription_only": True,
+            "adopt": [],
+        }
+        client = Sub2APIProvider(config)
+        groups = [
+            {
+                "id": 1,
+                "name": "subscription",
+                "status": "active",
+                "platform": "openai",
+                "subscription_type": "subscription",
+                "rate_multiplier": 1,
+            },
+            {
+                "id": 2,
+                "name": "metered",
+                "status": "active",
+                "platform": "openai",
+                "subscription_type": "standard",
+                "rate_multiplier": 0.22,
+            },
+        ]
+        with mock.patch.object(
+            client,
+            "_request",
+            side_effect=[groups, [{"group_id": 1, "status": "active"}], {}],
+        ), mock.patch.object(client, "_list_keys", return_value=([], {})):
+            snapshot = client.scan()
+        self.assertEqual([item.resource_id for item in snapshot.resources], ["group:1"])
+        self.assertEqual(snapshot.resources[0].source_class, "subscription")
+
+    def test_sub2api_excluded_group_ids_are_not_managed(self) -> None:
+        config = {
+            "id": "filtered-site",
+            "type": "sub2api",
+            "api_base": "https://example.test/api/v1",
+            "include_platform": "openai",
+            "exclude_group_ids": [2],
+            "adopt": [],
+        }
+        client = Sub2APIProvider(config)
+        groups = [
+            {
+                "id": 1,
+                "name": "gpt",
+                "status": "active",
+                "platform": "openai",
+                "subscription_type": "standard",
+                "rate_multiplier": 0.15,
+            },
+            {
+                "id": 2,
+                "name": "glm",
+                "status": "active",
+                "platform": "openai",
+                "subscription_type": "standard",
+                "rate_multiplier": 0.15,
+            },
+        ]
+        with mock.patch.object(
+            client, "_request", side_effect=[groups, [], {}]
+        ), mock.patch.object(client, "_list_keys", return_value=([], {})):
+            snapshot = client.scan()
+        self.assertEqual([item.resource_id for item in snapshot.resources], ["group:1"])
+
     def test_newapi_filter_excludes_non_gpt_groups(self) -> None:
         config = {
             "id": "new",
@@ -268,6 +339,62 @@ class ProviderNormalizationTests(unittest.TestCase):
             self.assertEqual(client._request("GET", "/api/test"), {"ok": True})
         self.assertEqual(request.call_count, 2)
         sleep.assert_called_once()
+
+    def test_sub2api_refresh_falls_back_to_stored_api_login(self) -> None:
+        client = Sub2APIProvider(
+            {
+                "id": "sub",
+                "type": "sub2api",
+                "api_base": "https://example.test/api/v1",
+            }
+        )
+        unauthorized = SimpleNamespace(
+            status_code=401,
+            headers={},
+            request=SimpleNamespace(method="POST"),
+            url="https://example.test/api/v1/auth/refresh",
+            content=b"{}",
+        )
+        with mock.patch(
+            "upstream_reconciler.clients.keychain_get", return_value="stale-refresh"
+        ), mock.patch.object(
+            client.session, "post", return_value=unauthorized
+        ), mock.patch.object(client, "_login_from_keychain") as login:
+            client._refresh()
+        login.assert_called_once_with()
+
+    def test_newapi_expired_session_reauthenticates_and_retries(self) -> None:
+        client = NewAPIProvider(
+            {
+                "id": "new",
+                "type": "new-api",
+                "api_base": "https://example.test",
+                "include_group_regex": "^gpt",
+            }
+        )
+        unauthorized = SimpleNamespace(
+            status_code=401,
+            headers={},
+            request=SimpleNamespace(method="GET"),
+            url="https://example.test/api/test",
+            content=b"{}",
+        )
+        success = SimpleNamespace(
+            status_code=200,
+            headers={},
+            request=SimpleNamespace(method="GET"),
+            url="https://example.test/api/test",
+            content=b'{"success":true,"data":{"ok":true}}',
+            json=lambda: {"success": True, "data": {"ok": True}},
+        )
+        with mock.patch.object(client, "_headers", return_value={}), mock.patch.object(
+            client, "_login_from_keychain"
+        ) as login, mock.patch.object(
+            client.session, "request", side_effect=[unauthorized, success]
+        ) as request:
+            self.assertEqual(client._request("GET", "/api/test"), {"ok": True})
+        login.assert_called_once_with()
+        self.assertEqual(request.call_count, 2)
 
 
 class PlanTests(unittest.TestCase):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 from .core import ReconcileError, redact
 from .runtime import (
     enroll_from_edge,
+    enroll_provider_login,
     reconcile_apply,
     reconcile_plan,
     reconcile_status,
@@ -38,6 +40,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="intentionally replace the target Admin API Key",
     )
+    login_parser = subparsers.add_parser(
+        "enroll-login",
+        help="validate and store one provider API login in macOS Keychain",
+    )
+    login_parser.add_argument("--provider", required=True, help="configured provider id")
 
     apply_parser = subparsers.add_parser("apply", help="apply a fresh plan and verify read-back")
     apply_parser.add_argument("--yes", action="store_true", help="confirm external writes")
@@ -68,6 +75,15 @@ def main(argv: list[str] | None = None) -> int:
             result = enroll_from_edge(
                 args.config,
                 rotate_target_admin_key=args.rotate_target_admin_key,
+            )
+        elif args.command == "enroll-login":
+            account = getpass.getpass("Account: ")
+            password = getpass.getpass("Password: ")
+            result = enroll_provider_login(
+                args.provider,
+                account,
+                password,
+                args.config,
             )
         elif args.command == "apply":
             if not args.yes:
