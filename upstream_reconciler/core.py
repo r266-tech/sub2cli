@@ -7,16 +7,25 @@ from typing import Any, Iterable, Literal
 
 
 MANAGED_PREFIX = "bbta:v1"
+PROBE_PREFIX = "bbta:probe:v1"
 METADATA_KEY = "babata_upstream_reconciler"
 
 
 class ReconcileError(RuntimeError):
     """A fail-closed reconciliation error safe to show to the operator."""
 
-    def __init__(self, code: str, message: str, *, next_action: str | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        next_action: str | None = None,
+        context: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.next_action = next_action
+        self.context = dict(context or {})
 
 
 def decimal_value(value: Any, *, field_name: str = "multiplier") -> Decimal:
@@ -41,6 +50,11 @@ def decimal_text(value: Decimal | None) -> str | None:
 def marker_for(provider_id: str, resource_id: str) -> str:
     digest = hashlib.sha256(f"{provider_id}\0{resource_id}".encode("utf-8")).hexdigest()[:12]
     return f"{MANAGED_PREFIX}:{provider_id}:{digest}"
+
+
+def probe_marker_for(provider_id: str, resource_id: str) -> str:
+    digest = hashlib.sha256(f"probe\0{provider_id}\0{resource_id}".encode("utf-8")).hexdigest()[:12]
+    return f"{PROBE_PREFIX}:{provider_id}:{digest}"
 
 
 def fingerprint_secret(value: str) -> str:
@@ -76,6 +90,10 @@ class UpstreamResource:
     @property
     def marker(self) -> str:
         return marker_for(self.provider_id, self.resource_id)
+
+    @property
+    def probe_marker(self) -> str:
+        return probe_marker_for(self.provider_id, self.resource_id)
 
     def safe_dict(self) -> dict[str, Any]:
         return {

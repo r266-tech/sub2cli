@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import time
 import urllib.request
@@ -13,12 +14,95 @@ import requests
 import websocket  # type: ignore[import-not-found]
 
 from .core import MANAGED_PREFIX, ReconcileError, UpstreamKey, UpstreamResource, decimal_value
+from .probe import ProbeResult, probe_codex_responses
 from .store import keychain_get, keychain_set
 
 
 DEFAULT_TIMEOUT = 15
 RETRYABLE_STATUS = {429, 502, 503, 504}
 RETRY_DELAYS = (0.5, 1.5)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _parse_api_time(value: Any, *, field_name: str) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        raise ReconcileError("incomplete_scan", f"{field_name} is not an ISO timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ReconcileError("incomplete_scan", f"{field_name} is not an ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ReconcileError("incomplete_scan", f"{field_name} must include a timezone")
+    return parsed.astimezone(UTC)
+
+
+def _subscription_is_current(
+    item: dict[str, Any],
+    *,
+    field_name: str,
+    require_expiry: bool,
+    now: datetime | None = None,
+) -> bool:
+    if item.get("status") != "active":
+        return False
+    current = now or _utc_now()
+    starts_at = _parse_api_time(item.get("starts_at"), field_name=f"{field_name}.starts_at")
+    expires_at = _parse_api_time(item.get("expires_at"), field_name=f"{field_name}.expires_at")
+    if require_expiry and expires_at is None:
+        raise ReconcileError("incomplete_scan", f"{field_name}.expires_at is required")
+    if starts_at is not None and current < starts_at:
+        return False
+    if expires_at is not None and current >= expires_at:
+        return False
+    return True
+
+
+def _schema_shape(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 3:
+        return type(value).__name__
+    if isinstance(value, dict):
+        return {
+            "type": "object",
+            "fields": {
+                str(key): _schema_shape(item, depth=depth + 1)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))[:80]
+            },
+        }
+    if isinstance(value, list):
+        return {
+            "type": "array",
+            "items": [_schema_shape(item, depth=depth + 1) for item in value[:3]],
+        }
+    return type(value).__name__
+
+
+def _schema_changed(
+    provider_id: str,
+    endpoint: str,
+    expected: str,
+    observed: Any,
+) -> ReconcileError:
+    shape = _schema_shape(observed)
+    raw = json.dumps(shape, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    top_keys = sorted(str(key) for key in observed)[:40] if isinstance(observed, dict) else []
+    return ReconcileError(
+        "schema_changed",
+        f"{provider_id} {endpoint} response schema changed",
+        next_action="repeat one read-only doctor check, then follow the upstream maintenance contract",
+        context={
+            "provider_id": provider_id,
+            "endpoint": endpoint,
+            "expected": expected,
+            "observed_type": type(observed).__name__,
+            "observed_keys": top_keys,
+            "schema_fingerprint": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        },
+    )
 
 
 def _request_with_retries(
@@ -200,10 +284,16 @@ class ProviderClient:
     def create_key(self, resource: UpstreamResource) -> UpstreamKey:  # pragma: no cover
         raise NotImplementedError
 
+    def create_probe_key(self, resource: UpstreamResource) -> UpstreamKey:  # pragma: no cover
+        raise NotImplementedError
+
     def rename_key(self, key: UpstreamKey, name: str) -> None:  # pragma: no cover
         raise NotImplementedError
 
     def enable_key(self, key: UpstreamKey) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    def disable_key(self, key: UpstreamKey) -> None:  # pragma: no cover
         raise NotImplementedError
 
     def delete_key(self, key_id: str) -> None:  # pragma: no cover
@@ -211,6 +301,26 @@ class ProviderClient:
 
     def reveal_key(self, key: UpstreamKey) -> UpstreamKey:
         return key
+
+    def probe_resource(self, resource: UpstreamResource, key: UpstreamKey) -> ProbeResult:
+        preferred = self.config.get("probe_preferred_models")
+        return probe_codex_responses(
+            str(self.config["inference_base"]),
+            key.secret,
+            timeout=float(self.config.get("probe_timeout_seconds", 30)),
+            allow_regex=str(
+                self.config.get("probe_model_allow_regex") or r"^(?:gpt-|codex-)"
+            ),
+            deny_regex=str(
+                self.config.get("probe_model_deny_regex")
+                or r"(?:^|[-_/])(?:audio|embedding|image|realtime|speech|transcribe|tts|video)(?:$|[-_/])"
+            ),
+            preferred_models=(
+                [str(value) for value in preferred]
+                if isinstance(preferred, list)
+                else ("gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3-codex-spark")
+            ),
+        )
 
     def login_with_credentials(self, account: str, password: str) -> None:  # pragma: no cover
         raise NotImplementedError
@@ -226,6 +336,7 @@ class ProviderClient:
                 "auth_required",
                 f"{self.provider_id} has no stored API login",
                 next_action=f"run enroll-login --provider {self.provider_id}",
+                context={"provider_id": self.provider_id},
             )
         return account, password
 
@@ -250,14 +361,32 @@ class Sub2APIProvider(ProviderClient):
             json={"email": account, "password": password},
             timeout=DEFAULT_TIMEOUT,
         )
+        if response.status_code in (400, 401, 403):
+            raise ReconcileError(
+                "interactive_auth_required",
+                f"{self.provider_id} rejected the stored API login",
+                next_action="check whether the password changed or the site added captcha or 2FA",
+                context={"provider_id": self.provider_id},
+            )
         _require_status(response)
-        data = _response_data(response)
+        try:
+            data = _response_data(response)
+        except ReconcileError as exc:
+            if exc.code in ("invalid_api_response", "upstream_api_error"):
+                raise ReconcileError(
+                    "interactive_auth_required",
+                    f"{self.provider_id} rejected the stored API login",
+                    next_action="check whether the password changed or the site added captcha or 2FA",
+                    context={"provider_id": self.provider_id},
+                ) from exc
+            raise
         if not isinstance(data, dict) or not data.get("access_token") or not data.get(
             "refresh_token"
         ):
             raise ReconcileError(
                 "auth_required",
                 f"{self.provider_id} login did not return a reusable session",
+                context={"provider_id": self.provider_id},
             )
         keychain_set(self.secret_account("access_token"), str(data["access_token"]))
         keychain_set(self.secret_account("refresh_token"), str(data["refresh_token"]))
@@ -280,12 +409,13 @@ class Sub2APIProvider(ProviderClient):
         try:
             data = _response_data(response)
         except ReconcileError as exc:
-            if exc.code == "upstream_api_error":
+            if exc.code in ("invalid_api_response", "upstream_api_error"):
                 self._login_from_keychain()
                 return
             raise
         if not isinstance(data, dict) or not data.get("access_token") or not data.get("refresh_token"):
-            raise ReconcileError("auth_refresh_failed", f"{self.provider_id} returned invalid refresh data")
+            self._login_from_keychain()
+            return
         keychain_set(self.secret_account("access_token"), str(data["access_token"]))
         keychain_set(self.secret_account("refresh_token"), str(data["refresh_token"]))
 
@@ -313,7 +443,7 @@ class Sub2APIProvider(ProviderClient):
             json=body,
             timeout=DEFAULT_TIMEOUT,
         )
-        if response.status_code == 401:
+        if response.status_code in (401, 403):
             self._refresh()
             headers = self._headers()
             if body is not None:
@@ -329,12 +459,33 @@ class Sub2APIProvider(ProviderClient):
                 json=body,
                 timeout=DEFAULT_TIMEOUT,
             )
+        if response.status_code in (401, 403):
+            raise ReconcileError(
+                "auth_required",
+                f"{self.provider_id} API session could not be renewed",
+                next_action="check whether the password changed or the site added captcha or 2FA",
+                context={"provider_id": self.provider_id},
+            )
         if allow_missing and response.status_code == 404:
             return None
         _require_status(response, (200, 201, 204) if allow_missing else (200, 201))
         if response.status_code == 204 or not response.content:
             return None
-        return _response_data(response)
+        try:
+            return _response_data(response)
+        except ReconcileError as exc:
+            if exc.code != "invalid_api_response":
+                raise
+            try:
+                observed = response.json()
+            except ValueError:
+                raise
+            raise _schema_changed(
+                self.provider_id,
+                path,
+                "standard JSON success envelope",
+                observed,
+            ) from exc
 
     def _list_keys(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
         items: list[dict[str, Any]] = []
@@ -343,7 +494,12 @@ class Sub2APIProvider(ProviderClient):
         while page <= pages:
             data = self._request("GET", f"/keys?page={page}&page_size=100&sort_by=created_at&sort_order=asc")
             if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-                raise ReconcileError("incomplete_scan", f"{self.provider_id} key pagination is invalid")
+                raise _schema_changed(
+                    self.provider_id,
+                    "/keys",
+                    "object with items array and optional pages",
+                    data,
+                )
             items.extend(item for item in data["items"] if isinstance(item, dict))
             pages = int(data.get("pages") or 1)
             page += 1
@@ -360,7 +516,17 @@ class Sub2APIProvider(ProviderClient):
             or not isinstance(subscriptions, list)
             or not isinstance(user_rates, dict)
         ):
-            raise ReconcileError("incomplete_scan", f"{self.provider_id} group inventory is invalid")
+            observed = {
+                "groups_available": available,
+                "subscriptions_active": subscriptions,
+                "groups_rates": user_rates,
+            }
+            raise _schema_changed(
+                self.provider_id,
+                "/groups/available + /subscriptions/active + /groups/rates",
+                "array + array + object",
+                observed,
+            )
 
         platform = str(self.config.get("include_platform") or "openai")
         adopted_ids = {str(item["key_id"]) for item in self.config.get("adopt", [])}
@@ -382,10 +548,29 @@ class Sub2APIProvider(ProviderClient):
             ):
                 groups[str(group["id"])] = group
 
+        require_subscription_expiry = bool(
+            self.config.get("require_subscription_expiry", False)
+        )
+        subscription_allowlist = self.config.get("subscription_resource_allowlist")
+        allowed_subscription_resources = (
+            {str(value) for value in subscription_allowlist}
+            if isinstance(subscription_allowlist, list)
+            else None
+        )
         active_subscription_groups = {
             str(item.get("group_id"))
             for item in subscriptions
-            if isinstance(item, dict) and item.get("status") == "active" and item.get("group_id") is not None
+            if isinstance(item, dict)
+            and item.get("group_id") is not None
+            and (
+                allowed_subscription_resources is None
+                or f"group:{item.get('group_id')}" in allowed_subscription_resources
+            )
+            and _subscription_is_current(
+                item,
+                field_name=f"{self.provider_id}/subscription:{item.get('group_id')}",
+                require_expiry=require_subscription_expiry,
+            )
         }
         excluded_group_ids = {
             str(value) for value in self.config.get("exclude_group_ids", [])
@@ -397,6 +582,21 @@ class Sub2APIProvider(ProviderClient):
             subscription_group = group.get("subscription_type") == "subscription"
             if self.config.get("subscription_only", False) and not subscription_group:
                 continue
+            resource_id = f"group:{group_ref}"
+            if (
+                allowed_subscription_resources is not None
+                and resource_id in allowed_subscription_resources
+                and not subscription_group
+            ):
+                # An authorized subscription must not silently turn into a
+                # metered route when upstream metadata drifts.
+                continue
+            if (
+                subscription_group
+                and allowed_subscription_resources is not None
+                and resource_id not in allowed_subscription_resources
+            ):
+                continue
             if subscription_group and group_ref not in active_subscription_groups:
                 continue
             source_class = "subscription" if subscription_group else "metered"
@@ -407,7 +607,7 @@ class Sub2APIProvider(ProviderClient):
             resources.append(
                 UpstreamResource(
                     provider_id=self.provider_id,
-                    resource_id=f"group:{group_ref}",
+                    resource_id=resource_id,
                     group_ref=group_ref,
                     group_name=str(group.get("name") or group_ref),
                     source_class=source_class,
@@ -428,22 +628,41 @@ class Sub2APIProvider(ProviderClient):
         ]
         return ProviderSnapshot(self.provider_id, resources, keys, raw_by_id)
 
-    def create_key(self, resource: UpstreamResource) -> UpstreamKey:
-        action_key = f"reconcile-{resource.marker}"
+    def _create_named_key(
+        self,
+        resource: UpstreamResource,
+        *,
+        name: str,
+        idempotency_key: str,
+    ) -> UpstreamKey:
         data = self._request(
             "POST",
             "/keys",
-            body={"name": resource.marker, "group_id": int(resource.group_ref)},
-            idempotency_key=action_key,
+            body={"name": name, "group_id": int(resource.group_ref)},
+            idempotency_key=idempotency_key,
         )
         if not isinstance(data, dict) or data.get("id") is None or not data.get("key"):
             raise ReconcileError("create_key_failed", f"{self.provider_id} did not return the created key")
         return UpstreamKey(
             id=str(data["id"]),
-            name=str(data.get("name") or resource.marker),
+            name=str(data.get("name") or name),
             group_ref=str(data.get("group_id") or resource.group_ref),
             status=str(data.get("status") or "active"),
             secret=str(data["key"]),
+        )
+
+    def create_key(self, resource: UpstreamResource) -> UpstreamKey:
+        return self._create_named_key(
+            resource,
+            name=resource.marker,
+            idempotency_key=f"reconcile-{resource.marker}",
+        )
+
+    def create_probe_key(self, resource: UpstreamResource) -> UpstreamKey:
+        return self._create_named_key(
+            resource,
+            name=resource.probe_marker,
+            idempotency_key=f"probe-{resource.probe_marker}",
         )
 
     def rename_key(self, key: UpstreamKey, name: str) -> None:
@@ -451,6 +670,9 @@ class Sub2APIProvider(ProviderClient):
 
     def enable_key(self, key: UpstreamKey) -> None:
         self._request("PUT", f"/keys/{key.id}", body={"status": "active"})
+
+    def disable_key(self, key: UpstreamKey) -> None:
+        self._request("PUT", f"/keys/{key.id}", body={"status": "inactive"})
 
     def delete_key(self, key_id: str) -> None:
         self._request("DELETE", f"/keys/{key_id}", allow_missing=True)
@@ -481,11 +703,30 @@ class NewAPIProvider(ProviderClient):
             json={"username": account, "password": password},
             timeout=DEFAULT_TIMEOUT,
         )
+        if response.status_code in (400, 401, 403):
+            raise ReconcileError(
+                "interactive_auth_required",
+                f"{self.provider_id} rejected the stored API login",
+                next_action="check whether the password changed or the site added captcha or 2FA",
+                context={"provider_id": self.provider_id},
+            )
         _require_status(response)
-        data = _response_data(response)
+        try:
+            data = _response_data(response)
+        except ReconcileError as exc:
+            if exc.code in ("invalid_api_response", "upstream_api_error"):
+                raise ReconcileError(
+                    "interactive_auth_required",
+                    f"{self.provider_id} rejected the stored API login",
+                    next_action="check whether the password changed or the site added captcha or 2FA",
+                    context={"provider_id": self.provider_id},
+                ) from exc
+            raise
         if not isinstance(data, dict):
             raise ReconcileError(
-                "auth_required", f"{self.provider_id} login returned invalid user data"
+                "auth_required",
+                f"{self.provider_id} login returned invalid user data",
+                context={"provider_id": self.provider_id},
             )
         nested_user = data.get("user") if isinstance(data.get("user"), dict) else {}
         uid = data.get("id") or nested_user.get("id")
@@ -496,6 +737,7 @@ class NewAPIProvider(ProviderClient):
             raise ReconcileError(
                 "auth_required",
                 f"{self.provider_id} login did not return a reusable session",
+                context={"provider_id": self.provider_id},
             )
         keychain_set(self.secret_account("uid"), str(uid))
         keychain_set(self.secret_account("cookie"), cookie_header)
@@ -531,12 +773,33 @@ class NewAPIProvider(ProviderClient):
                 json=body,
                 timeout=DEFAULT_TIMEOUT,
             )
+        if response.status_code in (401, 403):
+            raise ReconcileError(
+                "auth_required",
+                f"{self.provider_id} API session could not be renewed",
+                next_action="check whether the password changed or the site added captcha or 2FA",
+                context={"provider_id": self.provider_id},
+            )
         if allow_missing and response.status_code == 404:
             return None
         _require_status(response, (200, 201, 204) if allow_missing else (200, 201))
         if response.status_code == 204 or not response.content:
             return None
-        return _response_data(response)
+        try:
+            return _response_data(response)
+        except ReconcileError as exc:
+            if exc.code != "invalid_api_response":
+                raise
+            try:
+                observed = response.json()
+            except ValueError:
+                raise
+            raise _schema_changed(
+                self.provider_id,
+                path,
+                "standard JSON success envelope",
+                observed,
+            ) from exc
 
     def _list_keys(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
         items: list[dict[str, Any]] = []
@@ -545,7 +808,12 @@ class NewAPIProvider(ProviderClient):
         while len(items) < total:
             data = self._request("GET", f"/api/token/?p={page}&size=100")
             if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-                raise ReconcileError("incomplete_scan", f"{self.provider_id} token pagination is invalid")
+                raise _schema_changed(
+                    self.provider_id,
+                    "/api/token/",
+                    "object with items array and total integer",
+                    data,
+                )
             page_items = [item for item in data["items"] if isinstance(item, dict)]
             items.extend(page_items)
             total = int(data.get("total") or len(items))
@@ -561,21 +829,47 @@ class NewAPIProvider(ProviderClient):
         groups = self._request("GET", "/api/user/self/groups")
         raw_keys, raw_by_id = self._list_keys()
         if not isinstance(groups, dict):
-            raise ReconcileError("incomplete_scan", f"{self.provider_id} group inventory is invalid")
+            raise _schema_changed(
+                self.provider_id,
+                "/api/user/self/groups",
+                "object keyed by group name",
+                groups,
+            )
         resources: list[UpstreamResource] = []
+        subscription_allowlist = self.config.get("subscription_resource_allowlist")
+        allowed_subscription_resources = (
+            {str(value) for value in subscription_allowlist}
+            if isinstance(subscription_allowlist, list)
+            else None
+        )
         for name, metadata in groups.items():
             if not self.include_re.search(str(name)):
                 continue
             if not isinstance(metadata, dict) or "ratio" not in metadata:
-                raise ReconcileError("unclassified_group", f"{self.provider_id}/{name} has no ratio")
+                raise ReconcileError(
+                    "unclassified_group",
+                    f"{self.provider_id}/{name} has no authoritative ratio",
+                    next_action="leave routing unchanged and retry on the next scheduled scan",
+                    context={
+                        "provider_id": self.provider_id,
+                        "resource_id": f"group:{name}",
+                    },
+                )
             source_class = "subscription" if self.subscription_re.search(str(name)) else "metered"
+            resource_id = f"group:{name}"
+            if (
+                source_class == "subscription"
+                and allowed_subscription_resources is not None
+                and resource_id not in allowed_subscription_resources
+            ):
+                continue
             multiplier = None if source_class == "subscription" else decimal_value(
                 metadata["ratio"], field_name=f"{self.provider_id}/{name} multiplier"
             )
             resources.append(
                 UpstreamResource(
                     provider_id=self.provider_id,
-                    resource_id=f"group:{name}",
+                    resource_id=resource_id,
                     group_ref=str(name),
                     group_name=str(name),
                     source_class=source_class,
@@ -595,9 +889,9 @@ class NewAPIProvider(ProviderClient):
         ]
         return ProviderSnapshot(self.provider_id, resources, keys, raw_by_id)
 
-    def create_key(self, resource: UpstreamResource) -> UpstreamKey:
+    def _create_named_key(self, resource: UpstreamResource, *, name: str) -> UpstreamKey:
         payload = {
-            "name": resource.marker,
+            "name": name,
             "remain_quota": 0,
             "expired_time": -1,
             "unlimited_quota": True,
@@ -611,25 +905,31 @@ class NewAPIProvider(ProviderClient):
         if not isinstance(data, dict):
             # Some New-API forks return only success; resolve by stable marker.
             snapshot = self.scan()
-            matches = snapshot.keys_by_name(resource.marker)
+            matches = snapshot.keys_by_name(name)
             if len(matches) != 1:
                 raise ReconcileError("create_key_failed", f"{self.provider_id} created key cannot be resolved")
             return self.reveal_key(matches[0])
         key_id = data.get("id")
         if key_id is None:
             snapshot = self.scan()
-            matches = snapshot.keys_by_name(resource.marker)
+            matches = snapshot.keys_by_name(name)
             if len(matches) != 1:
                 raise ReconcileError("create_key_failed", f"{self.provider_id} created key cannot be resolved")
             return self.reveal_key(matches[0])
         key = UpstreamKey(
             id=str(key_id),
-            name=str(data.get("name") or resource.marker),
+            name=str(data.get("name") or name),
             group_ref=str(data.get("group") or resource.group_ref),
             status=str(data.get("status") or "1"),
             secret=self._inference_secret(str(data.get("key") or "")),
         )
         return self.reveal_key(key)
+
+    def create_key(self, resource: UpstreamResource) -> UpstreamKey:
+        return self._create_named_key(resource, name=resource.marker)
+
+    def create_probe_key(self, resource: UpstreamResource) -> UpstreamKey:
+        return self._create_named_key(resource, name=resource.probe_marker)
 
     @staticmethod
     def _inference_secret(secret: str) -> str:
@@ -664,6 +964,9 @@ class NewAPIProvider(ProviderClient):
 
     def enable_key(self, key: UpstreamKey) -> None:
         self._request("PUT", "/api/token/?status_only=true", body={"id": int(key.id), "status": 1})
+
+    def disable_key(self, key: UpstreamKey) -> None:
+        self._request("PUT", "/api/token/?status_only=true", body={"id": int(key.id), "status": 2})
 
     def delete_key(self, key_id: str) -> None:
         self._request("DELETE", f"/api/token/{key_id}/", allow_missing=True)

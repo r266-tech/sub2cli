@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
+import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,8 +30,10 @@ from .core import (
     assign_priorities,
     decimal_text,
     desired_metadata,
+    fingerprint_secret,
     marker_for,
     metadata_from_account,
+    probe_marker_for,
 )
 from .store import (
     append_audit,
@@ -54,6 +56,7 @@ class Inventory:
     target_accounts: list[dict[str, Any]]
     bindings: list[Binding]
     settings: dict[str, Any]
+    skipped_resources: list[dict[str, Any]] = dataclass_field(default_factory=list)
 
 
 def resource_state_id(provider_id: str, resource_id: str) -> str:
@@ -116,6 +119,51 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     if delete_grace_hours <= 0 or not math.isfinite(delete_grace_hours):
         raise ReconcileError("invalid_config", "delete_grace_hours must be finite and > 0")
+    notifications = config.get("notifications")
+    if notifications is not None:
+        if not isinstance(notifications, dict):
+            raise ReconcileError("invalid_config", "notifications must be an object")
+        command = notifications.get("telegram_command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(value, str) or not value for value in command)
+        ):
+            raise ReconcileError(
+                "invalid_config", "notifications.telegram_command must be a non-empty string list"
+            )
+        codes = notifications.get("error_codes")
+        if codes is not None and (
+            not isinstance(codes, list)
+            or not codes
+            or any(not isinstance(value, str) or not value for value in codes)
+        ):
+            raise ReconcileError(
+                "invalid_config", "notifications.error_codes must be a non-empty string list"
+            )
+        text_flag = notifications.get("telegram_text_flag", "--text")
+        if text_flag is not None and (
+            not isinstance(text_flag, str) or not text_flag
+        ):
+            raise ReconcileError(
+                "invalid_config",
+                "notifications.telegram_text_flag must be a non-empty string or null",
+            )
+        try:
+            dedupe_hours = float(notifications.get("dedupe_hours", 24))
+            timeout_seconds = float(notifications.get("timeout_seconds", 20))
+        except (TypeError, ValueError) as exc:
+            raise ReconcileError(
+                "invalid_config", "notification timing values must be numeric"
+            ) from exc
+        if not math.isfinite(dedupe_hours) or dedupe_hours < 1:
+            raise ReconcileError(
+                "invalid_config", "notifications.dedupe_hours must be at least 1"
+            )
+        if not math.isfinite(timeout_seconds) or not 1 <= timeout_seconds <= 120:
+            raise ReconcileError(
+                "invalid_config", "notifications.timeout_seconds must be between 1 and 120"
+            )
     seen: set[str] = set()
     for provider in providers:
         if not isinstance(provider, dict):
@@ -158,6 +206,82 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                 raise ReconcileError(
                     "invalid_config", f"{provider_id}.exclude_group_ids has an invalid id"
                 )
+        subscription_allowlist = provider.get("subscription_resource_allowlist")
+        if subscription_allowlist is None:
+            raise ReconcileError(
+                "invalid_config",
+                f"{provider_id}.subscription_resource_allowlist is required; use [] to reject all subscriptions",
+            )
+        if (
+            not isinstance(subscription_allowlist, list)
+            or any(
+                not isinstance(value, str) or not value.startswith("group:")
+                for value in subscription_allowlist
+            )
+            or len(set(subscription_allowlist)) != len(subscription_allowlist)
+        ):
+            raise ReconcileError(
+                "invalid_config",
+                f"{provider_id}.subscription_resource_allowlist must contain unique group:* strings",
+            )
+        if provider.get("type") == "new-api" and subscription_allowlist:
+            raise ReconcileError(
+                "invalid_config",
+                f"{provider_id} cannot enable subscriptions without an authoritative subscription status adapter",
+            )
+        if (
+            provider.get("type") == "sub2api"
+            and subscription_allowlist
+            and provider.get("require_subscription_expiry") is not True
+        ):
+            raise ReconcileError(
+                "invalid_config",
+                f"{provider_id}.require_subscription_expiry must be true when subscriptions are allowlisted",
+            )
+        if "require_subscription_expiry" in provider and (
+            provider.get("type") != "sub2api"
+            or not isinstance(provider.get("require_subscription_expiry"), bool)
+        ):
+            raise ReconcileError(
+                "invalid_config",
+                f"{provider_id}.require_subscription_expiry is supported only as a boolean for sub2api",
+            )
+        if "probe_new_resources" in provider and not isinstance(
+            provider.get("probe_new_resources"), bool
+        ):
+            raise ReconcileError(
+                "invalid_config", f"{provider_id}.probe_new_resources must be a boolean"
+            )
+        try:
+            probe_timeout = float(provider.get("probe_timeout_seconds", 30))
+        except (TypeError, ValueError) as exc:
+            raise ReconcileError(
+                "invalid_config", f"{provider_id}.probe_timeout_seconds must be a number"
+            ) from exc
+        if not math.isfinite(probe_timeout) or not 1 <= probe_timeout <= 120:
+            raise ReconcileError(
+                "invalid_config",
+                f"{provider_id}.probe_timeout_seconds must be between 1 and 120",
+            )
+        for regex_field in ("probe_model_allow_regex", "probe_model_deny_regex"):
+            if regex_field not in provider:
+                continue
+            try:
+                re.compile(str(provider[regex_field]))
+            except re.error as exc:
+                raise ReconcileError(
+                    "invalid_config", f"{provider_id}.{regex_field} is invalid"
+                ) from exc
+        preferred_models = provider.get("probe_preferred_models")
+        if preferred_models is not None and (
+            not isinstance(preferred_models, list)
+            or not preferred_models
+            or any(not isinstance(value, str) or not value.strip() for value in preferred_models)
+        ):
+            raise ReconcileError(
+                "invalid_config",
+                f"{provider_id}.probe_preferred_models must be a non-empty string list",
+            )
         adoption_resources: set[str] = set()
         for adoption in provider.get("adopt", []):
             if not isinstance(adoption, dict) or not adoption.get("resource_id"):
@@ -185,6 +309,113 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
 
 def _adoption_map(provider_config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(item["resource_id"]): item for item in provider_config.get("adopt", [])}
+
+
+def _probe_policy_hash(provider_config: dict[str, Any]) -> str:
+    payload = {
+        "policy": "codex-responses-sse-v1",
+        "inference_base": str(provider_config.get("inference_base") or "").rstrip("/"),
+        "allow": str(provider_config.get("probe_model_allow_regex") or r"^(?:gpt-|codex-)"),
+        "deny": str(
+            provider_config.get("probe_model_deny_regex")
+            or r"(?:^|[-_/])(?:audio|embedding|image|realtime|speech|transcribe|tts|video)(?:$|[-_/])"
+        ),
+        "preferred": provider_config.get("probe_preferred_models")
+        or ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3-codex-spark"],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _normalized_inference_base(provider_config: dict[str, Any]) -> str:
+    return str(provider_config.get("inference_base") or "").strip().rstrip("/")
+
+
+def _resource_is_grandfathered(
+    provider_config: dict[str, Any],
+    resource: UpstreamResource,
+    state: dict[str, Any],
+) -> bool:
+    if resource.resource_id in _adoption_map(provider_config):
+        return True
+    state_resources = state.get("resources")
+    entry = (
+        state_resources.get(resource_state_id(resource.provider_id, resource.resource_id))
+        if isinstance(state_resources, dict)
+        else None
+    )
+    return bool(
+        isinstance(entry, dict)
+        and entry.get("status") == "active"
+        and entry.get("upstream_key_id") is not None
+        and entry.get("target_account_id") is not None
+    )
+
+
+def _candidate_probe_record(state: dict[str, Any], state_id: str) -> dict[str, Any] | None:
+    records = state.get("candidate_probes")
+    value = records.get(state_id) if isinstance(records, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def _probe_record_matches_resource(
+    provider_config: dict[str, Any],
+    resource: UpstreamResource,
+    record: dict[str, Any],
+) -> bool:
+    return bool(
+        record.get("outcome") == "compatible"
+        and record.get("policy_hash") == _probe_policy_hash(provider_config)
+        and record.get("inference_base") == _normalized_inference_base(provider_config)
+        and str(record.get("group_ref") or "") == resource.group_ref
+        and record.get("marker") == resource.marker
+        and record.get("upstream_key_id") is not None
+        and isinstance(record.get("key_fingerprint"), str)
+        and bool(record.get("key_fingerprint"))
+    )
+
+
+def _probe_record_matches_live_key(
+    resource: UpstreamResource,
+    record: dict[str, Any],
+    snapshot: ProviderSnapshot,
+) -> bool:
+    key = snapshot.key_by_id(record.get("upstream_key_id"))
+    if (
+        key is None
+        or key.name != resource.marker
+        or key.group_ref != resource.group_ref
+        or key.status not in ("active", "1", "enabled")
+    ):
+        return False
+    secret = key.secret if key.secret and "*" not in key.secret else None
+    if not secret:
+        secret = keychain_get(_keychain_resource_account(resource), required=False)
+    if not secret:
+        return False
+    return fingerprint_secret(secret) == record.get("key_fingerprint")
+
+
+def _resource_probe_gate(
+    provider_config: dict[str, Any],
+    resource: UpstreamResource,
+    state: dict[str, Any],
+    *,
+    snapshot: ProviderSnapshot | None = None,
+) -> tuple[bool, str | None]:
+    if not provider_config.get("probe_new_resources", False):
+        return True, None
+    if _resource_is_grandfathered(provider_config, resource, state):
+        return True, None
+    state_id = resource_state_id(resource.provider_id, resource.resource_id)
+    record = _candidate_probe_record(state, state_id)
+    if record and _probe_record_matches_resource(provider_config, resource, record):
+        if snapshot is not None and not _probe_record_matches_live_key(
+            resource, record, snapshot
+        ):
+            return False, "probe_key_changed"
+        return True, None
+    return False, str((record or {}).get("code") or "probe_required")
 
 
 def _safe_setting_bool(settings: dict[str, Any], key: str) -> bool | None:
@@ -350,7 +581,592 @@ def _seed_inactive_adoptions(
         )
 
 
+def _single_named_key(
+    snapshot: ProviderSnapshot, name: str, *, label: str
+) -> UpstreamKey | None:
+    matches = snapshot.keys_by_name(name)
+    if len(matches) > 1:
+        raise ReconcileError(
+            "duplicate_probe_marker", f"multiple upstream keys use {label} marker"
+        )
+    return matches[0] if matches else None
+
+
+def _seed_candidate_probe_states(state: dict[str, Any]) -> None:
+    records = state.setdefault("candidate_probes", {})
+    state_resources = state.setdefault("resources", {})
+    if not isinstance(records, dict):
+        raise ReconcileError("invalid_local_state", "state.candidate_probes is invalid")
+    if not isinstance(state_resources, dict):
+        raise ReconcileError("invalid_local_state", "state.resources is invalid")
+    for state_id, record in records.items():
+        if state_id in state_resources or not isinstance(record, dict):
+            continue
+        provider_id = str(record.get("provider_id") or state_id.partition("/")[0])
+        resource_id = str(record.get("resource_id") or state_id.partition("/")[2])
+        key_id = record.get("upstream_key_id")
+        if not provider_id or not resource_id or key_id is None:
+            continue
+        compatible = record.get("outcome") == "compatible"
+        pending = record.get("outcome") == "pending"
+        marker = str(record.get("marker") or "")
+        if not marker:
+            marker = (
+                marker_for(provider_id, resource_id)
+                if compatible
+                else probe_marker_for(provider_id, resource_id)
+            )
+        state_resources[state_id] = {
+            "provider_id": provider_id,
+            "resource_id": resource_id,
+            "marker": marker,
+            "upstream_key_id": str(key_id),
+            "target_account_id": None,
+            "key_fingerprint": record.get("key_fingerprint"),
+            "source_class": "unknown_candidate",
+            "multiplier": None,
+            "priority": None,
+            "missing_since": None,
+            "missing_count": 0,
+            "status": (
+                "probe_compatible"
+                if compatible
+                else "probe_pending" if pending else "probe_deferred"
+            ),
+            "probe": dict(record),
+        }
+
+
+def _write_probe_pending_state(
+    records: dict[str, Any],
+    state_resources: dict[str, Any],
+    provider_config: dict[str, Any],
+    resource: UpstreamResource,
+    key: UpstreamKey,
+    *,
+    attempt_count: int,
+    attempted_at: str,
+) -> dict[str, Any]:
+    state_id = resource_state_id(resource.provider_id, resource.resource_id)
+    previous = state_resources.get(state_id)
+    previous = previous if isinstance(previous, dict) else {}
+    key_fingerprint = (
+        key.fingerprint if key.secret and "*" not in key.secret else None
+    )
+    record = {
+        "provider_id": resource.provider_id,
+        "resource_id": resource.resource_id,
+        "policy_hash": _probe_policy_hash(provider_config),
+        "inference_base": _normalized_inference_base(provider_config),
+        "outcome": "pending",
+        "code": "probe_pending",
+        "retryable": True,
+        "http_status": None,
+        "model": None,
+        "model_count": 0,
+        "upstream_key_id": key.id,
+        "key_fingerprint": key_fingerprint,
+        "group_ref": resource.group_ref,
+        "marker": key.name,
+        "probe_marker": resource.probe_marker,
+        "attempt_count": attempt_count,
+        "last_attempt_at": attempted_at,
+    }
+    records[state_id] = record
+    state_resources[state_id] = {
+        "provider_id": resource.provider_id,
+        "resource_id": resource.resource_id,
+        "marker": key.name,
+        "upstream_key_id": key.id,
+        "target_account_id": previous.get("target_account_id"),
+        "key_fingerprint": key_fingerprint,
+        "source_class": resource.source_class,
+        "multiplier": decimal_text(resource.multiplier),
+        "priority": previous.get("priority"),
+        "missing_since": None,
+        "missing_count": 0,
+        "status": "probe_pending",
+        "probe": dict(record),
+    }
+    return record
+
+
+def _pending_mutation_events(pending: dict[str, Any]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    chain = pending.get("recovery_chain")
+    if isinstance(chain, list):
+        for item in chain:
+            mutations = item.get("mutations") if isinstance(item, dict) else None
+            if isinstance(mutations, list):
+                events.extend(event for event in mutations if isinstance(event, dict))
+    mutations = pending.get("mutations")
+    if isinstance(mutations, list):
+        events.extend(event for event in mutations if isinstance(event, dict))
+    return events
+
+
+def _recover_pending_probe_keys(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    previous_pending: dict[str, Any] | None,
+    *,
+    audit_path: Path,
+    persist_state: Callable[[dict[str, Any]], None],
+) -> list[dict[str, Any]]:
+    if not isinstance(previous_pending, dict):
+        return []
+    state_resources = state.setdefault("resources", {})
+    records = state.setdefault("candidate_probes", {})
+    if not isinstance(state_resources, dict) or not isinstance(records, dict):
+        raise ReconcileError("invalid_local_state", "candidate recovery state is invalid")
+    provider_configs = {str(item["id"]): item for item in config["providers"]}
+    intents: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for event in _pending_mutation_events(previous_pending):
+        if event.get("phase") != "intent" or event.get("kind") != "create_probe_key":
+            continue
+        provider_id = str(event.get("provider_id") or "")
+        resource_id = str(event.get("resource_id") or "")
+        marker = str(event.get("marker") or "")
+        if (
+            provider_id not in provider_configs
+            or not resource_id.startswith("group:")
+            or marker != probe_marker_for(provider_id, resource_id)
+        ):
+            raise ReconcileError(
+                "invalid_pending_recovery",
+                "pending probe-key recovery intent is invalid",
+            )
+        intents[(provider_id, resource_id, marker)] = event
+    if not intents:
+        return []
+
+    snapshots: dict[str, ProviderSnapshot] = {}
+    recovered: list[dict[str, Any]] = []
+    for (provider_id, resource_id, marker), event in sorted(intents.items()):
+        provider_config = provider_configs[provider_id]
+        snapshot = snapshots.get(provider_id)
+        if snapshot is None:
+            snapshot = provider_from_config(provider_config).scan()
+            snapshots[provider_id] = snapshot
+        key = _single_named_key(snapshot, marker, label="recovery probe")
+        if key is None:
+            continue
+        group_ref = resource_id.removeprefix("group:")
+        if key.group_ref != group_ref:
+            raise ReconcileError(
+                "ownership_conflict",
+                f"recovered probe key {key.id} is bound to the wrong upstream group",
+            )
+        state_id = resource_state_id(provider_id, resource_id)
+        previous = state_resources.get(state_id)
+        previous = previous if isinstance(previous, dict) else {}
+        if (
+            str(previous.get("upstream_key_id") or "") == key.id
+            and previous.get("marker") == marker
+        ):
+            continue
+        resource = next(
+            (item for item in snapshot.resources if item.resource_id == resource_id),
+            None,
+        )
+        attempted_at = str(event.get("at") or utc_now())
+        if resource is not None:
+            record = _write_probe_pending_state(
+                records,
+                state_resources,
+                provider_config,
+                resource,
+                key,
+                attempt_count=0,
+                attempted_at=attempted_at,
+            )
+        else:
+            key_fingerprint = (
+                key.fingerprint if key.secret and "*" not in key.secret else None
+            )
+            record = {
+                "provider_id": provider_id,
+                "resource_id": resource_id,
+                "policy_hash": _probe_policy_hash(provider_config),
+                "inference_base": _normalized_inference_base(provider_config),
+                "outcome": "pending",
+                "code": "probe_recovery_pending",
+                "retryable": True,
+                "http_status": None,
+                "model": None,
+                "model_count": 0,
+                "upstream_key_id": key.id,
+                "key_fingerprint": key_fingerprint,
+                "group_ref": group_ref,
+                "marker": marker,
+                "probe_marker": marker,
+                "attempt_count": 0,
+                "last_attempt_at": attempted_at,
+            }
+            records[state_id] = record
+            state_resources[state_id] = {
+                "provider_id": provider_id,
+                "resource_id": resource_id,
+                "marker": marker,
+                "upstream_key_id": key.id,
+                "target_account_id": previous.get("target_account_id"),
+                "key_fingerprint": key_fingerprint,
+                "source_class": previous.get("source_class", "unknown_candidate"),
+                "multiplier": previous.get("multiplier"),
+                "priority": previous.get("priority"),
+                "missing_since": None,
+                "missing_count": 0,
+                "status": "probe_pending",
+                "probe": dict(record),
+            }
+        persist_state(state)
+        safe_result = {
+            "provider_id": provider_id,
+            "resource_id": resource_id,
+            "upstream_key_id": key.id,
+            "group_present": resource is not None,
+        }
+        recovered.append(safe_result)
+        append_audit(
+            audit_path,
+            {"event": "candidate_probe_key_recovered", **safe_result},
+        )
+    return recovered
+
+
+def _write_candidate_resource_state(
+    state_resources: dict[str, Any],
+    resource: UpstreamResource,
+    key: UpstreamKey,
+    record: dict[str, Any],
+    *,
+    compatible: bool,
+) -> None:
+    state_id = resource_state_id(resource.provider_id, resource.resource_id)
+    previous = state_resources.get(state_id)
+    previous = previous if isinstance(previous, dict) else {}
+    state_resources[state_id] = {
+        "provider_id": resource.provider_id,
+        "resource_id": resource.resource_id,
+        "marker": key.name,
+        "upstream_key_id": key.id,
+        "target_account_id": previous.get("target_account_id"),
+        "key_fingerprint": key.fingerprint,
+        "source_class": resource.source_class,
+        "multiplier": decimal_text(resource.multiplier),
+        "priority": previous.get("priority"),
+        "missing_since": None,
+        "missing_count": 0,
+        "status": "probe_compatible" if compatible else "probe_deferred",
+        "probe": dict(record),
+    }
+
+
+def _qualify_pending_resources(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    audit_path: Path,
+    record_mutation: Callable[[dict[str, Any]], None] | None = None,
+    persist_state: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
+    record_mutation = record_mutation or (lambda _event: None)
+    persist_state = persist_state or (lambda _state: None)
+    _seed_candidate_probe_states(state)
+    records = state.setdefault("candidate_probes", {})
+    if not isinstance(records, dict):
+        raise ReconcileError("invalid_local_state", "state.candidate_probes is invalid")
+    state_resources = state.get("resources")
+    if not isinstance(state_resources, dict):
+        raise ReconcileError("invalid_local_state", "state.resources is invalid")
+    results: list[dict[str, Any]] = []
+    for provider_config in config["providers"]:
+        if not provider_config.get("probe_new_resources", False):
+            continue
+        client = provider_from_config(provider_config)
+        snapshot = client.scan()
+        policy_hash = _probe_policy_hash(provider_config)
+        for resource in snapshot.resources:
+            state_id = resource_state_id(resource.provider_id, resource.resource_id)
+            if _resource_is_grandfathered(provider_config, resource, state):
+                records.pop(state_id, None)
+                continue
+            cached = _candidate_probe_record(state, state_id)
+            formal_key = _single_named_key(
+                snapshot, resource.marker, label="managed"
+            )
+            probe_key = _single_named_key(
+                snapshot, resource.probe_marker, label="probe"
+            )
+            if formal_key is not None and probe_key is not None:
+                # An interrupted prior promotion can leave only one official
+                # key; an extra probe marker is ours and has never reached Relay.
+                record_mutation(
+                    {
+                        "phase": "intent",
+                        "kind": "delete_probe_key",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "upstream_key_id": probe_key.id,
+                    }
+                )
+                client.delete_key(probe_key.id)
+                record_mutation(
+                    {
+                        "phase": "done",
+                        "kind": "delete_probe_key",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "upstream_key_id": probe_key.id,
+                    }
+                )
+                probe_key = None
+            qualified, _ = _resource_probe_gate(
+                provider_config,
+                resource,
+                state,
+                snapshot=snapshot,
+            )
+            if qualified:
+                continue
+            key = formal_key or probe_key
+            created_key = False
+            enabled_key = False
+            if key is None:
+                record_mutation(
+                    {
+                        "phase": "intent",
+                        "kind": "create_probe_key",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "marker": resource.probe_marker,
+                    }
+                )
+                key = client.create_probe_key(resource)
+                created_key = True
+            elif key.status not in ("active", "1", "enabled"):
+                record_mutation(
+                    {
+                        "phase": "intent",
+                        "kind": "enable_probe_key",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "upstream_key_id": key.id,
+                    }
+                )
+                client.enable_key(key)
+                key.status = "active"
+                enabled_key = True
+
+            previous_attempts = int((cached or {}).get("attempt_count") or 0)
+            attempt_count = previous_attempts + 1
+            attempted_at = utc_now()
+            # State is the cleanup handle if the group disappears. Persist it
+            # before recording a completed create/enable mutation.
+            pending_record = _write_probe_pending_state(
+                records,
+                state_resources,
+                provider_config,
+                resource,
+                key,
+                attempt_count=attempt_count,
+                attempted_at=attempted_at,
+            )
+            persist_state(state)
+
+            if created_key:
+                record_mutation(
+                    {
+                        "phase": "done",
+                        "kind": "create_probe_key",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "marker": resource.probe_marker,
+                        "upstream_key_id": key.id,
+                    }
+                )
+            elif enabled_key:
+                record_mutation(
+                    {
+                        "phase": "done",
+                        "kind": "enable_probe_key",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "upstream_key_id": key.id,
+                    }
+                )
+
+            revealed_key = False
+            if not key.secret or "*" in key.secret:
+                cached_secret = keychain_get(
+                    _keychain_resource_account(resource), required=False
+                )
+                if (
+                    cached_secret
+                    and cached
+                    and str(cached.get("upstream_key_id") or "") == key.id
+                    and cached.get("key_fingerprint")
+                    == fingerprint_secret(cached_secret)
+                ):
+                    key = UpstreamKey(
+                        key.id,
+                        key.name,
+                        key.group_ref,
+                        key.status,
+                        cached_secret,
+                    )
+                else:
+                    record_mutation(
+                        {
+                            "phase": "intent",
+                            "kind": "reveal_probe_key",
+                            "provider_id": resource.provider_id,
+                            "resource_id": resource.resource_id,
+                            "upstream_key_id": key.id,
+                        }
+                    )
+                    key = client.reveal_key(key)
+                    revealed_key = True
+            keychain_set(_keychain_resource_account(resource), key.secret)
+            # Bind the recovered secret to this exact key before any probe can
+            # fail, without ever persisting the secret itself.
+            if (
+                key.secret
+                and "*" not in key.secret
+                and pending_record.get("key_fingerprint") != key.fingerprint
+            ):
+                pending_record = _write_probe_pending_state(
+                    records,
+                    state_resources,
+                    provider_config,
+                    resource,
+                    key,
+                    attempt_count=attempt_count,
+                    attempted_at=attempted_at,
+                )
+                persist_state(state)
+            if revealed_key:
+                record_mutation(
+                    {
+                        "phase": "done",
+                        "kind": "reveal_probe_key",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "upstream_key_id": key.id,
+                    }
+                )
+
+            record_mutation(
+                {
+                    "phase": "intent",
+                    "kind": "probe_upstream_resource",
+                    "provider_id": resource.provider_id,
+                    "resource_id": resource.resource_id,
+                    "upstream_key_id": key.id,
+                }
+            )
+            probe = client.probe_resource(resource, key)
+            record_mutation(
+                {
+                    "phase": "done",
+                    "kind": "probe_upstream_resource",
+                    "provider_id": resource.provider_id,
+                    "resource_id": resource.resource_id,
+                    "upstream_key_id": key.id,
+                    "compatible": probe.compatible,
+                    "code": probe.code,
+                }
+            )
+            if probe.compatible:
+                if key.name != resource.marker:
+                    record_mutation(
+                        {
+                            "phase": "intent",
+                            "kind": "promote_probe_key",
+                            "provider_id": resource.provider_id,
+                            "resource_id": resource.resource_id,
+                            "upstream_key_id": key.id,
+                            "to": resource.marker,
+                        }
+                    )
+                    client.rename_key(key, resource.marker)
+                    key.name = resource.marker
+                    record_mutation(
+                        {
+                            "phase": "done",
+                            "kind": "promote_probe_key",
+                            "provider_id": resource.provider_id,
+                            "resource_id": resource.resource_id,
+                            "upstream_key_id": key.id,
+                            "to": resource.marker,
+                        }
+                    )
+            else:
+                record_mutation(
+                    {
+                        "phase": "intent",
+                        "kind": "disable_probe_key",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "upstream_key_id": key.id,
+                    }
+                )
+                client.disable_key(key)
+                key.status = "inactive"
+                record_mutation(
+                    {
+                        "phase": "done",
+                        "kind": "disable_probe_key",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "upstream_key_id": key.id,
+                    }
+                )
+            record = {
+                "provider_id": resource.provider_id,
+                "resource_id": resource.resource_id,
+                "policy_hash": policy_hash,
+                "inference_base": _normalized_inference_base(provider_config),
+                "outcome": "compatible" if probe.compatible else "retry",
+                "code": probe.code,
+                "retryable": probe.retryable,
+                "http_status": probe.http_status,
+                "model": probe.model,
+                "model_count": probe.model_count,
+                "upstream_key_id": key.id,
+                "key_fingerprint": key.fingerprint,
+                "group_ref": resource.group_ref,
+                "marker": key.name,
+                "probe_marker": resource.probe_marker,
+                "attempt_count": attempt_count,
+                "last_attempt_at": utc_now(),
+            }
+            records[state_id] = record
+            _write_candidate_resource_state(
+                state_resources,
+                resource,
+                key,
+                record,
+                compatible=probe.compatible,
+            )
+            safe_result = {
+                "provider_id": resource.provider_id,
+                "resource_id": resource.resource_id,
+                **probe.safe_dict(),
+            }
+            results.append(safe_result)
+            append_audit(
+                audit_path,
+                {
+                    "event": "candidate_probe_completed",
+                    **safe_result,
+                },
+            )
+    return results
+
+
 def build_inventory(config: dict[str, Any], state: dict[str, Any]) -> Inventory:
+    _seed_candidate_probe_states(state)
     target = TargetSub2API(config["target"])
     settings = _validate_target(config, target)
     target_accounts = target.list_accounts()
@@ -360,6 +1176,7 @@ def build_inventory(config: dict[str, Any], state: dict[str, Any]) -> Inventory:
     providers: dict[str, ProviderClient] = {}
     snapshots: dict[str, ProviderSnapshot] = {}
     resources: list[UpstreamResource] = []
+    skipped_resources: list[dict[str, Any]] = []
     provider_configs = {str(item["id"]): item for item in config["providers"]}
     state_resources = state.setdefault("resources", {})
     if not isinstance(state_resources, dict):
@@ -373,7 +1190,29 @@ def build_inventory(config: dict[str, Any], state: dict[str, Any]) -> Inventory:
         _seed_inactive_adoptions(provider_config, snapshot, accounts_by_id, state_resources)
         adoption_map = _adoption_map(provider_config)
         for resource in snapshot.resources:
-            entry = state_resources.get(resource_state_id(resource.provider_id, resource.resource_id))
+            state_id = resource_state_id(resource.provider_id, resource.resource_id)
+            entry = state_resources.get(state_id)
+            qualified, reason = _resource_probe_gate(
+                provider_config,
+                resource,
+                state,
+                snapshot=snapshot,
+            )
+            if not qualified:
+                skipped_resources.append(
+                    {
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "group_name": resource.group_name,
+                        "reason": reason,
+                        "target_account_id": (
+                            entry.get("target_account_id")
+                            if isinstance(entry, dict)
+                            else None
+                        ),
+                    }
+                )
+                continue
             adoption = adoption_map.get(resource.resource_id)
             resource.key = _choose_key(resource, snapshot, adoption, entry)
             if resource.key:
@@ -402,7 +1241,10 @@ def build_inventory(config: dict[str, Any], state: dict[str, Any]) -> Inventory:
                     resource.key = client.reveal_key(resource.key)
             resources.append(resource)
 
-    resources = assign_priorities(resources)
+    if resources:
+        resources = assign_priorities(resources)
+    elif not skipped_resources and not state_resources:
+        resources = assign_priorities(resources)
     bindings: list[Binding] = []
     for resource in resources:
         provider_config = provider_configs[resource.provider_id]
@@ -412,7 +1254,15 @@ def build_inventory(config: dict[str, Any], state: dict[str, Any]) -> Inventory:
             resource, accounts_by_id, managed_accounts, adoption, entry
         )
         bindings.append(Binding(resource, account, adopted=adopted))
-    return Inventory(providers, snapshots, target, target_accounts, bindings, settings)
+    return Inventory(
+        providers,
+        snapshots,
+        target,
+        target_accounts,
+        bindings,
+        settings,
+        skipped_resources,
+    )
 
 
 def _missing_delete_eligible(
@@ -517,6 +1367,44 @@ def _action_plan(
         if account.get("schedulable") is False:
             actions.append(Action("enable_target_account", resource.provider_id, resource.resource_id, {"account_id": account_id}))
 
+    accounts_by_id = {
+        int(item["id"]): item
+        for item in inventory.target_accounts
+        if item.get("id") is not None
+    }
+    for skipped in inventory.skipped_resources:
+        provider_id = str(skipped.get("provider_id") or "")
+        resource_id = str(skipped.get("resource_id") or "")
+        state_id = resource_state_id(provider_id, resource_id)
+        current_ids.add(state_id)
+        entry = state_resources.get(state_id)
+        account_id = (
+            entry.get("target_account_id") if isinstance(entry, dict) else None
+        )
+        actions.append(
+            Action(
+                "defer_probe_resource",
+                provider_id,
+                resource_id,
+                {
+                    "reason": skipped.get("reason"),
+                    "account_id": account_id,
+                },
+            )
+        )
+        account = (
+            accounts_by_id.get(int(account_id)) if account_id is not None else None
+        )
+        if account is not None and account.get("schedulable") is not False:
+            actions.append(
+                Action(
+                    "disable_target_account_probe_deferred",
+                    provider_id,
+                    resource_id,
+                    {"account_id": int(account_id)},
+                )
+            )
+
     for state_id, entry in state_resources.items():
         if state_id in current_ids or not isinstance(entry, dict):
             continue
@@ -555,6 +1443,7 @@ def _action_plan(
 def _observed_hash(inventory: Inventory) -> str:
     payload = {
         "resources": [binding.resource.safe_dict() for binding in inventory.bindings],
+        "skipped_resources": inventory.skipped_resources,
         "targets": [
             {
                 "id": binding.target_account_id,
@@ -576,12 +1465,14 @@ def build_plan(config: dict[str, Any], state: dict[str, Any]) -> tuple[dict[str,
         "schema": 1,
         "observed_hash": _observed_hash(inventory),
         "resources": [binding.resource.safe_dict() | {"target_account_id": binding.target_account_id} for binding in inventory.bindings],
+        "skipped_resources": inventory.skipped_resources,
         "actions": [action.safe_dict() for action in actions],
         "summary": {
             "providers": len(inventory.providers),
             "resources": len(inventory.bindings),
             "subscriptions": sum(1 for item in inventory.bindings if item.resource.source_class == "subscription"),
             "metered": sum(1 for item in inventory.bindings if item.resource.source_class == "metered"),
+            "probe_deferred": len(inventory.skipped_resources),
             "actions": len(actions),
         },
     }
@@ -630,6 +1521,35 @@ def _restore_target_routing(target: TargetSub2API, snapshot: dict[str, Any]) -> 
                 target.set_schedulable(account_id, bool(account["schedulable"]))
         except Exception:
             failed.append(int(account.get("id") or 0))
+    return failed
+
+
+def _quarantine_probe_deferred_accounts(
+    target: TargetSub2API, state: dict[str, Any]
+) -> list[int]:
+    resources = state.get("resources")
+    if not isinstance(resources, dict):
+        return [-1]
+    failed: list[int] = []
+    seen: set[int] = set()
+    for entry in resources.values():
+        if not isinstance(entry, dict) or entry.get("status") != "probe_deferred":
+            continue
+        account_id = entry.get("target_account_id")
+        if account_id is None:
+            continue
+        try:
+            normalized_id = int(account_id)
+        except (TypeError, ValueError):
+            failed.append(-1)
+            continue
+        if normalized_id in seen:
+            continue
+        seen.add(normalized_id)
+        try:
+            target.set_schedulable(normalized_id, False)
+        except Exception:
+            failed.append(normalized_id)
     return failed
 
 
@@ -697,6 +1617,9 @@ def _apply_active_resources(
     state_resources = state.setdefault("resources", {})
     if not isinstance(state_resources, dict):
         raise ReconcileError("invalid_local_state", "state.resources is invalid")
+    candidate_records = state.setdefault("candidate_probes", {})
+    if not isinstance(candidate_records, dict):
+        raise ReconcileError("invalid_local_state", "state.candidate_probes is invalid")
 
     # Phase 1: establish stable upstream ownership and secret custody.
     for binding in inventory.bindings:
@@ -891,6 +1814,12 @@ def _apply_active_resources(
                 }
             )
         _write_resource_state(state_resources, binding, account_id)
+        candidate_records.pop(
+            resource_state_id(
+                binding.resource.provider_id, binding.resource.resource_id
+            ),
+            None,
+        )
 
 
 def _parse_when(value: str | None) -> datetime | None:
@@ -900,6 +1829,63 @@ def _parse_when(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
     except ValueError:
         return None
+
+
+def _apply_probe_deferred_resources(
+    inventory: Inventory,
+    state: dict[str, Any],
+    *,
+    record_mutation: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    record = record_mutation or (lambda _event: None)
+    state_resources = state.setdefault("resources", {})
+    if not isinstance(state_resources, dict):
+        raise ReconcileError("invalid_local_state", "state.resources is invalid")
+    accounts_by_id = {
+        int(item["id"]): item
+        for item in inventory.target_accounts
+        if item.get("id") is not None
+    }
+    for skipped in inventory.skipped_resources:
+        provider_id = str(skipped.get("provider_id") or "")
+        resource_id = str(skipped.get("resource_id") or "")
+        state_id = resource_state_id(provider_id, resource_id)
+        entry = state_resources.get(state_id)
+        if not isinstance(entry, dict):
+            continue
+        entry["status"] = "probe_deferred"
+        entry["missing_since"] = None
+        entry["missing_count"] = 0
+        account_id = entry.get("target_account_id")
+        account = (
+            accounts_by_id.get(int(account_id)) if account_id is not None else None
+        )
+        if account is None or account.get("schedulable") is False:
+            continue
+        record(
+            {
+                "phase": "intent",
+                "kind": "set_target_schedulable",
+                "provider_id": provider_id,
+                "resource_id": resource_id,
+                "target_account_id": int(account_id),
+                "schedulable": False,
+                "reason": "probe_deferred",
+            }
+        )
+        inventory.target.set_schedulable(int(account_id), False)
+        account["schedulable"] = False
+        record(
+            {
+                "phase": "done",
+                "kind": "set_target_schedulable",
+                "provider_id": provider_id,
+                "resource_id": resource_id,
+                "target_account_id": int(account_id),
+                "schedulable": False,
+                "reason": "probe_deferred",
+            }
+        )
 
 
 def _apply_missing_resources(
@@ -917,7 +1903,17 @@ def _apply_missing_resources(
         resource_state_id(binding.resource.provider_id, binding.resource.resource_id)
         for binding in inventory.bindings
     }
+    current.update(
+        resource_state_id(
+            str(item.get("provider_id") or ""),
+            str(item.get("resource_id") or ""),
+        )
+        for item in inventory.skipped_resources
+    )
     state_resources = state.setdefault("resources", {})
+    candidate_records = state.setdefault("candidate_probes", {})
+    if not isinstance(candidate_records, dict):
+        raise ReconcileError("invalid_local_state", "state.candidate_probes is invalid")
     now = datetime.now(UTC)
     accounts_by_id = {
         int(item["id"]): item
@@ -993,6 +1989,7 @@ def _apply_missing_resources(
             if current_key is None:
                 entry["upstream_key_deleted_at"] = now.isoformat()
                 entry["status"] = "upstream_key_deleted_target_retained"
+                candidate_records.pop(state_id, None)
                 record(
                     {
                         "phase": "done",
@@ -1013,6 +2010,7 @@ def _apply_missing_resources(
             provider.delete_key(str(key_id))
             entry["upstream_key_deleted_at"] = now.isoformat()
             entry["status"] = "upstream_key_deleted_target_retained"
+            candidate_records.pop(state_id, None)
             record(
                 {
                     "phase": "done",
@@ -1052,6 +2050,48 @@ def _verify_active(config: dict[str, Any], state: dict[str, Any]) -> None:
             )
 
 
+def _prequalification_context(
+    config: dict[str, Any], state: dict[str, Any]
+) -> tuple[dict[str, Any], Inventory]:
+    target = TargetSub2API(config["target"])
+    settings = _validate_target(config, target)
+    target_accounts = target.list_accounts()
+    state_digest = hashlib.sha256(
+        json.dumps(
+            state,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    plan = {
+        "schema": 1,
+        "phase": "candidate_qualification",
+        "observed_hash": state_digest,
+        "resources": [],
+        "skipped_resources": [],
+        "actions": [],
+        "summary": {
+            "providers": len(config["providers"]),
+            "resources": 0,
+            "subscriptions": 0,
+            "metered": 0,
+            "probe_deferred": 0,
+            "actions": 0,
+        },
+    }
+    inventory = Inventory(
+        providers={},
+        snapshots={},
+        target=target,
+        target_accounts=target_accounts,
+        bindings=[],
+        settings=settings,
+        skipped_resources=[],
+    )
+    return plan, inventory
+
+
 def reconcile_plan(config_path: Path | None = None) -> dict[str, Any]:
     config = load_config(config_path)
     state_dir = default_state_dir()
@@ -1062,7 +2102,60 @@ def reconcile_plan(config_path: Path | None = None) -> dict[str, Any]:
     return plan
 
 
-def reconcile_apply(config_path: Path | None = None) -> dict[str, Any]:
+def _assert_maintenance_safe_plan(
+    plan: dict[str, Any],
+    *,
+    min_active_resources: int,
+) -> None:
+    actions = plan.get("actions")
+    resources = plan.get("resources")
+    if not isinstance(actions, list) or not isinstance(resources, list):
+        raise ReconcileError(
+            "maintenance_plan_unsafe",
+            "maintenance apply produced an invalid plan",
+        )
+    kinds = {
+        str(item.get("kind"))
+        for item in actions
+        if isinstance(item, dict) and item.get("kind")
+    }
+    if (
+        "delete_upstream_key" in kinds
+        or "confirm_upstream_key_absent" in kinds
+        or any(kind.startswith("quarantine") for kind in kinds)
+        or len(resources) < min_active_resources
+    ):
+        raise ReconcileError(
+            "maintenance_plan_unsafe",
+            "maintenance apply plan violates the non-destructive resource floor",
+            context={
+                "active_resource_floor": min_active_resources,
+                "planned_resources": len(resources),
+            },
+        )
+
+
+def reconcile_apply(
+    config_path: Path | None = None,
+    *,
+    maintenance_safe: bool = False,
+    min_active_resources: int | None = None,
+) -> dict[str, Any]:
+    if maintenance_safe:
+        if (
+            isinstance(min_active_resources, bool)
+            or not isinstance(min_active_resources, int)
+            or min_active_resources < 0
+        ):
+            raise ReconcileError(
+                "invalid_maintenance_guard",
+                "maintenance-safe apply requires a non-negative active resource floor",
+            )
+    elif min_active_resources is not None:
+        raise ReconcileError(
+            "invalid_maintenance_guard",
+            "active resource floor requires maintenance-safe apply",
+        )
     config = load_config(config_path)
     state_dir = default_state_dir()
     state_path = state_dir / "state.json"
@@ -1073,7 +2166,8 @@ def reconcile_apply(config_path: Path | None = None) -> dict[str, Any]:
         state = load_json(state_path, {"schema": 1, "resources": {}})
         if not isinstance(state, dict):
             raise ReconcileError("invalid_local_state", "state root is invalid")
-        plan, inventory = build_plan(config, state)
+        plan, inventory = _prequalification_context(config, state)
+        probe_results: list[dict[str, Any]] = []
         run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
         snapshot_path = snapshots_dir / f"{run_id}.json"
         snapshot = _snapshot_payload(inventory, state, plan)
@@ -1106,6 +2200,56 @@ def reconcile_apply(config_path: Path | None = None) -> dict[str, Any]:
 
         append_audit(audit_path, {"event": "run_started", "run_id": run_id, "plan": plan})
         try:
+            recovered_probe_keys = _recover_pending_probe_keys(
+                config,
+                state,
+                previous_pending if isinstance(previous_pending, dict) else None,
+                audit_path=audit_path,
+                persist_state=lambda current_state: atomic_write_json(
+                    state_path, current_state
+                ),
+            )
+            if recovered_probe_keys:
+                pending["recovered_probe_keys"] = recovered_probe_keys
+                atomic_write_json(pending_path, pending)
+            probe_results = _qualify_pending_resources(
+                config,
+                state,
+                audit_path=audit_path,
+                record_mutation=record_mutation,
+                persist_state=lambda current_state: atomic_write_json(
+                    state_path, current_state
+                ),
+            )
+            # Candidate state is a durable observation and recovery handle. It is
+            # intentionally persisted before target routing starts.
+            atomic_write_json(state_path, state)
+            plan, inventory = build_plan(config, state)
+            if maintenance_safe:
+                assert min_active_resources is not None
+                _assert_maintenance_safe_plan(
+                    plan,
+                    min_active_resources=min_active_resources,
+                )
+            pending["plan"] = plan
+            pending["qualification"] = {
+                "attempted": len(probe_results),
+                "compatible": sum(
+                    1 for item in probe_results if item.get("compatible") is True
+                ),
+                "deferred": sum(
+                    1 for item in probe_results if item.get("compatible") is not True
+                ),
+            }
+            atomic_write_json(pending_path, pending)
+            append_audit(
+                audit_path,
+                {
+                    "event": "candidate_qualification_completed",
+                    "run_id": run_id,
+                    **pending["qualification"],
+                },
+            )
             planned_deletions = {
                 resource_state_id(str(item["provider_id"]), str(item["resource_id"])): str(
                     item["kind"]
@@ -1113,6 +2257,11 @@ def reconcile_apply(config_path: Path | None = None) -> dict[str, Any]:
                 for item in plan["actions"]
                 if item["kind"] in ("delete_upstream_key", "confirm_upstream_key_absent")
             }
+            _apply_probe_deferred_resources(
+                inventory,
+                state,
+                record_mutation=record_mutation,
+            )
             # Remove confirmed-inactive resources from scheduling before any tier
             # compaction can temporarily place a more expensive route alongside them.
             _apply_missing_resources(
@@ -1144,6 +2293,15 @@ def reconcile_apply(config_path: Path | None = None) -> dict[str, Any]:
                 "completed_at": utc_now(),
                 "observed_hash": plan["observed_hash"],
                 "actions": len(plan["actions"]),
+                "probes": {
+                    "attempted": len(probe_results),
+                    "compatible": sum(
+                        1 for item in probe_results if item.get("compatible") is True
+                    ),
+                    "deferred": sum(
+                        1 for item in probe_results if item.get("compatible") is not True
+                    ),
+                },
                 "snapshot": str(snapshot_path),
             }
             atomic_write_json(state_path, state)
@@ -1158,17 +2316,33 @@ def reconcile_apply(config_path: Path | None = None) -> dict[str, Any]:
             )
             pending_path.unlink(missing_ok=True)
         except Exception as exc:
+            cause_code = str(getattr(exc, "code", "unexpected_error"))
+            cause_context = getattr(exc, "context", {})
+            if not isinstance(cause_context, dict):
+                cause_context = {}
             failed_restore = _quarantine_new_managed_accounts(inventory.target, snapshot)
             failed_restore.extend(_restore_target_routing(inventory.target, snapshot))
+            failed_restore.extend(
+                _quarantine_probe_deferred_accounts(inventory.target, state)
+            )
+            if (
+                maintenance_safe
+                and cause_code == "maintenance_plan_unsafe"
+                and not pending["mutations"]
+                and not failed_restore
+            ):
+                pending_path.unlink(missing_ok=True)
             append_audit(
                 audit_path,
                 {
                     "event": "run_failed",
                     "run_id": run_id,
                     "error_type": type(exc).__name__,
-                    "error_code": getattr(exc, "code", "unexpected_error"),
+                    "error_code": cause_code,
                     "routing_restore_failed_ids": failed_restore,
-                    "pending_recovery": str(pending_path),
+                    "pending_recovery": (
+                        str(pending_path) if pending_path.exists() else None
+                    ),
                     "mutation_count": len(pending["mutations"]),
                     "snapshot": str(snapshot_path),
                 },
@@ -1178,12 +2352,14 @@ def reconcile_apply(config_path: Path | None = None) -> dict[str, Any]:
                     "degraded_rollback",
                     "reconciliation failed and one or more target routing rows could not be restored",
                     next_action=f"inspect snapshot {snapshot_path}",
+                    context={"cause_code": cause_code, **cause_context},
                 ) from exc
             if pending["mutations"]:
                 raise ReconcileError(
                     "partial_external_mutation",
                     "reconciliation stopped after one or more durable mutations; the next run will recover from managed markers",
                     next_action=f"inspect {pending_path}, then rerun apply",
+                    context={"cause_code": cause_code, **cause_context},
                 ) from exc
             raise
     return {
@@ -1191,6 +2367,16 @@ def reconcile_apply(config_path: Path | None = None) -> dict[str, Any]:
         "run_id": run_id,
         "actions": len(plan["actions"]),
         "resources": len(plan["resources"]),
+        "probes": {
+            "attempted": len(probe_results),
+            "compatible": sum(
+                1 for item in probe_results if item.get("compatible") is True
+            ),
+            "deferred": sum(
+                1 for item in probe_results if item.get("compatible") is not True
+            ),
+            "results": probe_results,
+        },
         "snapshot": str(snapshot_path),
     }
 

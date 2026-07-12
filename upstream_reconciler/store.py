@@ -165,10 +165,18 @@ def keychain_get(account: str, *, required: bool = True) -> str | None:
     if status == 0:
         return value
     if required:
+        context: dict[str, str] = {}
+        if account.startswith("provider:"):
+            parts = account.split(":", 2)
+            if len(parts) >= 2 and parts[1]:
+                context["provider_id"] = parts[1]
+        elif account.startswith("target:"):
+            context["provider_id"] = "target"
         raise ReconcileError(
             "credential_missing",
             f"local credential {account} is not enrolled",
             next_action="run enroll-edge while the target sites are logged in in Edge",
+            context=context,
         )
     return None
 

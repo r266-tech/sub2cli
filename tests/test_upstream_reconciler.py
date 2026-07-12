@@ -14,7 +14,6 @@ from unittest import mock
 from upstream_reconciler.clients import NewAPIProvider, ProviderSnapshot, Sub2APIProvider
 from upstream_reconciler.core import (
     METADATA_KEY,
-    Action,
     Binding,
     ReconcileError,
     UpstreamKey,
@@ -22,20 +21,30 @@ from upstream_reconciler.core import (
     assign_priorities,
     decimal_text,
     desired_metadata,
+    fingerprint_secret,
     marker_for,
     redact,
 )
+from upstream_reconciler.probe import ProbeResult, probe_codex_responses, select_codex_model
+from upstream_reconciler.notify import notify_reconcile_error
 from upstream_reconciler.runtime import (
     Inventory,
+    _assert_maintenance_safe_plan,
     _action_plan,
     _apply_active_resources,
     _apply_missing_resources,
+    _apply_probe_deferred_resources,
     _choose_key,
     _choose_target_account,
+    _probe_policy_hash,
+    _qualify_pending_resources,
+    _recover_pending_probe_keys,
+    _resource_probe_gate,
     _seed_inactive_adoptions,
+    reconcile_apply,
     validate_config,
 )
-from upstream_reconciler.store import atomic_write_json
+from upstream_reconciler.store import atomic_write_json, keychain_get
 
 
 def resource(
@@ -221,6 +230,166 @@ class ProviderNormalizationTests(unittest.TestCase):
         self.assertEqual([item.resource_id for item in snapshot.resources], ["group:1"])
         self.assertEqual(snapshot.resources[0].source_class, "subscription")
 
+    def test_sub2api_subscription_allowlist_rejects_unapproved_subscription(self) -> None:
+        config = {
+            "id": "subscription-site",
+            "type": "sub2api",
+            "api_base": "https://example.test/api/v1",
+            "include_platform": "openai",
+            "subscription_resource_allowlist": ["group:1"],
+            "require_subscription_expiry": True,
+            "adopt": [],
+        }
+        client = Sub2APIProvider(config)
+        groups = [
+            {
+                "id": 1,
+                "name": "approved",
+                "status": "active",
+                "platform": "openai",
+                "subscription_type": "subscription",
+                "rate_multiplier": 1,
+            },
+            {
+                "id": 2,
+                "name": "future-unapproved",
+                "status": "active",
+                "platform": "openai",
+                "subscription_type": "subscription",
+                "rate_multiplier": 1,
+            },
+        ]
+        active = [
+            {
+                "group_id": 1,
+                "status": "active",
+                "starts_at": "2026-01-01T00:00:00Z",
+                "expires_at": "2027-01-01T00:00:00Z",
+            },
+            {
+                "group_id": 2,
+                "status": "active",
+                "starts_at": "2026-01-01T00:00:00Z",
+                "expires_at": "not-a-time",
+            },
+        ]
+        with mock.patch.object(
+            client, "_request", side_effect=[groups, active, {}]
+        ), mock.patch.object(client, "_list_keys", return_value=([], {})), mock.patch(
+            "upstream_reconciler.clients._utc_now",
+            return_value=datetime(2026, 7, 12, tzinfo=UTC),
+        ):
+            snapshot = client.scan()
+        self.assertEqual([item.resource_id for item in snapshot.resources], ["group:1"])
+
+    def test_sub2api_expired_allowlisted_subscription_is_not_managed(self) -> None:
+        config = {
+            "id": "subscription-site",
+            "type": "sub2api",
+            "api_base": "https://example.test/api/v1",
+            "include_platform": "openai",
+            "subscription_resource_allowlist": ["group:1"],
+            "require_subscription_expiry": True,
+            "adopt": [],
+        }
+        client = Sub2APIProvider(config)
+        groups = [
+            {
+                "id": 1,
+                "name": "expired",
+                "status": "active",
+                "platform": "openai",
+                "subscription_type": "subscription",
+                "rate_multiplier": 1,
+            }
+        ]
+        active = [
+            {
+                "group_id": 1,
+                "status": "active",
+                "starts_at": "2026-01-01T00:00:00Z",
+                "expires_at": "2026-07-11T23:59:59Z",
+            }
+        ]
+        with mock.patch.object(
+            client, "_request", side_effect=[groups, active, {}]
+        ), mock.patch.object(client, "_list_keys", return_value=([], {})), mock.patch(
+            "upstream_reconciler.clients._utc_now",
+            return_value=datetime(2026, 7, 12, tzinfo=UTC),
+        ):
+            snapshot = client.scan()
+        self.assertEqual(snapshot.resources, [])
+
+    def test_allowlisted_subscription_type_drift_does_not_become_metered(self) -> None:
+        config = {
+            "id": "subscription-site",
+            "type": "sub2api",
+            "api_base": "https://example.test/api/v1",
+            "include_platform": "openai",
+            "subscription_resource_allowlist": ["group:1"],
+            "require_subscription_expiry": True,
+            "adopt": [],
+        }
+        client = Sub2APIProvider(config)
+        groups = [
+            {
+                "id": 1,
+                "name": "used-to-be-subscription",
+                "status": "active",
+                "platform": "openai",
+                "subscription_type": "standard",
+                "rate_multiplier": 0.22,
+            },
+            {
+                "id": 2,
+                "name": "ordinary-metered",
+                "status": "active",
+                "platform": "openai",
+                "subscription_type": "standard",
+                "rate_multiplier": 0.08,
+            },
+        ]
+        with mock.patch.object(
+            client, "_request", side_effect=[groups, [], {}]
+        ), mock.patch.object(client, "_list_keys", return_value=([], {})):
+            snapshot = client.scan()
+        self.assertEqual([item.resource_id for item in snapshot.resources], ["group:2"])
+
+    def test_allowlisted_subscription_rejects_timezone_less_expiry(self) -> None:
+        config = {
+            "id": "subscription-site",
+            "type": "sub2api",
+            "api_base": "https://example.test/api/v1",
+            "include_platform": "openai",
+            "subscription_resource_allowlist": ["group:1"],
+            "require_subscription_expiry": True,
+            "adopt": [],
+        }
+        client = Sub2APIProvider(config)
+        groups = [
+            {
+                "id": 1,
+                "name": "approved",
+                "status": "active",
+                "platform": "openai",
+                "subscription_type": "subscription",
+                "rate_multiplier": 1,
+            }
+        ]
+        active = [
+            {
+                "group_id": 1,
+                "status": "active",
+                "starts_at": "2026-01-01T00:00:00Z",
+                "expires_at": "2027-01-01T00:00:00",
+            }
+        ]
+        with mock.patch.object(
+            client, "_request", side_effect=[groups, active, {}]
+        ), mock.patch.object(client, "_list_keys", return_value=([], {})):
+            with self.assertRaisesRegex(ReconcileError, "timezone"):
+                client.scan()
+
     def test_sub2api_excluded_group_ids_are_not_managed(self) -> None:
         config = {
             "id": "filtered-site",
@@ -274,10 +443,105 @@ class ProviderNormalizationTests(unittest.TestCase):
             snapshot = client.scan()
         self.assertEqual({item.group_ref for item in snapshot.resources}, {"gpt-low", "特惠分组"})
 
+    def test_single_unclassified_group_does_not_trigger_schema_repair(self) -> None:
+        client = NewAPIProvider(
+            {
+                "id": "new",
+                "type": "new-api",
+                "api_base": "https://example.test",
+                "include_group_regex": "^gpt",
+            }
+        )
+        groups = {"gpt-low": {"renamed_ratio": "sensitive-value"}}
+        with mock.patch.object(client, "_request", return_value=groups), mock.patch.object(
+            client, "_list_keys", return_value=([], {})
+        ):
+            with self.assertRaises(ReconcileError) as raised:
+                client.scan()
+        self.assertEqual(raised.exception.code, "unclassified_group")
+        self.assertNotIn("schema_fingerprint", raised.exception.context)
+
+    def test_root_shape_change_reports_only_sanitized_fingerprint(self) -> None:
+        client = NewAPIProvider(
+            {
+                "id": "new",
+                "type": "new-api",
+                "api_base": "https://example.test",
+                "include_group_regex": "^gpt",
+            }
+        )
+        with mock.patch.object(client, "_request", return_value=[{"secret": "value"}]), mock.patch.object(
+            client, "_list_keys", return_value=([], {})
+        ):
+            with self.assertRaises(ReconcileError) as raised:
+                client.scan()
+        self.assertEqual(raised.exception.code, "schema_changed")
+        rendered = json.dumps(raised.exception.context)
+        self.assertIn("schema_fingerprint", rendered)
+        self.assertNotIn("value", rendered)
+
+    def test_non_delete_not_found_is_not_classified_as_schema_change(self) -> None:
+        response = SimpleNamespace(
+            status_code=404,
+            headers={},
+            request=SimpleNamespace(method="GET"),
+            url="https://example.test/api/test",
+            content=b"{}",
+        )
+        clients = [
+            Sub2APIProvider(
+                {
+                    "id": "sub",
+                    "type": "sub2api",
+                    "api_base": "https://example.test/api/v1",
+                }
+            ),
+            NewAPIProvider(
+                {
+                    "id": "new",
+                    "type": "new-api",
+                    "api_base": "https://example.test",
+                    "include_group_regex": "^gpt",
+                }
+            ),
+        ]
+        for client in clients:
+            with self.subTest(client=type(client).__name__), mock.patch.object(
+                client, "_headers", return_value={}
+            ), mock.patch.object(client.session, "request", return_value=response):
+                with self.assertRaises(ReconcileError) as raised:
+                    client._request("GET", "/api/test")
+            self.assertEqual(raised.exception.code, "http_error")
+
     def test_newapi_normalizes_management_token_for_inference(self) -> None:
         self.assertEqual(NewAPIProvider._inference_secret("a" * 48), "sk-" + "a" * 48)
         self.assertEqual(NewAPIProvider._inference_secret("sk-abc"), "sk-abc")
         self.assertEqual(NewAPIProvider._inference_secret("abc***xyz"), "abc***xyz")
+
+    def test_sub2api_probe_creation_uses_stable_idempotency_key(self) -> None:
+        client = Sub2APIProvider(
+            {
+                "id": "sub",
+                "type": "sub2api",
+                "api_base": "https://example.test/api/v1",
+            }
+        )
+        item = resource("sub", "group:9", "metered", "0.05")
+        with mock.patch.object(
+            client,
+            "_request",
+            return_value={
+                "id": 7,
+                "name": item.probe_marker,
+                "group_id": 9,
+                "status": "active",
+                "key": "sk-probe",
+            },
+        ) as request:
+            client.create_probe_key(item)
+            client.create_probe_key(item)
+        keys = [call.kwargs["idempotency_key"] for call in request.call_args_list]
+        self.assertEqual(keys, [f"probe-{item.probe_marker}"] * 2)
 
     def test_provider_deletes_treat_not_found_as_already_deleted(self) -> None:
         response = SimpleNamespace(
@@ -340,6 +604,131 @@ class ProviderNormalizationTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         sleep.assert_called_once()
 
+
+class CapabilityProbeTests(unittest.TestCase):
+    @staticmethod
+    def response(
+        *,
+        status: int = 200,
+        url: str,
+        payload: object | None = None,
+        content_type: str = "application/json",
+        lines: list[bytes] | None = None,
+    ) -> SimpleNamespace:
+        encoded = json.dumps(payload or {}).encode("utf-8")
+        return SimpleNamespace(
+            status_code=status,
+            url=url,
+            is_redirect=False,
+            headers={"Content-Type": content_type},
+            content=encoded,
+            json=lambda: payload or {},
+            iter_lines=lambda decode_unicode=False: iter(lines or []),
+        )
+
+    def test_model_selection_excludes_non_text_gpt_variants(self) -> None:
+        model, count = select_codex_model(
+            ["glm-5", "gpt-image-2", "gpt-4o-audio-preview", "gpt-5.6-sol"]
+        )
+        self.assertEqual(model, "gpt-5.6-sol")
+        self.assertEqual(count, 1)
+
+    def test_probe_rejects_group_without_codex_models_before_inference(self) -> None:
+        session = mock.Mock()
+        session.get.return_value = self.response(
+            url="https://example.test/v1/models",
+            payload={"data": [{"id": "glm-5"}]},
+        )
+        result = probe_codex_responses(
+            "https://example.test/v1", "sk-probe", session=session
+        )
+        self.assertFalse(result.compatible)
+        self.assertEqual(result.code, "probe_no_codex_model")
+        session.post.assert_not_called()
+
+    def test_probe_requires_real_responses_stream_success(self) -> None:
+        session = mock.Mock()
+        session.get.return_value = self.response(
+            url="https://example.test/v1/models",
+            payload={"data": [{"id": "gpt-5.6-sol"}]},
+        )
+        session.post.return_value = self.response(
+            url="https://example.test/v1/responses",
+            payload={},
+            content_type="text/event-stream",
+            lines=[
+                b'data: {"type":"response.completed","response":{"status":"completed"}}',
+                b"data: [DONE]",
+            ],
+        )
+        result = probe_codex_responses(
+            "https://example.test/v1", "sk-probe", session=session
+        )
+        self.assertTrue(result.compatible)
+        self.assertEqual(result.model, "gpt-5.6-sol")
+        session.post.assert_called_once()
+
+    def test_probe_rejects_failed_completed_terminal_event(self) -> None:
+        session = mock.Mock()
+        session.get.return_value = self.response(
+            url="https://example.test/v1/models",
+            payload={"data": [{"id": "gpt-5.6-sol"}]},
+        )
+        session.post.return_value = self.response(
+            url="https://example.test/v1/responses",
+            payload={},
+            content_type="text/event-stream",
+            lines=[
+                b'data: {"type":"response.completed","response":{"status":"failed","error":{"code":"bad"}}}',
+                b"data: [DONE]",
+            ],
+        )
+        result = probe_codex_responses(
+            "https://example.test/v1", "sk-probe", session=session
+        )
+        self.assertFalse(result.compatible)
+        self.assertEqual(result.code, "probe_invalid_responses_protocol")
+
+    def test_probe_rejects_failure_after_an_apparent_success_event(self) -> None:
+        session = mock.Mock()
+        session.get.return_value = self.response(
+            url="https://example.test/v1/models",
+            payload={"data": [{"id": "gpt-5.6-sol"}]},
+        )
+        session.post.return_value = self.response(
+            url="https://example.test/v1/responses",
+            payload={},
+            content_type="text/event-stream",
+            lines=[
+                b'data: {"type":"response.completed","response":{"status":"completed"}}',
+                b'event: response.failed',
+                b'data: {"type":"response.failed","response":{"status":"failed"}}',
+            ],
+        )
+        result = probe_codex_responses(
+            "https://example.test/v1", "sk-probe", session=session
+        )
+        self.assertFalse(result.compatible)
+        self.assertEqual(result.code, "probe_invalid_responses_protocol")
+
+    def test_probe_rate_limit_is_retryable_and_not_compatible(self) -> None:
+        session = mock.Mock()
+        session.get.return_value = self.response(
+            url="https://example.test/v1/models",
+            payload={"data": [{"id": "gpt-5.6-sol"}]},
+        )
+        session.post.return_value = self.response(
+            status=429,
+            url="https://example.test/v1/responses",
+            payload={"error": {"message": "quota"}},
+        )
+        result = probe_codex_responses(
+            "https://example.test/v1", "sk-probe", session=session
+        )
+        self.assertFalse(result.compatible)
+        self.assertTrue(result.retryable)
+        self.assertEqual(result.http_status, 429)
+
     def test_sub2api_refresh_falls_back_to_stored_api_login(self) -> None:
         client = Sub2APIProvider(
             {
@@ -362,6 +751,61 @@ class ProviderNormalizationTests(unittest.TestCase):
         ), mock.patch.object(client, "_login_from_keychain") as login:
             client._refresh()
         login.assert_called_once_with()
+
+    def test_sub2api_invalid_refresh_payload_falls_back_to_stored_api_login(self) -> None:
+        client = Sub2APIProvider(
+            {
+                "id": "sub",
+                "type": "sub2api",
+                "api_base": "https://example.test/api/v1",
+            }
+        )
+        malformed = SimpleNamespace(
+            status_code=200,
+            headers={},
+            request=SimpleNamespace(method="POST"),
+            url="https://example.test/api/v1/auth/refresh",
+            content=b'{"success":true,"data":{}}',
+            json=lambda: {"success": True, "data": {}},
+        )
+        with mock.patch(
+            "upstream_reconciler.clients.keychain_get", return_value="stale-refresh"
+        ), mock.patch.object(
+            client.session, "post", return_value=malformed
+        ), mock.patch.object(client, "_login_from_keychain") as login:
+            client._refresh()
+        login.assert_called_once_with()
+
+    def test_sub2api_forbidden_session_refreshes_and_retries(self) -> None:
+        client = Sub2APIProvider(
+            {
+                "id": "sub",
+                "type": "sub2api",
+                "api_base": "https://example.test/api/v1",
+            }
+        )
+        forbidden = SimpleNamespace(
+            status_code=403,
+            headers={},
+            request=SimpleNamespace(method="GET"),
+            url="https://example.test/api/v1/groups/available",
+            content=b"{}",
+        )
+        success = SimpleNamespace(
+            status_code=200,
+            headers={},
+            request=SimpleNamespace(method="GET"),
+            url="https://example.test/api/v1/groups/available",
+            content=b'{"data":[]}',
+            json=lambda: {"data": []},
+        )
+        with mock.patch.object(client, "_headers", return_value={}), mock.patch.object(
+            client, "_refresh"
+        ) as refresh, mock.patch.object(
+            client.session, "request", side_effect=[forbidden, success]
+        ):
+            self.assertEqual(client._request("GET", "/groups/available"), [])
+        refresh.assert_called_once_with()
 
     def test_newapi_expired_session_reauthenticates_and_retries(self) -> None:
         client = NewAPIProvider(
@@ -396,8 +840,732 @@ class ProviderNormalizationTests(unittest.TestCase):
         login.assert_called_once_with()
         self.assertEqual(request.call_count, 2)
 
+    def test_login_rejection_is_classified_as_interactive_auth(self) -> None:
+        client = Sub2APIProvider(
+            {
+                "id": "sub",
+                "type": "sub2api",
+                "api_base": "https://example.test/api/v1",
+            }
+        )
+        rejected = SimpleNamespace(
+            status_code=400,
+            request=SimpleNamespace(method="POST"),
+            url="https://example.test/api/v1/auth/login",
+            content=b"{}",
+        )
+        with mock.patch.object(client.session, "post", return_value=rejected):
+            with self.assertRaises(ReconcileError) as raised:
+                client.login_with_credentials("account", "password")
+        self.assertEqual(raised.exception.code, "interactive_auth_required")
+        self.assertEqual(raised.exception.context, {"provider_id": "sub"})
+
+    def test_newapi_non_json_login_is_classified_as_interactive_auth(self) -> None:
+        client = NewAPIProvider(
+            {
+                "id": "new",
+                "type": "new-api",
+                "api_base": "https://example.test",
+                "include_group_regex": "^gpt",
+            }
+        )
+        captcha = SimpleNamespace(
+            status_code=200,
+            request=SimpleNamespace(method="POST"),
+            url="https://example.test/api/user/login",
+            content=b"<html>captcha</html>",
+            json=mock.Mock(side_effect=ValueError("not json")),
+        )
+        with mock.patch.object(client.session, "post", return_value=captcha):
+            with self.assertRaises(ReconcileError) as raised:
+                client.login_with_credentials("account", "password")
+        self.assertEqual(raised.exception.code, "interactive_auth_required")
+        self.assertEqual(raised.exception.context, {"provider_id": "new"})
+
+
+class NotificationTests(unittest.TestCase):
+    def test_auth_notification_is_sent_once_and_deduplicated(self) -> None:
+        error = ReconcileError(
+            "interactive_auth_required",
+            "safe",
+            context={"provider_id": "code-plan"},
+        )
+        runner = mock.Mock(
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            atomic_write_json(
+                config_path,
+                {
+                    "notifications": {
+                        "telegram_command": ["python3", "notify.py"],
+                        "telegram_text_flag": None,
+                        "error_codes": ["interactive_auth_required"],
+                        "dedupe_hours": 24,
+                    }
+                },
+            )
+            now = datetime(2026, 7, 12, tzinfo=UTC)
+            first = notify_reconcile_error(
+                error,
+                config_path=config_path,
+                state_dir=root / "state",
+                now=now,
+                runner=runner,
+            )
+            second = notify_reconcile_error(
+                error,
+                config_path=config_path,
+                state_dir=root / "state",
+                now=now + timedelta(hours=1),
+                runner=runner,
+            )
+            stored = (root / "state" / "notification-state.json").read_text()
+        self.assertEqual(first["status"], "sent")
+        self.assertEqual(second["status"], "deduplicated")
+        runner.assert_called_once()
+        self.assertNotIn("--text", runner.call_args.args[0])
+        self.assertNotIn("password", stored)
+        self.assertNotIn("code-plan", stored)
+
+    def test_non_auth_error_does_not_send_notification(self) -> None:
+        runner = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            atomic_write_json(
+                config_path,
+                {
+                    "notifications": {
+                        "telegram_command": ["python3", "notify.py"],
+                        "error_codes": ["auth_required"],
+                    }
+                },
+            )
+            result = notify_reconcile_error(
+                ReconcileError("rate_limited", "safe"),
+                config_path=config_path,
+                state_dir=root / "state",
+                runner=runner,
+            )
+        self.assertEqual(result["status"], "not_applicable")
+        runner.assert_not_called()
+
+    def test_wrapped_partial_mutation_preserves_auth_notification(self) -> None:
+        runner = mock.Mock(
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+        )
+        error = ReconcileError(
+            "partial_external_mutation",
+            "safe",
+            context={
+                "cause_code": "interactive_auth_required",
+                "provider_id": "yjy",
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            atomic_write_json(
+                config_path,
+                {
+                    "notifications": {
+                        "telegram_command": ["notify"],
+                        "error_codes": ["interactive_auth_required"],
+                    }
+                },
+            )
+            result = notify_reconcile_error(
+                error,
+                config_path=config_path,
+                state_dir=root / "state",
+                runner=runner,
+            )
+        self.assertEqual(result["status"], "sent")
+        self.assertIn("interactive_auth_required", runner.call_args.args[0][-1])
+
 
 class PlanTests(unittest.TestCase):
+    def test_create_intent_recovers_orphan_probe_key_after_group_disappears(self) -> None:
+        item = resource("a", "group:new", "metered", "0.05")
+        key = UpstreamKey("7", item.probe_marker, "new", "inactive", "sk-***")
+        provider = mock.Mock()
+        provider.scan.return_value = ProviderSnapshot(
+            "a", [], [key], {"7": {}}
+        )
+        config = {
+            "providers": [
+                {
+                    "id": "a",
+                    "type": "sub2api",
+                    "inference_base": "https://a.example/v1",
+                    "probe_new_resources": True,
+                    "adopt": [],
+                }
+            ]
+        }
+        previous_pending = {
+            "schema": 1,
+            "run_id": "interrupted-2",
+            "recovery_chain": [
+                {
+                    "run_id": "interrupted-1",
+                    "mutations": [
+                        {
+                            "at": "2026-07-12T00:00:00+00:00",
+                            "phase": "intent",
+                            "kind": "create_probe_key",
+                            "provider_id": "a",
+                            "resource_id": "group:new",
+                            "marker": item.probe_marker,
+                        }
+                    ],
+                }
+            ],
+            "mutations": [],
+        }
+        state = {
+            "schema": 1,
+            "resources": {
+                "a/group:new": {
+                    "provider_id": "a",
+                    "resource_id": "group:new",
+                    "marker": item.probe_marker,
+                    "upstream_key_id": "6",
+                    "target_account_id": None,
+                    "status": "upstream_key_deleted_target_retained",
+                }
+            },
+            "candidate_probes": {
+                "a/group:new": {
+                    "outcome": "retry",
+                    "upstream_key_id": "6",
+                }
+            },
+        }
+        persisted: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "upstream_reconciler.runtime.provider_from_config",
+            return_value=provider,
+        ):
+            recovered = _recover_pending_probe_keys(
+                config,
+                state,
+                previous_pending,
+                audit_path=Path(tmp) / "audit.jsonl",
+                persist_state=lambda value: persisted.append(
+                    json.loads(json.dumps(value))
+                ),
+            )
+        self.assertEqual(
+            recovered,
+            [
+                {
+                    "provider_id": "a",
+                    "resource_id": "group:new",
+                    "upstream_key_id": "7",
+                    "group_present": False,
+                }
+            ],
+        )
+        entry = state["resources"]["a/group:new"]
+        self.assertEqual(entry["status"], "probe_pending")
+        self.assertEqual(entry["upstream_key_id"], "7")
+        self.assertEqual(entry["marker"], item.probe_marker)
+        self.assertEqual(
+            state["candidate_probes"]["a/group:new"]["code"],
+            "probe_recovery_pending",
+        )
+        self.assertEqual(len(persisted), 1)
+        provider.delete_key.assert_not_called()
+        provider.create_probe_key.assert_not_called()
+
+    def test_maintenance_safe_plan_rejects_fresh_destructive_drift(self) -> None:
+        with self.assertRaises(ReconcileError) as destructive:
+            _assert_maintenance_safe_plan(
+                {
+                    "resources": [{}, {}],
+                    "actions": [{"kind": "quarantine_missing_resource"}],
+                },
+                min_active_resources=2,
+            )
+        self.assertEqual(destructive.exception.code, "maintenance_plan_unsafe")
+
+        with self.assertRaises(ReconcileError) as reduced:
+            _assert_maintenance_safe_plan(
+                {"resources": [{}], "actions": []},
+                min_active_resources=2,
+            )
+        self.assertEqual(reduced.exception.code, "maintenance_plan_unsafe")
+
+    def test_maintenance_safe_apply_checks_locked_plan_before_target_writes(self) -> None:
+        target = mock.Mock()
+        target.list_accounts.return_value = []
+        inventory = Inventory({}, {}, target, [], [], {})
+        initial_plan = {
+            "schema": 1,
+            "phase": "candidate_qualification",
+            "observed_hash": "baseline",
+            "resources": [],
+            "skipped_resources": [],
+            "actions": [],
+            "summary": {},
+        }
+        unsafe_plan = {
+            "schema": 1,
+            "observed_hash": "fresh",
+            "resources": [{}],
+            "skipped_resources": [],
+            "actions": [{"kind": "delete_upstream_key"}],
+            "summary": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            with mock.patch(
+                "upstream_reconciler.runtime.load_config",
+                return_value={"providers": []},
+            ), mock.patch(
+                "upstream_reconciler.runtime.default_state_dir", return_value=state_dir
+            ), mock.patch(
+                "upstream_reconciler.runtime._prequalification_context",
+                return_value=(initial_plan, inventory),
+            ), mock.patch(
+                "upstream_reconciler.runtime._qualify_pending_resources",
+                return_value=[],
+            ), mock.patch(
+                "upstream_reconciler.runtime.build_plan",
+                return_value=(unsafe_plan, inventory),
+            ):
+                with self.assertRaises(ReconcileError) as raised:
+                    reconcile_apply(
+                        maintenance_safe=True,
+                        min_active_resources=2,
+                    )
+            self.assertFalse((state_dir / "pending-run.json").exists())
+        self.assertEqual(raised.exception.code, "maintenance_plan_unsafe")
+        target.create_account.assert_not_called()
+        target.bulk_update.assert_not_called()
+        target.set_schedulable.assert_not_called()
+
+    def test_probe_crash_is_journaled_and_provisional_state_is_durable(self) -> None:
+        item = resource("a", "group:new", "metered", "0.05")
+        key = UpstreamKey("7", item.probe_marker, "new", "active", "sk-probe")
+        provider = mock.Mock()
+        provider.provider_id = "a"
+        provider.scan.return_value = ProviderSnapshot("a", [item], [], {})
+        provider.create_probe_key.return_value = key
+        provider.probe_resource.side_effect = RuntimeError("simulated crash")
+        target = mock.Mock()
+        target.list_accounts.return_value = []
+        pre_plan = {
+            "schema": 1,
+            "phase": "candidate_qualification",
+            "observed_hash": "baseline",
+            "resources": [],
+            "skipped_resources": [],
+            "actions": [],
+            "summary": {
+                "providers": 1,
+                "resources": 0,
+                "subscriptions": 0,
+                "metered": 0,
+                "probe_deferred": 0,
+                "actions": 0,
+            },
+        }
+        pre_inventory = Inventory({}, {}, target, [], [], {})
+        config = {
+            "providers": [
+                {
+                    "id": "a",
+                    "type": "sub2api",
+                    "inference_base": "https://a.example/v1",
+                    "probe_new_resources": True,
+                    "adopt": [],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            with mock.patch(
+                "upstream_reconciler.runtime.load_config", return_value=config
+            ), mock.patch(
+                "upstream_reconciler.runtime.default_state_dir", return_value=state_dir
+            ), mock.patch(
+                "upstream_reconciler.runtime._prequalification_context",
+                return_value=(pre_plan, pre_inventory),
+            ), mock.patch(
+                "upstream_reconciler.runtime.provider_from_config",
+                return_value=provider,
+            ), mock.patch("upstream_reconciler.runtime.keychain_set"):
+                with self.assertRaises(ReconcileError) as raised:
+                    reconcile_apply()
+
+            pending = json.loads((state_dir / "pending-run.json").read_text())
+            durable = json.loads((state_dir / "state.json").read_text())
+        self.assertEqual(raised.exception.code, "partial_external_mutation")
+        sequence = [
+            (event["phase"], event["kind"])
+            for event in pending["mutations"]
+        ]
+        self.assertEqual(
+            sequence,
+            [
+                ("intent", "create_probe_key"),
+                ("done", "create_probe_key"),
+                ("intent", "probe_upstream_resource"),
+            ],
+        )
+        rendered = json.dumps(pending)
+        self.assertNotIn("sk-probe", rendered)
+        self.assertEqual(
+            durable["candidate_probes"]["a/group:new"]["outcome"], "pending"
+        )
+        self.assertEqual(
+            durable["resources"]["a/group:new"]["status"], "probe_pending"
+        )
+        target.create_account.assert_not_called()
+
+    def test_observed_deferred_candidate_is_not_treated_as_missing(self) -> None:
+        state_id = "a/group:new"
+        entry = {
+            "provider_id": "a",
+            "resource_id": "group:new",
+            "marker": marker_for("a", "group:new"),
+            "upstream_key_id": "7",
+            "target_account_id": 9,
+            "missing_count": 5,
+            "missing_since": (datetime.now(UTC) - timedelta(hours=30)).isoformat(),
+            "status": "probe_deferred",
+        }
+        account = {"id": 9, "schedulable": True}
+        target = mock.Mock()
+        provider = mock.Mock()
+        inventory = Inventory(
+            providers={"a": provider},
+            snapshots={"a": ProviderSnapshot("a", [], [])},
+            target=target,
+            target_accounts=[account],
+            bindings=[],
+            settings={},
+            skipped_resources=[
+                {
+                    "provider_id": "a",
+                    "resource_id": "group:new",
+                    "reason": "probe_no_codex_model",
+                    "target_account_id": 9,
+                }
+            ],
+        )
+        state = {"resources": {state_id: entry}, "candidate_probes": {}}
+        actions = _action_plan(
+            inventory,
+            state,
+            {
+                "delete_upstream_keys": True,
+                "delete_grace_hours": 24,
+                "delete_min_confirmations": 3,
+            },
+        )
+        self.assertNotIn(
+            "quarantine_missing_resource", [item.kind for item in actions]
+        )
+        self.assertNotIn("delete_upstream_key", [item.kind for item in actions])
+
+        _apply_probe_deferred_resources(inventory, state)
+        _apply_missing_resources(
+            {
+                "delete_upstream_keys": True,
+                "delete_grace_hours": 24,
+                "delete_min_confirmations": 3,
+            },
+            inventory,
+            state,
+        )
+        self.assertEqual(entry["missing_count"], 0)
+        self.assertIsNone(entry["missing_since"])
+        self.assertEqual(entry["status"], "probe_deferred")
+        target.set_schedulable.assert_called_once_with(9, False)
+        provider.delete_key.assert_not_called()
+
+    def test_stale_compatible_record_cannot_pass_live_key_validation(self) -> None:
+        item = resource("a", "group:new", "metered", "0.05")
+        provider_config = {
+            "id": "a",
+            "inference_base": "https://a.example/v1",
+            "probe_new_resources": True,
+            "adopt": [],
+        }
+        state = {
+            "resources": {
+                "a/group:new": {
+                    "provider_id": "a",
+                    "resource_id": "group:new",
+                    "status": "probe_compatible",
+                    "target_account_id": None,
+                    "upstream_key_id": "7",
+                }
+            },
+            "candidate_probes": {
+                "a/group:new": {
+                    "provider_id": "a",
+                    "resource_id": "group:new",
+                    "outcome": "compatible",
+                    "policy_hash": _probe_policy_hash(provider_config),
+                    "inference_base": "https://a.example/v1",
+                    "group_ref": "new",
+                    "marker": item.marker,
+                    "upstream_key_id": "7",
+                    "key_fingerprint": fingerprint_secret("sk-old"),
+                }
+            },
+        }
+        snapshot = ProviderSnapshot(
+            "a",
+            [item],
+            [UpstreamKey("7", item.marker, "new", "active", "sk-replaced")],
+        )
+        allowed, reason = _resource_probe_gate(
+            provider_config,
+            item,
+            state,
+            snapshot=snapshot,
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "probe_key_changed")
+
+    def test_masked_probe_key_is_revealed_once_then_reused_from_keychain(self) -> None:
+        item = resource("a", "group:new", "metered", "0.05")
+        masked_probe = UpstreamKey("7", item.probe_marker, "new", "active", "sk-***")
+        masked_formal = UpstreamKey("7", item.marker, "new", "active", "sk-***")
+        provider = mock.Mock()
+        provider.provider_id = "a"
+        provider.scan.side_effect = [
+            ProviderSnapshot("a", [item], [masked_probe], {"7": {}}),
+            ProviderSnapshot("a", [item], [masked_formal], {"7": {}}),
+        ]
+        provider.reveal_key.return_value = UpstreamKey(
+            "7", item.probe_marker, "new", "active", "sk-full-probe"
+        )
+        provider.probe_resource.return_value = ProbeResult(
+            True,
+            "compatible",
+            False,
+            http_status=200,
+            model="gpt-5.6-sol",
+            model_count=1,
+        )
+        config = {
+            "providers": [
+                {
+                    "id": "a",
+                    "type": "sub2api",
+                    "inference_base": "https://a.example/v1",
+                    "probe_new_resources": True,
+                    "adopt": [],
+                }
+            ]
+        }
+        state = {"schema": 1, "resources": {}}
+        vault: dict[str, str] = {}
+
+        def fake_get(account: str, *, required: bool = True) -> str | None:
+            value = vault.get(account)
+            if value is None and required:
+                raise AssertionError(f"unexpected required Keychain read: {account}")
+            return value
+
+        def fake_set(account: str, value: str) -> None:
+            vault[account] = value
+
+        events: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "upstream_reconciler.runtime.provider_from_config",
+            return_value=provider,
+        ), mock.patch(
+            "upstream_reconciler.runtime.keychain_get", side_effect=fake_get
+        ), mock.patch(
+            "upstream_reconciler.runtime.keychain_set", side_effect=fake_set
+        ):
+            first = _qualify_pending_resources(
+                config,
+                state,
+                audit_path=Path(tmp) / "audit.jsonl",
+                record_mutation=events.append,
+            )
+            second = _qualify_pending_resources(
+                config,
+                state,
+                audit_path=Path(tmp) / "audit.jsonl",
+                record_mutation=events.append,
+            )
+        self.assertEqual([item["compatible"] for item in first], [True])
+        self.assertEqual(second, [])
+        provider.reveal_key.assert_called_once()
+        provider.probe_resource.assert_called_once()
+        provider.rename_key.assert_called_once()
+        provider.create_probe_key.assert_not_called()
+        self.assertEqual(
+            state["candidate_probes"]["a/group:new"]["attempt_count"], 1
+        )
+        self.assertEqual(
+            [event["kind"] for event in events].count("reveal_probe_key"), 2
+        )
+
+    def test_disappeared_candidate_cleans_only_owned_probe_key_after_grace(self) -> None:
+        item = resource("a", "group:new", "metered", "0.05")
+        probe_key = UpstreamKey("7", item.probe_marker, "new", "inactive", "sk-probe")
+        unrelated = UpstreamKey("8", "personal", "other", "active", "sk-other")
+        provider = mock.Mock()
+        provider.scan.return_value = ProviderSnapshot(
+            "a", [], [probe_key, unrelated], {"7": {}, "8": {}}
+        )
+        inventory = Inventory(
+            providers={"a": provider},
+            snapshots={
+                "a": ProviderSnapshot(
+                    "a", [], [probe_key, unrelated], {"7": {}, "8": {}}
+                )
+            },
+            target=mock.Mock(),
+            target_accounts=[],
+            bindings=[],
+            settings={},
+        )
+        state_id = "a/group:new"
+        state = {
+            "resources": {
+                state_id: {
+                    "provider_id": "a",
+                    "resource_id": "group:new",
+                    "marker": item.probe_marker,
+                    "upstream_key_id": "7",
+                    "target_account_id": None,
+                    "missing_count": 3,
+                    "missing_since": (
+                        datetime.now(UTC) - timedelta(hours=25)
+                    ).isoformat(),
+                    "status": "quarantined",
+                }
+            },
+            "candidate_probes": {state_id: {"outcome": "retry"}},
+        }
+        config = {
+            "delete_upstream_keys": True,
+            "delete_grace_hours": 24,
+            "delete_min_confirmations": 3,
+        }
+        events: list[dict[str, object]] = []
+        _apply_missing_resources(
+            config,
+            inventory,
+            state,
+            increment=False,
+            allow_delete=True,
+            planned_deletions={state_id: "delete_upstream_key"},
+            record_mutation=events.append,
+        )
+        provider.delete_key.assert_called_once_with("7")
+        self.assertNotIn(state_id, state["candidate_probes"])
+        self.assertEqual(
+            state["resources"][state_id]["status"],
+            "upstream_key_deleted_target_retained",
+        )
+        self.assertEqual(
+            [event["kind"] for event in events],
+            ["delete_upstream_key", "delete_upstream_key"],
+        )
+
+    def test_failed_new_group_probe_is_deferred_and_retried_next_apply(self) -> None:
+        item = resource("a", "group:new", "metered", "0.05")
+        key = UpstreamKey("7", item.probe_marker, "new", "active", "sk-probe")
+        provider = mock.Mock()
+        provider.provider_id = "a"
+        provider.scan.side_effect = [
+            ProviderSnapshot("a", [item], [], {}),
+            ProviderSnapshot("a", [item], [key], {"7": {}}),
+        ]
+        provider.create_probe_key.return_value = key
+        provider.probe_resource.return_value = ProbeResult(
+            False,
+            "probe_no_codex_model",
+            True,
+            http_status=200,
+        )
+        config = {
+            "providers": [
+                {
+                    "id": "a",
+                    "type": "sub2api",
+                    "inference_base": "https://a.example/v1",
+                    "probe_new_resources": True,
+                    "adopt": [],
+                }
+            ]
+        }
+        state = {"schema": 1, "resources": {}}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "upstream_reconciler.runtime.provider_from_config",
+            return_value=provider,
+        ):
+            first = _qualify_pending_resources(
+                config, state, audit_path=Path(tmp) / "audit.jsonl"
+            )
+            second = _qualify_pending_resources(
+                config, state, audit_path=Path(tmp) / "audit.jsonl"
+            )
+        self.assertEqual([result["compatible"] for result in first], [False])
+        self.assertEqual([result["compatible"] for result in second], [False])
+        self.assertEqual(provider.probe_resource.call_count, 2)
+        self.assertEqual(provider.create_probe_key.call_count, 1)
+        self.assertEqual(provider.disable_key.call_count, 2)
+        allowed, reason = _resource_probe_gate(config["providers"][0], item, state)
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "probe_no_codex_model")
+
+    def test_successful_new_group_probe_promotes_key_before_relay_plan(self) -> None:
+        item = resource("a", "group:new", "metered", "0.05")
+        key = UpstreamKey("7", item.probe_marker, "new", "active", "sk-probe")
+        provider = mock.Mock()
+        provider.provider_id = "a"
+        provider.scan.return_value = ProviderSnapshot("a", [item], [], {})
+        provider.create_probe_key.return_value = key
+        provider.probe_resource.return_value = ProbeResult(
+            True,
+            "compatible",
+            False,
+            http_status=200,
+            model="gpt-5.6-sol",
+            model_count=3,
+        )
+        config = {
+            "providers": [
+                {
+                    "id": "a",
+                    "type": "sub2api",
+                    "inference_base": "https://a.example/v1",
+                    "probe_new_resources": True,
+                    "adopt": [],
+                }
+            ]
+        }
+        state = {"schema": 1, "resources": {}}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "upstream_reconciler.runtime.provider_from_config",
+            return_value=provider,
+        ):
+            results = _qualify_pending_resources(
+                config, state, audit_path=Path(tmp) / "audit.jsonl"
+            )
+        self.assertEqual([result["compatible"] for result in results], [True])
+        provider.rename_key.assert_called_once_with(key, item.marker)
+        provider.disable_key.assert_not_called()
+        allowed, reason = _resource_probe_gate(config["providers"][0], item, state)
+        self.assertTrue(allowed)
+        self.assertIsNone(reason)
+
     def test_initial_adoption_and_equal_priority_plan(self) -> None:
         first = resource("a", "group:15", "metered", "0.15")
         second = resource("b", "group:15", "metered", "0.150")
@@ -651,11 +1819,54 @@ class ConfigAndStoreTests(unittest.TestCase):
                     "dashboard_origin": "https://example.test",
                     "inference_base": "https://example.test/v1",
                     "include_group_regex": "^gpt",
+                    "subscription_resource_allowlist": [],
                     "adopt": [{"resource_id": "group:gpt", "key_id": 1, "account_id": 2}],
                 }
             ],
         }
         self.assertIs(validate_config(config), config)
+
+    def test_subscription_allowlist_is_canonical_and_newapi_fails_closed(self) -> None:
+        base = {
+            "version": 1,
+            "target": {
+                "api_base": "http://127.0.0.1/api/v1",
+                "dashboard_origin": "http://127.0.0.1",
+                "group_id": 9,
+            },
+            "providers": [
+                {
+                    "id": "p1",
+                    "type": "sub2api",
+                    "api_base": "https://example.test/api/v1",
+                    "dashboard_origin": "https://example.test",
+                    "inference_base": "https://example.test/v1",
+                    "subscription_resource_allowlist": ["bad"],
+                    "adopt": [],
+                }
+            ],
+        }
+        base["providers"][0].pop("subscription_resource_allowlist")
+        with self.assertRaisesRegex(ReconcileError, "is required"):
+            validate_config(base)
+        base["providers"][0]["subscription_resource_allowlist"] = ["bad"]
+        with self.assertRaisesRegex(ReconcileError, "group"):
+            validate_config(base)
+        base["providers"][0]["subscription_resource_allowlist"] = ["group:1"]
+        with self.assertRaisesRegex(ReconcileError, "require_subscription_expiry"):
+            validate_config(base)
+        base["providers"][0] = {
+            "id": "p1",
+            "type": "new-api",
+            "api_base": "https://example.test",
+            "dashboard_origin": "https://example.test",
+            "inference_base": "https://example.test/v1",
+            "include_group_regex": "^gpt",
+            "subscription_resource_allowlist": ["group:gpt-monthly"],
+            "adopt": [],
+        }
+        with self.assertRaisesRegex(ReconcileError, "authoritative"):
+            validate_config(base)
 
     def test_unsafe_delete_thresholds_are_rejected(self) -> None:
         config = {
@@ -681,6 +1892,15 @@ class ConfigAndStoreTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ReconcileError, "delete_min_confirmations"):
             validate_config(config)
+
+    def test_missing_provider_credential_keeps_provider_context(self) -> None:
+        with mock.patch(
+            "upstream_reconciler.store._keychain_find", return_value=(44, None, "missing")
+        ):
+            with self.assertRaises(ReconcileError) as raised:
+                keychain_get("provider:code-plan:password")
+        self.assertEqual(raised.exception.code, "credential_missing")
+        self.assertEqual(raised.exception.context, {"provider_id": "code-plan"})
 
     def test_browser_credentials_cannot_cross_configured_origins(self) -> None:
         config = {

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .core import ReconcileError, redact
+from .maintenance import run_maintenance_phase
+from .notify import notify_reconcile_error
 from .runtime import (
     enroll_from_edge,
     enroll_provider_login,
@@ -48,12 +50,47 @@ def _parser() -> argparse.ArgumentParser:
 
     apply_parser = subparsers.add_parser("apply", help="apply a fresh plan and verify read-back")
     apply_parser.add_argument("--yes", action="store_true", help="confirm external writes")
+    apply_parser.add_argument(
+        "--maintenance-safe",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    apply_parser.add_argument(
+        "--min-active-resources",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
 
     rollback_parser = subparsers.add_parser(
         "rollback", help="restore target priority/schedulable fields from a snapshot"
     )
     rollback_parser.add_argument("--snapshot", type=Path, required=True)
     rollback_parser.add_argument("--yes", action="store_true", help="confirm target writes")
+
+    maintenance_parser = subparsers.add_parser(
+        "maintenance",
+        help="run the bounded schema-repair hard gate",
+    )
+    maintenance_subparsers = maintenance_parser.add_subparsers(
+        dest="maintenance_phase",
+        required=True,
+    )
+    for phase in ("status", "prepare", "verify", "promote"):
+        phase_parser = maintenance_subparsers.add_parser(
+            phase,
+            help=f"{phase} one schema-repair gate",
+        )
+        if phase in ("verify", "promote"):
+            phase_parser.add_argument(
+                "--gate-id",
+                required=True,
+                help="gate id returned by maintenance prepare",
+            )
+        phase_parser.add_argument(
+            "--notify-on-failure",
+            action="store_true",
+            help="send a sanitized configured Telegram alert when a gate stops",
+        )
     return parser
 
 
@@ -92,7 +129,11 @@ def main(argv: list[str] | None = None) -> int:
                     "apply requires --yes",
                     next_action="review plan, then run apply --yes",
                 )
-            result = reconcile_apply(args.config)
+            result = reconcile_apply(
+                args.config,
+                maintenance_safe=args.maintenance_safe,
+                min_active_resources=args.min_active_resources,
+            )
         elif args.command == "rollback":
             if not args.yes:
                 raise ReconcileError(
@@ -101,6 +142,13 @@ def main(argv: list[str] | None = None) -> int:
                     next_action="review the snapshot, then run rollback --yes",
                 )
             result = rollback_snapshot(args.snapshot, args.config)
+        elif args.command == "maintenance":
+            result = run_maintenance_phase(
+                args.maintenance_phase,
+                gate_id=getattr(args, "gate_id", None),
+                config_path=args.config,
+                notify_on_failure=args.notify_on_failure,
+            )
         else:  # pragma: no cover
             raise AssertionError(args.command)
         _emit(result)
@@ -109,6 +157,11 @@ def main(argv: list[str] | None = None) -> int:
         payload = {"ok": False, "error": {"code": exc.code, "message": str(exc)}}
         if exc.next_action:
             payload["error"]["next_action"] = exc.next_action
+        if exc.context:
+            payload["error"]["context"] = redact(exc.context)
+        notification = notify_reconcile_error(exc, config_path=args.config)
+        if notification.get("status") not in ("not_applicable", "not_configured"):
+            payload["notification"] = notification
         _emit(payload, stream=sys.stderr)
         return 2
     except KeyboardInterrupt:
