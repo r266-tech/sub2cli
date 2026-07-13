@@ -1067,6 +1067,7 @@ class TargetSub2API:
         name: str,
         base_url: str,
         api_key: str,
+        concurrency: int,
         priority: int,
         extra: dict[str, Any],
     ) -> dict[str, Any]:
@@ -1076,7 +1077,7 @@ class TargetSub2API:
             "type": "apikey",
             "credentials": {"base_url": base_url, "api_key": api_key},
             "extra": extra,
-            "concurrency": int(self.config.get("concurrency") or 100),
+            "concurrency": concurrency,
             "priority": priority,
             # No group at creation prevents the brief default schedulable=true row
             # from receiving traffic before ownership and credentials are verified.

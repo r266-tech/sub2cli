@@ -96,6 +96,13 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ReconcileError("invalid_config", "target api_base and dashboard_origin are required")
     if not isinstance(target.get("group_id"), int):
         raise ReconcileError("invalid_config", "target group_id must be an integer")
+    target_concurrency = target.get("concurrency", 100)
+    if (
+        isinstance(target_concurrency, bool)
+        or not isinstance(target_concurrency, int)
+        or target_concurrency < 1
+    ):
+        raise ReconcileError("invalid_config", "target.concurrency must be an integer >= 1")
     _require_same_credential_origin(
         "target", str(target["dashboard_origin"]), str(target["api_base"])
     )
@@ -174,6 +181,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         seen.add(provider_id)
         if provider.get("type") not in ("sub2api", "new-api"):
             raise ReconcileError("invalid_config", f"unsupported provider type for {provider_id}")
+        provider_concurrency = provider.get("target_concurrency", target_concurrency)
+        if (
+            isinstance(provider_concurrency, bool)
+            or not isinstance(provider_concurrency, int)
+            or provider_concurrency < 1
+        ):
+            raise ReconcileError(
+                "invalid_config", f"{provider_id}.target_concurrency must be an integer >= 1"
+            )
         for field in ("api_base", "dashboard_origin", "inference_base"):
             if not provider.get(field):
                 raise ReconcileError("invalid_config", f"{provider_id}.{field} is required")
@@ -305,6 +321,17 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
             next_action="create the private provider inventory, then run enroll-edge",
         )
     return validate_config(config)
+
+
+def _target_concurrency(config: dict[str, Any], provider_id: str) -> int:
+    default = int((config.get("target") or {}).get("concurrency", 100))
+    provider = next(
+        (item for item in config.get("providers", []) if item.get("id") == provider_id),
+        None,
+    )
+    if provider is None:
+        raise ReconcileError("invalid_config", f"provider config is missing for {provider_id}")
+    return int(provider.get("target_concurrency", default))
 
 
 def _adoption_map(provider_config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -562,12 +589,19 @@ def _seed_inactive_adoptions(
             )
         if key is None:
             continue
+        expected_marker = marker_for(provider_id, resource_id)
+        if not isinstance(existing, dict) and key.name != expected_marker:
+            raise ReconcileError(
+                "inactive_adoption_unclaimed",
+                f"inactive adopted key {key.id} for {provider_id}/{resource_id} has no ownership marker",
+                next_action="remove the inactive adoption or explicitly establish ownership outside the scheduled workflow",
+            )
         state_resources.setdefault(
             state_id,
             {
                 "provider_id": provider_id,
                 "resource_id": resource_id,
-                "marker": marker_for(provider_id, resource_id),
+                "marker": expected_marker,
                 "upstream_key_id": key.id,
                 "target_account_id": int(account["id"]),
                 "key_fingerprint": key.fingerprint if key.secret else None,
@@ -1334,7 +1368,19 @@ def _action_plan(
                 actions.append(Action("enable_upstream_key", resource.provider_id, resource.resource_id, {"key_id": key.id}))
         account = binding.target_account
         if account is None:
-            actions.append(Action("create_target_account", resource.provider_id, resource.resource_id, {"priority": resource.priority, "marker": resource.marker}))
+            detail = {"priority": resource.priority, "marker": resource.marker}
+            if config.get("providers"):
+                detail["concurrency"] = _target_concurrency(
+                    config, resource.provider_id
+                )
+            actions.append(
+                Action(
+                    "create_target_account",
+                    resource.provider_id,
+                    resource.resource_id,
+                    detail,
+                )
+            )
             continue
         account_id = int(account["id"])
         metadata = metadata_from_account(account)
@@ -1364,6 +1410,21 @@ def _action_plan(
             )
         if int(account.get("priority") or 0) != int(resource.priority or 0):
             actions.append(Action("update_target_priority", resource.provider_id, resource.resource_id, {"account_id": account_id, "from": account.get("priority"), "to": resource.priority}))
+        if config.get("providers"):
+            desired_concurrency = _target_concurrency(config, resource.provider_id)
+            if int(account.get("concurrency") or 0) != desired_concurrency:
+                actions.append(
+                    Action(
+                        "update_target_concurrency",
+                        resource.provider_id,
+                        resource.resource_id,
+                        {
+                            "account_id": account_id,
+                            "from": account.get("concurrency"),
+                            "to": desired_concurrency,
+                        },
+                    )
+                )
         if account.get("schedulable") is False:
             actions.append(Action("enable_target_account", resource.provider_id, resource.resource_id, {"account_id": account_id}))
 
@@ -1448,6 +1509,7 @@ def _observed_hash(inventory: Inventory) -> str:
             {
                 "id": binding.target_account_id,
                 "priority": binding.target_account.get("priority") if binding.target_account else None,
+                "concurrency": binding.target_account.get("concurrency") if binding.target_account else None,
                 "schedulable": binding.target_account.get("schedulable") if binding.target_account else None,
                 "metadata": metadata_from_account(binding.target_account),
             }
@@ -1501,6 +1563,7 @@ def _snapshot_payload(inventory: Inventory, state: dict[str, Any], plan: dict[st
                 "id": int(item["id"]),
                 "name": item.get("name"),
                 "priority": item.get("priority"),
+                "concurrency": item.get("concurrency"),
                 "schedulable": item.get("schedulable"),
                 "metadata": metadata_from_account(item),
             }
@@ -1517,6 +1580,8 @@ def _restore_target_routing(target: TargetSub2API, snapshot: dict[str, Any]) -> 
             account_id = int(account["id"])
             if account.get("priority") is not None:
                 target.bulk_update([account_id], priority=int(account["priority"]))
+            if account.get("concurrency") is not None:
+                target.bulk_update([account_id], concurrency=int(account["concurrency"]))
             if account.get("schedulable") is not None:
                 target.set_schedulable(account_id, bool(account["schedulable"]))
         except Exception:
@@ -1684,16 +1749,17 @@ def _apply_active_resources(
         metadata = desired_metadata(resource)
         extra_patch = {METADATA_KEY: metadata}
         account = binding.target_account
+        provider_config = next(
+            item for item in config["providers"] if item["id"] == resource.provider_id
+        )
+        desired_concurrency = _target_concurrency(config, resource.provider_id)
         if account is None:
             record({"phase": "intent", "kind": "create_target_account", "marker": resource.marker})
             account = inventory.target.create_account(
                 name=_target_account_name(resource),
-                base_url=str(
-                    next(item for item in config["providers"] if item["id"] == resource.provider_id)[
-                        "inference_base"
-                    ]
-                ),
+                base_url=str(provider_config["inference_base"]),
                 api_key=resource.key.secret,
+                concurrency=desired_concurrency,
                 priority=int(resource.priority or 1),
                 extra=extra_patch,
             )
@@ -1759,6 +1825,28 @@ def _apply_active_resources(
                         "kind": "update_target_metadata",
                         "marker": resource.marker,
                         "target_account_id": int(account["id"]),
+                    }
+                )
+            if int(account.get("concurrency") or 0) != desired_concurrency:
+                record(
+                    {
+                        "phase": "intent",
+                        "kind": "update_target_concurrency",
+                        "marker": resource.marker,
+                        "target_account_id": int(account["id"]),
+                        "concurrency": desired_concurrency,
+                    }
+                )
+                inventory.target.bulk_update(
+                    [int(account["id"])], concurrency=desired_concurrency
+                )
+                record(
+                    {
+                        "phase": "done",
+                        "kind": "update_target_concurrency",
+                        "marker": resource.marker,
+                        "target_account_id": int(account["id"]),
+                        "concurrency": desired_concurrency,
                     }
                 )
 
@@ -2032,6 +2120,12 @@ def _verify_active(config: dict[str, Any], state: dict[str, Any]) -> None:
             raise ReconcileError("verification_failed", f"target account is missing for {resource.marker}")
         if int(account.get("priority") or 0) != int(resource.priority or 0):
             raise ReconcileError("verification_failed", f"priority verification failed for {resource.marker}")
+        if int(account.get("concurrency") or 0) != _target_concurrency(
+            config, resource.provider_id
+        ):
+            raise ReconcileError(
+                "verification_failed", f"concurrency verification failed for {resource.marker}"
+            )
         if account.get("schedulable") is not True:
             raise ReconcileError("verification_failed", f"schedulable verification failed for {resource.marker}")
         if metadata_from_account(account) != desired_metadata(resource):
@@ -2231,6 +2325,12 @@ def reconcile_apply(
                     plan,
                     min_active_resources=min_active_resources,
                 )
+            # Prequalification intentionally has no bindings. Refresh the target
+            # routing snapshot after the full locked inventory is built, but
+            # before any target account mutation, so first-time adoptions are
+            # also restorable.
+            snapshot = _snapshot_payload(inventory, state, plan)
+            atomic_write_json(snapshot_path, snapshot)
             pending["plan"] = plan
             pending["qualification"] = {
                 "attempted": len(probe_results),

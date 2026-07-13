@@ -14,6 +14,9 @@ confirmed upstream response-schema change.
   and retry it once on the next scheduled run.
 - Subscription routes are priority 1. Metered routes use dense ascending
   multiplier tiers, with equal multipliers sharing one priority.
+- Each provider's configured target-account concurrency is enforced for both
+  existing and newly created managed accounts, and is included in verification
+  and rollback snapshots.
 - Never weaken ownership markers, deletion grace, confirmation counts,
   rollback, or secret redaction while repairing an adapter.
 

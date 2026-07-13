@@ -36,11 +36,15 @@ from upstream_reconciler.runtime import (
     _apply_probe_deferred_resources,
     _choose_key,
     _choose_target_account,
+    _observed_hash,
     _probe_policy_hash,
     _qualify_pending_resources,
     _recover_pending_probe_keys,
+    _restore_target_routing,
     _resource_probe_gate,
     _seed_inactive_adoptions,
+    _snapshot_payload,
+    _verify_active,
     reconcile_apply,
     validate_config,
 )
@@ -1149,6 +1153,102 @@ class PlanTests(unittest.TestCase):
         target.bulk_update.assert_not_called()
         target.set_schedulable.assert_not_called()
 
+    def test_apply_refreshes_snapshot_before_first_adoption_routing_mutation(self) -> None:
+        item = resource("a", "group:15", "metered", "0.15")
+        assign_priorities([item])
+        item.key = UpstreamKey("1", item.marker, "15", "active", "sk-current")
+        account = {
+            "id": 10,
+            "name": "adopt-me",
+            "platform": "openai",
+            "type": "apikey",
+            "priority": item.priority,
+            "concurrency": 50,
+            "schedulable": True,
+            "credentials": {"base_url": "https://a.example/v1"},
+            "extra": {},
+        }
+        target = mock.Mock()
+        target.list_accounts.return_value = [account]
+        provider = mock.Mock()
+        provider.config = {"inference_base": "https://a.example/v1"}
+        pre_inventory = Inventory({}, {}, target, [account], [], {})
+        full_inventory = Inventory(
+            {"a": provider},
+            {},
+            target,
+            [account],
+            [Binding(item, account, adopted=True)],
+            {},
+        )
+        pre_plan = {
+            "schema": 1,
+            "phase": "candidate_qualification",
+            "observed_hash": "pre",
+            "resources": [],
+            "skipped_resources": [],
+            "actions": [],
+            "summary": {},
+        }
+        full_plan = {
+            "schema": 1,
+            "observed_hash": "full",
+            "resources": [{"target_account_id": 10}],
+            "skipped_resources": [],
+            "actions": [],
+            "summary": {},
+        }
+        config = {
+            "target": {"group_id": 9, "concurrency": 100},
+            "providers": [
+                {
+                    "id": "a",
+                    "inference_base": "https://a.example/v1",
+                    "target_concurrency": 8,
+                }
+            ],
+        }
+
+        def mutate_routing(*_args: object, **_kwargs: object) -> None:
+            target.bulk_update([10], concurrency=8)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            with mock.patch(
+                "upstream_reconciler.runtime.load_config", return_value=config
+            ), mock.patch(
+                "upstream_reconciler.runtime.default_state_dir", return_value=state_dir
+            ), mock.patch(
+                "upstream_reconciler.runtime._prequalification_context",
+                return_value=(pre_plan, pre_inventory),
+            ), mock.patch(
+                "upstream_reconciler.runtime._qualify_pending_resources",
+                return_value=[],
+            ), mock.patch(
+                "upstream_reconciler.runtime.build_plan",
+                return_value=(full_plan, full_inventory),
+            ), mock.patch(
+                "upstream_reconciler.runtime._apply_probe_deferred_resources"
+            ), mock.patch(
+                "upstream_reconciler.runtime._apply_missing_resources"
+            ), mock.patch(
+                "upstream_reconciler.runtime._apply_active_resources",
+                side_effect=mutate_routing,
+            ), mock.patch(
+                "upstream_reconciler.runtime._verify_active",
+                side_effect=ReconcileError("verification_failed", "simulated"),
+            ):
+                with self.assertRaises(ReconcileError) as raised:
+                    reconcile_apply()
+
+            snapshot_path = next((state_dir / "snapshots").glob("*.json"))
+            snapshot = json.loads(snapshot_path.read_text())
+        self.assertEqual(raised.exception.code, "verification_failed")
+        self.assertEqual(snapshot["accounts"][0]["id"], 10)
+        self.assertEqual(snapshot["accounts"][0]["concurrency"], 50)
+        target.bulk_update.assert_any_call([10], concurrency=8)
+        target.bulk_update.assert_any_call([10], concurrency=50)
+
     def test_probe_crash_is_journaled_and_provisional_state_is_durable(self) -> None:
         item = resource("a", "group:new", "metered", "0.05")
         key = UpstreamKey("7", item.probe_marker, "new", "active", "sk-probe")
@@ -1643,6 +1743,133 @@ class PlanTests(unittest.TestCase):
             {"base_url": "https://a.example/v1", "api_key": "sk-current"},
         )
 
+    def test_new_target_account_uses_provider_concurrency(self) -> None:
+        item = resource("a", "group:15", "metered", "0.15")
+        assign_priorities([item])
+        item.key = UpstreamKey("1", item.marker, "15", "active", "sk-current")
+        provider = mock.Mock()
+        target = mock.Mock()
+        target.create_account.return_value = {
+            "id": 10,
+            "priority": item.priority,
+            "schedulable": False,
+        }
+        inventory = Inventory(
+            providers={"a": provider},
+            snapshots={},
+            target=target,
+            target_accounts=[],
+            bindings=[Binding(item, None)],
+            settings={},
+        )
+        config = {
+            "target": {"group_id": 9, "concurrency": 100},
+            "providers": [
+                {
+                    "id": "a",
+                    "inference_base": "https://a.example/v1",
+                    "target_concurrency": 8,
+                }
+            ],
+        }
+        actions = _action_plan(inventory, {"resources": {}}, config)
+        create = next(action for action in actions if action.kind == "create_target_account")
+        self.assertEqual(create.detail["concurrency"], 8)
+        with mock.patch("upstream_reconciler.runtime.keychain_set"):
+            _apply_active_resources(config, inventory, {"resources": {}})
+        self.assertEqual(target.create_account.call_args.kwargs["concurrency"], 8)
+
+    def test_existing_target_account_concurrency_drift_is_repaired(self) -> None:
+        item = resource("a", "group:15", "metered", "0.15")
+        assign_priorities([item])
+        item.key = UpstreamKey("1", item.marker, "15", "active", "sk-current")
+        account = {
+            "id": 10,
+            "priority": item.priority,
+            "concurrency": 100,
+            "schedulable": True,
+            "credentials": {"base_url": "https://a.example/v1"},
+            "extra": {METADATA_KEY: desired_metadata(item)},
+        }
+        provider = mock.Mock()
+        provider.config = {"inference_base": "https://a.example/v1"}
+        target = mock.Mock()
+        inventory = Inventory(
+            providers={"a": provider},
+            snapshots={},
+            target=target,
+            target_accounts=[account],
+            bindings=[Binding(item, account)],
+            settings={},
+        )
+        config = {
+            "target": {"group_id": 9, "concurrency": 100},
+            "providers": [
+                {
+                    "id": "a",
+                    "inference_base": "https://a.example/v1",
+                    "target_concurrency": 8,
+                }
+            ],
+        }
+        actions = _action_plan(inventory, {"resources": {}}, config)
+        self.assertIn("update_target_concurrency", [action.kind for action in actions])
+        with mock.patch("upstream_reconciler.runtime.keychain_set"):
+            _apply_active_resources(config, inventory, {"resources": {}})
+        target.bulk_update.assert_any_call([10], concurrency=8)
+
+    def test_concurrency_is_hashed_snapshotted_rolled_back_and_verified(self) -> None:
+        item = resource("a", "group:15", "metered", "0.15")
+        assign_priorities([item])
+        item.key = UpstreamKey("1", item.marker, "15", "active", "sk-current")
+        account = {
+            "id": 10,
+            "name": "managed-a",
+            "priority": item.priority,
+            "concurrency": 50,
+            "schedulable": True,
+            "credentials": {"base_url": "https://a.example/v1"},
+            "extra": {METADATA_KEY: desired_metadata(item)},
+        }
+        provider = mock.Mock()
+        provider.config = {"inference_base": "https://a.example/v1"}
+        inventory = Inventory(
+            providers={"a": provider},
+            snapshots={},
+            target=mock.Mock(),
+            target_accounts=[account],
+            bindings=[Binding(item, account)],
+            settings={},
+        )
+        original_hash = _observed_hash(inventory)
+        account["concurrency"] = 40
+        self.assertNotEqual(_observed_hash(inventory), original_hash)
+        account["concurrency"] = 50
+
+        snapshot = _snapshot_payload(
+            inventory,
+            {"resources": {}},
+            {"observed_hash": original_hash},
+        )
+        self.assertEqual(snapshot["accounts"][0]["concurrency"], 50)
+        target = mock.Mock()
+        self.assertEqual(_restore_target_routing(target, snapshot), [])
+        target.bulk_update.assert_any_call([10], concurrency=50)
+
+        config = {
+            "target": {"group_id": 9, "concurrency": 100},
+            "providers": [
+                {
+                    "id": "a",
+                    "inference_base": "https://a.example/v1",
+                    "target_concurrency": 8,
+                }
+            ],
+        }
+        with mock.patch("upstream_reconciler.runtime.build_inventory", return_value=inventory):
+            with self.assertRaisesRegex(ReconcileError, "concurrency verification"):
+                _verify_active(config, {"resources": {}})
+
     def test_missing_state_becomes_quarantine_not_delete(self) -> None:
         inventory = Inventory({}, {}, mock.Mock(), [], [], {})
         actions = _action_plan(
@@ -1661,10 +1888,11 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(actions[0].kind, "quarantine_missing_resource")
 
     def test_inactive_adoption_is_seeded_for_quarantine(self) -> None:
+        marker = marker_for("a", "group:gone")
         snapshot = ProviderSnapshot(
             "a",
             [],
-            [UpstreamKey("7", "old", "gone", "active", "sk-old")],
+            [UpstreamKey("7", marker, "gone", "active", "sk-old")],
         )
         state_resources: dict[str, object] = {}
         account = {"id": 9, "platform": "openai", "type": "apikey", "priority": 3}
@@ -1680,6 +1908,28 @@ class PlanTests(unittest.TestCase):
         entry = state_resources["a/group:gone"]
         self.assertEqual(entry["status"], "bootstrap_inactive")  # type: ignore[index]
         self.assertEqual(entry["target_account_id"], 9)  # type: ignore[index]
+
+    def test_inactive_adoption_without_marker_fails_before_seeding_state(self) -> None:
+        snapshot = ProviderSnapshot(
+            "a",
+            [],
+            [UpstreamKey("7", "personal", "gone", "active", "sk-old")],
+        )
+        state_resources: dict[str, object] = {}
+        account = {"id": 9, "platform": "openai", "type": "apikey", "priority": 3}
+        with self.assertRaisesRegex(ReconcileError, "has no ownership marker"):
+            _seed_inactive_adoptions(
+                {
+                    "id": "a",
+                    "adopt": [
+                        {"resource_id": "group:gone", "key_id": 7, "account_id": 9}
+                    ],
+                },
+                snapshot,
+                {9: account},
+                state_resources,
+            )
+        self.assertEqual(state_resources, {})
 
     def test_delete_is_explicitly_planned_after_grace_and_confirmations(self) -> None:
         marker = marker_for("a", "group:gone")
@@ -1825,6 +2075,34 @@ class ConfigAndStoreTests(unittest.TestCase):
             ],
         }
         self.assertIs(validate_config(config), config)
+
+    def test_target_concurrency_overrides_are_positive_integers(self) -> None:
+        config = {
+            "version": 1,
+            "target": {
+                "api_base": "http://127.0.0.1/api/v1",
+                "dashboard_origin": "http://127.0.0.1",
+                "group_id": 9,
+                "concurrency": 100,
+            },
+            "providers": [
+                {
+                    "id": "p1",
+                    "type": "new-api",
+                    "api_base": "https://example.test",
+                    "dashboard_origin": "https://example.test",
+                    "inference_base": "https://example.test/v1",
+                    "include_group_regex": "^gpt",
+                    "subscription_resource_allowlist": [],
+                    "target_concurrency": 50,
+                    "adopt": [],
+                }
+            ],
+        }
+        self.assertIs(validate_config(config), config)
+        config["providers"][0]["target_concurrency"] = 0
+        with self.assertRaisesRegex(ReconcileError, "target_concurrency"):
+            validate_config(config)
 
     def test_subscription_allowlist_is_canonical_and_newapi_fails_closed(self) -> None:
         base = {
