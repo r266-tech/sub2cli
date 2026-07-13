@@ -25,7 +25,14 @@ from upstream_reconciler.core import (
     marker_for,
     redact,
 )
-from upstream_reconciler.probe import ProbeResult, probe_codex_responses, select_codex_model
+from upstream_reconciler.probe import (
+    PROBE_POLICY,
+    REQUIRED_MODEL,
+    RESPONSE_CONTRACT,
+    ProbeResult,
+    probe_codex_responses,
+    select_codex_model,
+)
 from upstream_reconciler.notify import notify_reconcile_error
 from upstream_reconciler.runtime import (
     Inventory,
@@ -78,11 +85,11 @@ class PriorityTests(unittest.TestCase):
         ]
         result = assign_priorities(items)
         actual = {(item.provider_id, item.resource_id): item.priority for item in result}
-        self.assertEqual(actual[("a", "group:sub")], 1)
-        self.assertEqual(actual[("a", "group:5")], 2)
-        self.assertEqual(actual[("b", "group:5")], 2)
-        self.assertEqual(actual[("b", "group:8")], 3)
-        self.assertEqual(actual[("a", "group:15")], 4)
+        self.assertEqual(actual[("a", "group:sub")], 40)
+        self.assertEqual(actual[("a", "group:5")], 50)
+        self.assertEqual(actual[("b", "group:5")], 50)
+        self.assertEqual(actual[("b", "group:8")], 80)
+        self.assertEqual(actual[("a", "group:15")], 150)
 
     def test_provider_order_does_not_change_tiers(self) -> None:
         left = assign_priorities(
@@ -630,6 +637,37 @@ class CapabilityProbeTests(unittest.TestCase):
             iter_lines=lambda decode_unicode=False: iter(lines or []),
         )
 
+    @staticmethod
+    def terminal_line(
+        *,
+        model: str = REQUIRED_MODEL,
+        response_id: str = "resp_probe",
+        status: str = "completed",
+    ) -> bytes:
+        response: dict[str, object] = {
+            "id": response_id,
+            "object": "response",
+            "model": model,
+            "status": status,
+            "output": [
+                {
+                    "id": "msg_probe",
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "OK"}],
+                }
+            ],
+            "usage": {"input_tokens": 4, "output_tokens": 1},
+        }
+        if status == "incomplete":
+            response["incomplete_details"] = {"reason": "max_output_tokens"}
+        return (
+            "data: "
+            + json.dumps(
+                {"type": f"response.{status}", "response": response},
+                separators=(",", ":"),
+            )
+        ).encode("utf-8")
+
     def test_model_selection_excludes_non_text_gpt_variants(self) -> None:
         model, count = select_codex_model(
             ["glm-5", "gpt-image-2", "gpt-4o-audio-preview", "gpt-5.6-sol"]
@@ -637,7 +675,7 @@ class CapabilityProbeTests(unittest.TestCase):
         self.assertEqual(model, "gpt-5.6-sol")
         self.assertEqual(count, 1)
 
-    def test_probe_rejects_group_without_codex_models_before_inference(self) -> None:
+    def test_models_catalog_without_any_codex_model_skips_paid_probe(self) -> None:
         session = mock.Mock()
         session.get.return_value = self.response(
             url="https://example.test/v1/models",
@@ -650,6 +688,27 @@ class CapabilityProbeTests(unittest.TestCase):
         self.assertEqual(result.code, "probe_no_codex_model")
         session.post.assert_not_called()
 
+    def test_missing_models_endpoint_does_not_short_circuit_responses_probe(self) -> None:
+        session = mock.Mock()
+        session.get.return_value = self.response(
+            status=404,
+            url="https://example.test/v1/models",
+            payload={"error": {"message": "not found"}},
+        )
+        session.post.return_value = self.response(
+            url="https://example.test/v1/responses",
+            payload={},
+            content_type="text/event-stream",
+            lines=[
+                self.terminal_line(),
+            ],
+        )
+        result = probe_codex_responses(
+            "https://example.test/v1", "sk-probe", session=session
+        )
+        self.assertTrue(result.compatible)
+        session.post.assert_called_once()
+
     def test_probe_requires_real_responses_stream_success(self) -> None:
         session = mock.Mock()
         session.get.return_value = self.response(
@@ -661,7 +720,7 @@ class CapabilityProbeTests(unittest.TestCase):
             payload={},
             content_type="text/event-stream",
             lines=[
-                b'data: {"type":"response.completed","response":{"status":"completed"}}',
+                self.terminal_line(),
                 b"data: [DONE]",
             ],
         )
@@ -670,6 +729,7 @@ class CapabilityProbeTests(unittest.TestCase):
         )
         self.assertTrue(result.compatible)
         self.assertEqual(result.model, "gpt-5.6-sol")
+        self.assertEqual(result.response_id, "resp_probe")
         session.post.assert_called_once()
 
     def test_probe_rejects_failed_completed_terminal_event(self) -> None:
@@ -683,7 +743,7 @@ class CapabilityProbeTests(unittest.TestCase):
             payload={},
             content_type="text/event-stream",
             lines=[
-                b'data: {"type":"response.completed","response":{"status":"failed","error":{"code":"bad"}}}',
+                b'data: {"type":"response.completed","response":{"id":"resp_probe","object":"response","model":"gpt-5.6-sol","status":"failed","error":{"code":"bad"}}}',
                 b"data: [DONE]",
             ],
         )
@@ -704,9 +764,52 @@ class CapabilityProbeTests(unittest.TestCase):
             payload={},
             content_type="text/event-stream",
             lines=[
-                b'data: {"type":"response.completed","response":{"status":"completed"}}',
+                self.terminal_line(),
                 b'event: response.failed',
                 b'data: {"type":"response.failed","response":{"status":"failed"}}',
+            ],
+        )
+        result = probe_codex_responses(
+            "https://example.test/v1", "sk-probe", session=session
+        )
+        self.assertFalse(result.compatible)
+        self.assertEqual(result.code, "probe_invalid_responses_protocol")
+
+    def test_probe_rejects_terminal_response_for_a_fallback_model(self) -> None:
+        session = mock.Mock()
+        session.get.return_value = self.response(
+            url="https://example.test/v1/models",
+            payload={"data": [{"id": "gpt-5.5"}]},
+        )
+        session.post.return_value = self.response(
+            url="https://example.test/v1/responses",
+            payload={},
+            content_type="text/event-stream",
+            lines=[
+                self.terminal_line(model="gpt-5.5"),
+            ],
+        )
+        result = probe_codex_responses(
+            "https://example.test/v1", "sk-probe", session=session
+        )
+        self.assertFalse(result.compatible)
+        self.assertEqual(result.code, "probe_invalid_responses_protocol")
+        self.assertEqual(
+            session.post.call_args.kwargs["json"]["model"], REQUIRED_MODEL
+        )
+
+    def test_probe_rejects_terminal_event_without_full_response_contract(self) -> None:
+        session = mock.Mock()
+        session.get.return_value = self.response(
+            url="https://example.test/v1/models",
+            payload={"data": [{"id": REQUIRED_MODEL}]},
+        )
+        session.post.return_value = self.response(
+            url="https://example.test/v1/responses",
+            payload={},
+            content_type="text/event-stream",
+            lines=[
+                b'data: {"type":"response.completed","response":{"status":"completed"}}',
             ],
         )
         result = probe_codex_responses(
@@ -732,6 +835,27 @@ class CapabilityProbeTests(unittest.TestCase):
         self.assertFalse(result.compatible)
         self.assertTrue(result.retryable)
         self.assertEqual(result.http_status, 429)
+
+    def test_provider_probe_ignores_legacy_fallback_preferences(self) -> None:
+        item = resource("a", "group:new", "metered", "0.05")
+        key = UpstreamKey("7", item.probe_marker, "new", "active", "sk-probe")
+        client = Sub2APIProvider(
+            {
+                "id": "a",
+                "type": "sub2api",
+                "api_base": "https://example.test/api/v1",
+                "inference_base": "https://example.test/v1",
+                "probe_preferred_models": ["gpt-5.5", "gpt-5.4"],
+            }
+        )
+        with mock.patch(
+            "upstream_reconciler.clients.probe_codex_responses",
+            return_value=ProbeResult(True, "compatible", False, model=REQUIRED_MODEL),
+        ) as probe:
+            result = client.probe_resource(item, key)
+        self.assertTrue(result.compatible)
+        self.assertEqual(probe.call_args.kwargs["required_model"], REQUIRED_MODEL)
+        self.assertNotIn("preferred_models", probe.call_args.kwargs)
 
     def test_sub2api_refresh_falls_back_to_stored_api_login(self) -> None:
         client = Sub2APIProvider(
@@ -1413,8 +1537,13 @@ class PlanTests(unittest.TestCase):
                     "provider_id": "a",
                     "resource_id": "group:new",
                     "outcome": "compatible",
+                    "probe_policy": PROBE_POLICY,
+                    "response_contract": RESPONSE_CONTRACT,
+                    "required_model": REQUIRED_MODEL,
                     "policy_hash": _probe_policy_hash(provider_config),
                     "inference_base": "https://a.example/v1",
+                    "model": REQUIRED_MODEL,
+                    "response_id": "resp-stale-proof",
                     "group_ref": "new",
                     "marker": item.marker,
                     "upstream_key_id": "7",
@@ -1456,6 +1585,7 @@ class PlanTests(unittest.TestCase):
             http_status=200,
             model="gpt-5.6-sol",
             model_count=1,
+            response_id="resp-masked-key",
         )
         config = {
             "providers": [
@@ -1639,6 +1769,7 @@ class PlanTests(unittest.TestCase):
             http_status=200,
             model="gpt-5.6-sol",
             model_count=3,
+            response_id="resp-new-group",
         )
         config = {
             "providers": [
@@ -1665,6 +1796,210 @@ class PlanTests(unittest.TestCase):
         allowed, reason = _resource_probe_gate(config["providers"][0], item, state)
         self.assertTrue(allowed)
         self.assertIsNone(reason)
+
+    def test_new_group_probe_is_mandatory_without_legacy_toggle(self) -> None:
+        item = resource("a", "group:new", "metered", "0.05")
+        key = UpstreamKey("7", item.probe_marker, "new", "active", "sk-probe")
+        provider = mock.Mock()
+        provider.provider_id = "a"
+        provider.scan.return_value = ProviderSnapshot("a", [item], [], {})
+        provider.create_probe_key.return_value = key
+        provider.probe_resource.return_value = ProbeResult(
+            True,
+            "compatible",
+            False,
+            http_status=200,
+            model=REQUIRED_MODEL,
+            model_count=0,
+        )
+        config = {
+            "providers": [
+                {
+                    "id": "a",
+                    "type": "sub2api",
+                    "inference_base": "https://a.example/v1",
+                    "adopt": [],
+                }
+            ]
+        }
+        state = {"schema": 1, "resources": {}}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "upstream_reconciler.runtime.provider_from_config",
+            return_value=provider,
+        ), mock.patch("upstream_reconciler.runtime.keychain_set"):
+            results = _qualify_pending_resources(
+                config, state, audit_path=Path(tmp) / "audit.jsonl"
+            )
+        self.assertEqual([item["compatible"] for item in results], [True])
+        provider.probe_resource.assert_called_once()
+
+    def test_historical_route_is_not_revalidated_or_stopped_by_default(self) -> None:
+        item = resource("a", "group:old", "metered", "0.05")
+        key = UpstreamKey("7", item.marker, "old", "active", "sk-existing")
+        provider = mock.Mock()
+        provider.scan.return_value = ProviderSnapshot("a", [item], [key], {})
+        config = {
+            "providers": [
+                {
+                    "id": "a",
+                    "type": "sub2api",
+                    "inference_base": "https://a.example/v1",
+                    "adopt": [],
+                }
+            ]
+        }
+        state = {
+            "schema": 1,
+            "resources": {
+                "a/group:old": {
+                    "provider_id": "a",
+                    "resource_id": "group:old",
+                    "status": "active",
+                    "upstream_key_id": "7",
+                    "target_account_id": 12,
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "upstream_reconciler.runtime.provider_from_config",
+            return_value=provider,
+        ):
+            results = _qualify_pending_resources(
+                config, state, audit_path=Path(tmp) / "audit.jsonl"
+            )
+        self.assertEqual(results, [])
+        self.assertEqual(state["resources"]["a/group:old"]["status"], "active")
+        provider.probe_resource.assert_not_called()
+        provider.disable_key.assert_not_called()
+
+    def test_historical_revalidation_failure_preserves_existing_route(self) -> None:
+        item = resource("a", "group:old", "metered", "0.05")
+        key = UpstreamKey("7", item.marker, "old", "active", "sk-existing")
+        provider = mock.Mock()
+        provider.scan.return_value = ProviderSnapshot("a", [item], [key], {})
+        provider.probe_resource.return_value = ProbeResult(
+            False,
+            "probe_responses_rejected",
+            True,
+            http_status=400,
+            model=REQUIRED_MODEL,
+            model_count=1,
+            response_id="resp-historical-refresh",
+        )
+        config = {
+            "providers": [
+                {
+                    "id": "a",
+                    "type": "sub2api",
+                    "inference_base": "https://a.example/v1",
+                    "probe_revalidate_resource_ids": ["group:old"],
+                    "adopt": [],
+                }
+            ]
+        }
+        state = {
+            "schema": 1,
+            "resources": {
+                "a/group:old": {
+                    "provider_id": "a",
+                    "resource_id": "group:old",
+                    "status": "active",
+                    "upstream_key_id": "7",
+                    "target_account_id": 12,
+                    "key_fingerprint": key.fingerprint,
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "upstream_reconciler.runtime.provider_from_config",
+            return_value=provider,
+        ), mock.patch("upstream_reconciler.runtime.keychain_set"):
+            results = _qualify_pending_resources(
+                config, state, audit_path=Path(tmp) / "audit.jsonl"
+            )
+        self.assertFalse(results[0]["compatible"])
+        self.assertTrue(results[0]["routing_preserved"])
+        self.assertEqual(state["resources"]["a/group:old"]["status"], "active")
+        proof = state["candidate_probes"]["a/group:old"]
+        self.assertEqual(proof["required_model"], REQUIRED_MODEL)
+        self.assertEqual(proof["mode"], "historical_revalidation")
+        provider.disable_key.assert_not_called()
+        provider.rename_key.assert_not_called()
+        provider.create_probe_key.assert_not_called()
+
+    def test_historical_proof_reuse_and_policy_invalidation_are_safe(self) -> None:
+        item = resource("a", "group:old", "metered", "0.05")
+        key = UpstreamKey("7", item.marker, "old", "active", "sk-existing")
+        provider = mock.Mock()
+        provider.scan.return_value = ProviderSnapshot("a", [item], [key], {})
+        provider.probe_resource.return_value = ProbeResult(
+            True,
+            "compatible",
+            False,
+            http_status=200,
+            model=REQUIRED_MODEL,
+            model_count=1,
+        )
+        provider_config = {
+            "id": "a",
+            "type": "sub2api",
+            "inference_base": "https://a.example/v1",
+            "probe_revalidate_resource_ids": ["group:old"],
+            "adopt": [],
+        }
+        proof = {
+            "provider_id": "a",
+            "resource_id": "group:old",
+            "probe_policy": PROBE_POLICY,
+            "response_contract": RESPONSE_CONTRACT,
+            "required_model": REQUIRED_MODEL,
+            "policy_hash": _probe_policy_hash(provider_config),
+            "inference_base": "https://a.example/v1",
+            "outcome": "compatible",
+            "model": REQUIRED_MODEL,
+            "response_id": "resp-historical-proof",
+            "upstream_key_id": "7",
+            "key_fingerprint": key.fingerprint,
+            "group_ref": "old",
+            "marker": item.marker,
+            "attempt_count": 1,
+        }
+        state = {
+            "schema": 1,
+            "resources": {
+                "a/group:old": {
+                    "provider_id": "a",
+                    "resource_id": "group:old",
+                    "status": "active",
+                    "upstream_key_id": "7",
+                    "target_account_id": 12,
+                    "key_fingerprint": key.fingerprint,
+                    "probe": dict(proof),
+                }
+            },
+            "candidate_probes": {"a/group:old": proof},
+        }
+        config = {"providers": [provider_config]}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "upstream_reconciler.runtime.provider_from_config",
+            return_value=provider,
+        ), mock.patch("upstream_reconciler.runtime.keychain_set"):
+            reused = _qualify_pending_resources(
+                config, state, audit_path=Path(tmp) / "audit.jsonl"
+            )
+            state["candidate_probes"]["a/group:old"]["response_contract"] = "old"
+            refreshed = _qualify_pending_resources(
+                config, state, audit_path=Path(tmp) / "audit.jsonl"
+            )
+        self.assertEqual(reused, [])
+        self.assertEqual([item["compatible"] for item in refreshed], [True])
+        provider.probe_resource.assert_called_once()
+        self.assertEqual(
+            state["candidate_probes"]["a/group:old"]["response_contract"],
+            RESPONSE_CONTRACT,
+        )
+        self.assertEqual(state["resources"]["a/group:old"]["status"], "active")
+        provider.disable_key.assert_not_called()
 
     def test_initial_adoption_and_equal_priority_plan(self) -> None:
         first = resource("a", "group:15", "metered", "0.15")
@@ -2075,6 +2410,58 @@ class ConfigAndStoreTests(unittest.TestCase):
             ],
         }
         self.assertIs(validate_config(config), config)
+
+    def test_config_cannot_disable_mandatory_new_group_probes(self) -> None:
+        config = {
+            "version": 1,
+            "target": {
+                "api_base": "http://127.0.0.1/api/v1",
+                "dashboard_origin": "http://127.0.0.1",
+                "group_id": 9,
+            },
+            "providers": [
+                {
+                    "id": "p1",
+                    "type": "new-api",
+                    "api_base": "https://example.test",
+                    "dashboard_origin": "https://example.test",
+                    "inference_base": "https://example.test/v1",
+                    "include_group_regex": "^gpt",
+                    "subscription_resource_allowlist": [],
+                    "probe_new_resources": False,
+                    "adopt": [],
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ReconcileError, "cannot disable"):
+            validate_config(config)
+
+    def test_historical_revalidation_list_is_explicit_and_canonical(self) -> None:
+        config = {
+            "version": 1,
+            "target": {
+                "api_base": "http://127.0.0.1/api/v1",
+                "dashboard_origin": "http://127.0.0.1",
+                "group_id": 9,
+            },
+            "providers": [
+                {
+                    "id": "p1",
+                    "type": "new-api",
+                    "api_base": "https://example.test",
+                    "dashboard_origin": "https://example.test",
+                    "inference_base": "https://example.test/v1",
+                    "include_group_regex": "^gpt",
+                    "subscription_resource_allowlist": [],
+                    "probe_revalidate_resource_ids": ["group:gpt"],
+                    "adopt": [],
+                }
+            ],
+        }
+        self.assertIs(validate_config(config), config)
+        config["providers"][0]["probe_revalidate_resource_ids"] = ["gpt"]
+        with self.assertRaisesRegex(ReconcileError, "group"):
+            validate_config(config)
 
     def test_target_concurrency_overrides_are_positive_integers(self) -> None:
         config = {

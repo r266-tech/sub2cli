@@ -1,6 +1,6 @@
 # Upstream reconciler autonomy contract
 
-This contract is consumed by the twice-daily Codex automation. Routine runs
+This contract is consumed by the hourly Codex automation. Routine runs
 remain deterministic. Intelligent source maintenance is allowed only for a
 confirmed upstream response-schema change.
 
@@ -10,10 +10,26 @@ confirmed upstream response-schema change.
 - A Sub2API subscription must be active, started, and not expired.
 - A new or returning group is not exposed to Relay until a dedicated managed
   probe key completes a real Codex-compatible `/v1/responses` stream.
+- An unchanged active group reuses its bound proof and is not probed again.
+  Multiplier-only changes recalculate priority without spending inference quota.
+- A valid `/v1/models` catalog with no GPT/Codex text model defers the group
+  before the paid probe. Missing or broken model catalogs fall through to the
+  exact-model probe because some otherwise compatible relays omit this endpoint.
 - A failed candidate probe is a normal deferred result. Keep it out of Relay
   and retry it once on the next scheduled run.
-- Subscription routes are priority 1. Metered routes use dense ascending
-  multiplier tiers, with equal multipliers sharing one priority.
+- A missing group is quarantined first and deleted only after the configured
+  grace period and consecutive complete-scan confirmations. In production the
+  intended policy is two hourly confirmations over about two hours.
+- Priority tiers are computed only from groups that have passed the dedicated
+  compatibility probe. Pending or failed candidates never reserve a tier.
+- Qualified metered groups use `ceil(multiplier * 1000)`, with the boundary
+  clamped around the configurable `target.subscription_priority` (default
+  `40`). Values below `0.04x` stay in `1..39`, exactly `0.04x` shares priority
+  `40` with subscriptions, and values above it start at `41`. Thus `0.02x ->
+  20`, `0.04x -> 40`, subscription `-> 40`, `0.15x -> 150`, and `1x -> 1000`.
+  Equal multipliers share the same priority, and adding another group never
+  renumbers existing routes. Changing the one fixed subscription priority also
+  moves the matching multiplier boundary.
 - Each provider's configured target-account concurrency is enforced for both
   existing and newly created managed accounts, and is included in verification
   and rollback snapshots.
@@ -37,7 +53,7 @@ multiplier, and any generic parsing or transport failure are not
 
 ## Scheduled orchestration order
 
-Every twice-daily run first calls `maintenance status`. A `verified` or
+Every hourly run first calls `maintenance status`. A `verified` or
 `push_pending` gate must finish `maintenance promote` before any new scan; a
 `prepared` gate must resume only its recorded worktree; an interrupted
 `verifying` or `applying` gate stops and notifies rather than starting another

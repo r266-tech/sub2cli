@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any, Iterable, Literal
 
 
 MANAGED_PREFIX = "bbta:v1"
 PROBE_PREFIX = "bbta:probe:v1"
 METADATA_KEY = "babata_upstream_reconciler"
+METERED_PRIORITY_SCALE = Decimal("1000")
+DEFAULT_SUBSCRIPTION_PRIORITY = 40
 
 
 class ReconcileError(RuntimeError):
@@ -146,28 +148,46 @@ class Action:
         }
 
 
-def assign_priorities(resources: Iterable[UpstreamResource]) -> list[UpstreamResource]:
+def assign_priorities(
+    resources: Iterable[UpstreamResource],
+    *,
+    subscription_priority: int = DEFAULT_SUBSCRIPTION_PRIORITY,
+) -> list[UpstreamResource]:
+    """Assign tiers to resources that have already passed qualification."""
+
+    if isinstance(subscription_priority, bool) or subscription_priority < 2:
+        raise ReconcileError(
+            "invalid_subscription_priority",
+            "subscription priority must be an integer >= 2",
+        )
+    threshold = Decimal(subscription_priority) / METERED_PRIORITY_SCALE
     items = list(resources)
     if not items:
         raise ReconcileError("empty_inventory", "no eligible upstream groups were found")
 
-    metered_rates: set[Decimal] = set()
     for item in items:
         if item.source_class == "subscription":
             if item.multiplier is not None:
                 # Subscription billing multiplier is intentionally ignored for routing.
                 item.multiplier = None
-            continue
-        if item.source_class != "metered" or item.multiplier is None:
+            item.priority = subscription_priority
+        elif item.source_class != "metered" or item.multiplier is None:
             raise ReconcileError(
                 "unclassified_group",
                 f"{item.provider_id}/{item.resource_id} has no authoritative class or multiplier",
             )
-        metered_rates.add(item.multiplier)
-
-    rate_priorities = {rate: index + 2 for index, rate in enumerate(sorted(metered_rates))}
-    for item in items:
-        item.priority = 1 if item.source_class == "subscription" else rate_priorities[item.multiplier]
+        else:
+            raw_priority = int(
+                (item.multiplier * METERED_PRIORITY_SCALE).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            )
+            if item.multiplier < threshold:
+                item.priority = min(subscription_priority - 1, max(1, raw_priority))
+            elif item.multiplier == threshold:
+                item.priority = subscription_priority
+            else:
+                item.priority = max(subscription_priority + 1, raw_priority)
 
     return sorted(
         items,

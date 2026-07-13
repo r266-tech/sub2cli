@@ -14,7 +14,7 @@ import requests
 import websocket  # type: ignore[import-not-found]
 
 from .core import MANAGED_PREFIX, ReconcileError, UpstreamKey, UpstreamResource, decimal_value
-from .probe import ProbeResult, probe_codex_responses
+from .probe import REQUIRED_MODEL, ProbeResult, probe_codex_responses
 from .store import keychain_get, keychain_set
 
 
@@ -303,23 +303,11 @@ class ProviderClient:
         return key
 
     def probe_resource(self, resource: UpstreamResource, key: UpstreamKey) -> ProbeResult:
-        preferred = self.config.get("probe_preferred_models")
         return probe_codex_responses(
             str(self.config["inference_base"]),
             key.secret,
             timeout=float(self.config.get("probe_timeout_seconds", 30)),
-            allow_regex=str(
-                self.config.get("probe_model_allow_regex") or r"^(?:gpt-|codex-)"
-            ),
-            deny_regex=str(
-                self.config.get("probe_model_deny_regex")
-                or r"(?:^|[-_/])(?:audio|embedding|image|realtime|speech|transcribe|tts|video)(?:$|[-_/])"
-            ),
-            preferred_models=(
-                [str(value) for value in preferred]
-                if isinstance(preferred, list)
-                else ("gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3-codex-spark")
-            ),
+            required_model=REQUIRED_MODEL,
         )
 
     def login_with_credentials(self, account: str, password: str) -> None:  # pragma: no cover

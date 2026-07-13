@@ -17,6 +17,9 @@ DEFAULT_PREFERRED_MODELS = (
     "gpt-5.4",
     "gpt-5.3-codex-spark",
 )
+REQUIRED_MODEL = "gpt-5.6-sol"
+PROBE_POLICY = "strict-gpt-5.6-sol-responses-v2"
+RESPONSE_CONTRACT = "openai-responses-v1-terminal-v2"
 MAX_MODELS_BYTES = 1_000_000
 MAX_RESPONSE_BYTES = 512_000
 
@@ -29,6 +32,7 @@ class ProbeResult:
     http_status: int | None = None
     model: str | None = None
     model_count: int = 0
+    response_id: str | None = None
 
     def safe_dict(self) -> dict[str, Any]:
         return {
@@ -38,6 +42,7 @@ class ProbeResult:
             "http_status": self.http_status,
             "model": self.model,
             "model_count": self.model_count,
+            "response_id": self.response_id,
         }
 
 
@@ -169,21 +174,58 @@ def _status_result(status: int, *, model: str | None, model_count: int) -> Probe
     )
 
 
-def _response_event_accepted(value: Any) -> bool:
+def _terminal_response(
+    value: Any,
+    *,
+    required_model: str,
+) -> tuple[bool, str | None]:
     if not isinstance(value, dict):
-        return False
+        return False, None
     event_type = str(value.get("type") or "")
     response = value.get("response") if isinstance(value.get("response"), dict) else value
     if response.get("error"):
-        return False
-    if event_type == "response.completed":
-        return str(response.get("status") or "") == "completed"
-    if response.get("object") == "response" and str(response.get("status") or "") == "completed":
-        return True
-    if event_type == "response.incomplete" or str(response.get("status") or "") == "incomplete":
+        return False, None
+    response_id = response.get("id")
+    if not isinstance(response_id, str) or not response_id.strip():
+        return False, None
+    if response.get("object") != "response":
+        return False, None
+    if response.get("model") != required_model:
+        return False, None
+    output = response.get("output")
+    usage = response.get("usage")
+    if not isinstance(output, list) or not output:
+        return False, None
+    if not isinstance(usage, dict):
+        return False, None
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if (
+        isinstance(input_tokens, bool)
+        or not isinstance(input_tokens, int)
+        or input_tokens < 1
+        or isinstance(output_tokens, bool)
+        or not isinstance(output_tokens, int)
+        or output_tokens < 1
+    ):
+        return False, None
+    status = str(response.get("status") or "")
+    if event_type:
+        if event_type not in ("response.completed", "response.incomplete"):
+            return False, None
+        expected_status = event_type.removeprefix("response.")
+        if status != expected_status:
+            return False, None
+    if status == "completed":
+        return True, response_id
+    if status == "incomplete":
         details = response.get("incomplete_details")
-        return isinstance(details, dict) and details.get("reason") == "max_output_tokens"
-    return False
+        return (
+            isinstance(details, dict)
+            and details.get("reason") == "max_output_tokens",
+            response_id,
+        )
+    return False, None
 
 
 def _response_event_failed(value: Any) -> bool:
@@ -199,28 +241,32 @@ def _response_event_failed(value: Any) -> bool:
     )
 
 
-def _valid_responses_stream(response: requests.Response) -> bool:
+def _valid_responses_stream(
+    response: requests.Response,
+    *,
+    required_model: str,
+) -> tuple[bool, str | None]:
     consumed = 0
     content_type = str(response.headers.get("Content-Type") or "").lower()
     if "text/event-stream" not in content_type:
         body = response.content
         if len(body) > MAX_RESPONSE_BYTES:
-            return False
+            return False, None
         try:
-            return _response_event_accepted(json.loads(body))
+            return _terminal_response(json.loads(body), required_model=required_model)
         except (TypeError, ValueError):
-            return False
-    accepted = False
+            return False, None
+    terminal_response_id: str | None = None
     for raw_line in response.iter_lines(decode_unicode=False):
         consumed += len(raw_line)
         if consumed > MAX_RESPONSE_BYTES:
-            return False
+            return False, None
         line = raw_line.decode("utf-8", errors="replace").strip()
         if line in ("event: error", "event: response.error", "event: response.failed"):
-            return False
+            return False, None
         if line in ("event: response.completed", "event: response.incomplete"):
             # The following data line still determines whether an incomplete
-            # result is the expected one-token cap.
+            # result is the bounded-output cap used by this probe.
             continue
         if not line.startswith("data:"):
             continue
@@ -230,12 +276,18 @@ def _valid_responses_stream(response: requests.Response) -> bool:
         try:
             event = json.loads(data)
         except ValueError:
-            continue
+            return False, None
         if _response_event_failed(event):
-            return False
-        if _response_event_accepted(event):
-            accepted = True
-    return accepted
+            return False, None
+        accepted, response_id = _terminal_response(
+            event,
+            required_model=required_model,
+        )
+        if accepted:
+            if terminal_response_id is not None:
+                return False, None
+            terminal_response_id = response_id
+    return terminal_response_id is not None, terminal_response_id
 
 
 def probe_codex_responses(
@@ -243,13 +295,14 @@ def probe_codex_responses(
     api_key: str,
     *,
     timeout: float = 30.0,
-    allow_regex: str = DEFAULT_ALLOW_RE,
-    deny_regex: str = DEFAULT_DENY_RE,
-    preferred_models: Iterable[str] = DEFAULT_PREFERRED_MODELS,
+    required_model: str = REQUIRED_MODEL,
     session: requests.Session | None = None,
 ) -> ProbeResult:
+    if required_model != REQUIRED_MODEL:
+        return ProbeResult(False, "probe_policy_mismatch", False, model=required_model)
     client = session or requests.Session()
     headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    model_count = 0
     models_url = _endpoint(base_url, "models")
     try:
         models_response = client.get(
@@ -259,25 +312,32 @@ def probe_codex_responses(
             allow_redirects=False,
         )
     except requests.RequestException:
-        return ProbeResult(False, "probe_models_unreachable", True)
-    if models_response.is_redirect or not _same_origin(models_url, models_response.url):
-        return ProbeResult(False, "probe_cross_origin_redirect", True, models_response.status_code)
-    if models_response.status_code != 200:
-        return _status_result(models_response.status_code, model=None, model_count=0)
-    if len(models_response.content) > MAX_MODELS_BYTES:
-        return ProbeResult(False, "probe_models_too_large", True, http_status=200)
-    try:
-        models = parse_models_payload(models_response.json())
-    except ValueError:
-        return ProbeResult(False, "probe_models_invalid_json", True, http_status=200)
-    model, model_count = select_codex_model(
-        models,
-        allow_regex=allow_regex,
-        deny_regex=deny_regex,
-        preferred_models=preferred_models,
-    )
-    if model is None:
-        return ProbeResult(False, "probe_no_codex_model", True, http_status=200)
+        models_response = None
+    # A valid catalog is a cheap admission prefilter: if it proves there are no
+    # GPT/Codex text models, do not spend quota on a Responses probe. Relays that
+    # omit or break /models still fall through to the exact-model request.
+    if (
+        models_response is not None
+        and not models_response.is_redirect
+        and _same_origin(models_url, models_response.url)
+        and models_response.status_code == 200
+        and len(models_response.content) <= MAX_MODELS_BYTES
+    ):
+        try:
+            models = parse_models_payload(models_response.json())
+            _, model_count = select_codex_model(models)
+        except (TypeError, ValueError):
+            model_count = 0
+        else:
+            if model_count == 0:
+                return ProbeResult(
+                    False,
+                    "probe_no_codex_model",
+                    False,
+                    http_status=200,
+                    model=required_model,
+                    model_count=0,
+                )
 
     responses_url = _endpoint(base_url, "responses")
     response_headers = {**headers, "Content-Type": "application/json", "Accept": "text/event-stream"}
@@ -286,9 +346,9 @@ def probe_codex_responses(
             responses_url,
             headers=response_headers,
             json={
-                "model": model,
-                "input": "hi",
-                "max_output_tokens": 1,
+                "model": required_model,
+                "input": "Reply with OK.",
+                "max_output_tokens": 8,
                 "stream": True,
                 "store": False,
             },
@@ -301,7 +361,7 @@ def probe_codex_responses(
             False,
             "probe_responses_unreachable",
             True,
-            model=model,
+            model=required_model,
             model_count=model_count,
         )
     if response.is_redirect or not _same_origin(responses_url, response.url):
@@ -310,22 +370,40 @@ def probe_codex_responses(
             "probe_cross_origin_redirect",
             True,
             http_status=response.status_code,
-            model=model,
+            model=required_model,
             model_count=model_count,
         )
     if response.status_code != 200:
         return _status_result(
             response.status_code,
-            model=model,
+            model=required_model,
             model_count=model_count,
         )
-    if not _valid_responses_stream(response):
+    try:
+        valid_contract, response_id = _valid_responses_stream(
+            response,
+            required_model=required_model,
+        )
+    except requests.RequestException:
+        return ProbeResult(
+            False,
+            "probe_responses_unreachable",
+            True,
+            http_status=200,
+            model=required_model,
+            model_count=model_count,
+        )
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    if not valid_contract:
         return ProbeResult(
             False,
             "probe_invalid_responses_protocol",
             True,
             http_status=200,
-            model=model,
+            model=required_model,
             model_count=model_count,
         )
     return ProbeResult(
@@ -333,6 +411,7 @@ def probe_codex_responses(
         "compatible",
         False,
         http_status=200,
-        model=model,
+        model=required_model,
         model_count=model_count,
+        response_id=response_id,
     )

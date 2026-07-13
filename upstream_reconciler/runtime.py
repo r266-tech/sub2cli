@@ -35,6 +35,7 @@ from .core import (
     metadata_from_account,
     probe_marker_for,
 )
+from .probe import PROBE_POLICY, REQUIRED_MODEL, RESPONSE_CONTRACT
 from .store import (
     append_audit,
     atomic_write_json,
@@ -103,6 +104,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         or target_concurrency < 1
     ):
         raise ReconcileError("invalid_config", "target.concurrency must be an integer >= 1")
+    subscription_priority = target.get("subscription_priority", 40)
+    if (
+        isinstance(subscription_priority, bool)
+        or not isinstance(subscription_priority, int)
+        or subscription_priority < 2
+    ):
+        raise ReconcileError(
+            "invalid_config", "target.subscription_priority must be an integer >= 2"
+        )
     _require_same_credential_origin(
         "target", str(target["dashboard_origin"]), str(target["api_base"])
     )
@@ -262,11 +272,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                 "invalid_config",
                 f"{provider_id}.require_subscription_expiry is supported only as a boolean for sub2api",
             )
-        if "probe_new_resources" in provider and not isinstance(
-            provider.get("probe_new_resources"), bool
-        ):
+        if "probe_new_resources" in provider and provider.get("probe_new_resources") is not True:
             raise ReconcileError(
-                "invalid_config", f"{provider_id}.probe_new_resources must be a boolean"
+                "invalid_config",
+                f"{provider_id}.probe_new_resources cannot disable mandatory admission probes",
             )
         try:
             probe_timeout = float(provider.get("probe_timeout_seconds", 30))
@@ -297,6 +306,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ReconcileError(
                 "invalid_config",
                 f"{provider_id}.probe_preferred_models must be a non-empty string list",
+            )
+        revalidate_resources = provider.get("probe_revalidate_resource_ids", [])
+        if (
+            not isinstance(revalidate_resources, list)
+            or any(
+                not isinstance(value, str) or not value.startswith("group:")
+                for value in revalidate_resources
+            )
+            or len(set(revalidate_resources)) != len(revalidate_resources)
+        ):
+            raise ReconcileError(
+                "invalid_config",
+                f"{provider_id}.probe_revalidate_resource_ids must contain unique group:* strings",
             )
         adoption_resources: set[str] = set()
         for adoption in provider.get("adopt", []):
@@ -340,15 +362,10 @@ def _adoption_map(provider_config: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def _probe_policy_hash(provider_config: dict[str, Any]) -> str:
     payload = {
-        "policy": "codex-responses-sse-v1",
+        "policy": PROBE_POLICY,
+        "contract": RESPONSE_CONTRACT,
+        "required_model": REQUIRED_MODEL,
         "inference_base": str(provider_config.get("inference_base") or "").rstrip("/"),
-        "allow": str(provider_config.get("probe_model_allow_regex") or r"^(?:gpt-|codex-)"),
-        "deny": str(
-            provider_config.get("probe_model_deny_regex")
-            or r"(?:^|[-_/])(?:audio|embedding|image|realtime|speech|transcribe|tts|video)(?:$|[-_/])"
-        ),
-        "preferred": provider_config.get("probe_preferred_models")
-        or ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3-codex-spark"],
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -392,6 +409,12 @@ def _probe_record_matches_resource(
 ) -> bool:
     return bool(
         record.get("outcome") == "compatible"
+        and record.get("probe_policy") == PROBE_POLICY
+        and record.get("response_contract") == RESPONSE_CONTRACT
+        and record.get("required_model") == REQUIRED_MODEL
+        and record.get("model") == REQUIRED_MODEL
+        and isinstance(record.get("response_id"), str)
+        and bool(str(record.get("response_id")).strip())
         and record.get("policy_hash") == _probe_policy_hash(provider_config)
         and record.get("inference_base") == _normalized_inference_base(provider_config)
         and str(record.get("group_ref") or "") == resource.group_ref
@@ -430,8 +453,6 @@ def _resource_probe_gate(
     *,
     snapshot: ProviderSnapshot | None = None,
 ) -> tuple[bool, str | None]:
-    if not provider_config.get("probe_new_resources", False):
-        return True, None
     if _resource_is_grandfathered(provider_config, resource, state):
         return True, None
     state_id = resource_state_id(resource.provider_id, resource.resource_id)
@@ -690,6 +711,9 @@ def _write_probe_pending_state(
     record = {
         "provider_id": resource.provider_id,
         "resource_id": resource.resource_id,
+        "probe_policy": PROBE_POLICY,
+        "response_contract": RESPONSE_CONTRACT,
+        "required_model": REQUIRED_MODEL,
         "policy_hash": _probe_policy_hash(provider_config),
         "inference_base": _normalized_inference_base(provider_config),
         "outcome": "pending",
@@ -698,6 +722,7 @@ def _write_probe_pending_state(
         "http_status": None,
         "model": None,
         "model_count": 0,
+        "response_id": None,
         "upstream_key_id": key.id,
         "key_fingerprint": key_fingerprint,
         "group_ref": resource.group_ref,
@@ -821,6 +846,9 @@ def _recover_pending_probe_keys(
             record = {
                 "provider_id": provider_id,
                 "resource_id": resource_id,
+                "probe_policy": PROBE_POLICY,
+                "response_contract": RESPONSE_CONTRACT,
+                "required_model": REQUIRED_MODEL,
                 "policy_hash": _probe_policy_hash(provider_config),
                 "inference_base": _normalized_inference_base(provider_config),
                 "outcome": "pending",
@@ -829,6 +857,7 @@ def _recover_pending_probe_keys(
                 "http_status": None,
                 "model": None,
                 "model_count": 0,
+                "response_id": None,
                 "upstream_key_id": key.id,
                 "key_fingerprint": key_fingerprint,
                 "group_ref": group_ref,
@@ -896,6 +925,51 @@ def _write_candidate_resource_state(
     }
 
 
+def _completed_probe_record(
+    provider_config: dict[str, Any],
+    resource: UpstreamResource,
+    key: UpstreamKey,
+    probe: Any,
+    *,
+    attempt_count: int,
+    mode: str,
+) -> dict[str, Any]:
+    return {
+        "provider_id": resource.provider_id,
+        "resource_id": resource.resource_id,
+        "probe_policy": PROBE_POLICY,
+        "response_contract": RESPONSE_CONTRACT,
+        "required_model": REQUIRED_MODEL,
+        "policy_hash": _probe_policy_hash(provider_config),
+        "inference_base": _normalized_inference_base(provider_config),
+        "outcome": "compatible" if probe.compatible else "retry",
+        "code": probe.code,
+        "retryable": probe.retryable,
+        "http_status": probe.http_status,
+        "model": probe.model,
+        "model_count": probe.model_count,
+        "response_id": probe.response_id,
+        "upstream_key_id": key.id,
+        "key_fingerprint": key.fingerprint,
+        "group_ref": resource.group_ref,
+        "marker": key.name,
+        "probe_marker": resource.probe_marker,
+        "mode": mode,
+        "attempt_count": attempt_count,
+        "last_attempt_at": utc_now(),
+    }
+
+
+def _historical_revalidation_requested(
+    provider_config: dict[str, Any], resource: UpstreamResource
+) -> bool:
+    configured = provider_config.get("probe_revalidate_resource_ids", [])
+    return bool(
+        resource.resource_id in _adoption_map(provider_config)
+        or (isinstance(configured, list) and resource.resource_id in configured)
+    )
+
+
 def _qualify_pending_resources(
     config: dict[str, Any],
     state: dict[str, Any],
@@ -915,20 +989,193 @@ def _qualify_pending_resources(
         raise ReconcileError("invalid_local_state", "state.resources is invalid")
     results: list[dict[str, Any]] = []
     for provider_config in config["providers"]:
-        if not provider_config.get("probe_new_resources", False):
-            continue
         client = provider_from_config(provider_config)
         snapshot = client.scan()
-        policy_hash = _probe_policy_hash(provider_config)
         for resource in snapshot.resources:
             state_id = resource_state_id(resource.provider_id, resource.resource_id)
-            if _resource_is_grandfathered(provider_config, resource, state):
-                records.pop(state_id, None)
-                continue
             cached = _candidate_probe_record(state, state_id)
             formal_key = _single_named_key(
                 snapshot, resource.marker, label="managed"
             )
+            adoption = _adoption_map(provider_config).get(resource.resource_id)
+            adopted_key = (
+                snapshot.key_by_id(adoption.get("key_id")) if adoption else None
+            )
+            if adoption and adopted_key is None:
+                raise ReconcileError(
+                    "adoption_missing",
+                    f"adopted upstream key {adoption.get('key_id')} does not exist for {resource.provider_id}",
+                )
+            if adopted_key is not None and adopted_key.group_ref != resource.group_ref:
+                raise ReconcileError(
+                    "group_drift",
+                    f"adopted upstream key {adopted_key.id} is bound to the wrong upstream group",
+                )
+            if (
+                formal_key is not None
+                and adopted_key is not None
+                and formal_key.id != adopted_key.id
+            ):
+                raise ReconcileError(
+                    "ownership_conflict",
+                    f"conflicting upstream key ownership for {resource.marker}",
+                )
+            grandfathered = _resource_is_grandfathered(
+                provider_config, resource, state
+            )
+            if grandfathered:
+                if not _historical_revalidation_requested(provider_config, resource):
+                    continue
+                if (
+                    cached
+                    and _probe_record_matches_resource(
+                        provider_config, resource, cached
+                    )
+                    and _probe_record_matches_live_key(resource, cached, snapshot)
+                ):
+                    continue
+                state_entry = state_resources.get(state_id)
+                state_entry = state_entry if isinstance(state_entry, dict) else {}
+                key = (
+                    formal_key
+                    or adopted_key
+                    or snapshot.key_by_id(state_entry.get("upstream_key_id"))
+                )
+                if (
+                    key is None
+                    or key.group_ref != resource.group_ref
+                    or key.status not in ("active", "1", "enabled")
+                ):
+                    safe_result = {
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "compatible": False,
+                        "code": "probe_historical_key_unavailable",
+                        "retryable": True,
+                        "http_status": None,
+                        "model": REQUIRED_MODEL,
+                        "model_count": 0,
+                        "mode": "historical_revalidation",
+                        "routing_preserved": True,
+                    }
+                    results.append(safe_result)
+                    append_audit(
+                        audit_path,
+                        {"event": "historical_probe_deferred", **safe_result},
+                    )
+                    continue
+                if not state_entry:
+                    state_entry = {
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "marker": key.name,
+                        "upstream_key_id": key.id,
+                        "target_account_id": (
+                            int(adoption["account_id"]) if adoption else None
+                        ),
+                        "key_fingerprint": (
+                            key.fingerprint
+                            if key.secret and "*" not in key.secret
+                            else None
+                        ),
+                        "source_class": resource.source_class,
+                        "multiplier": decimal_text(resource.multiplier),
+                        "priority": None,
+                        "missing_since": None,
+                        "missing_count": 0,
+                        "status": "active",
+                    }
+                    state_resources[state_id] = state_entry
+                if not key.secret or "*" in key.secret:
+                    cached_secret = keychain_get(
+                        _keychain_resource_account(resource), required=False
+                    )
+                    expected_fingerprint = (
+                        cached.get("key_fingerprint") if cached else None
+                    ) or state_entry.get("key_fingerprint")
+                    if (
+                        cached_secret
+                        and expected_fingerprint
+                        == fingerprint_secret(cached_secret)
+                    ):
+                        key = UpstreamKey(
+                            key.id,
+                            key.name,
+                            key.group_ref,
+                            key.status,
+                            cached_secret,
+                        )
+                    else:
+                        record_mutation(
+                            {
+                                "phase": "intent",
+                                "kind": "reveal_probe_key",
+                                "provider_id": resource.provider_id,
+                                "resource_id": resource.resource_id,
+                                "upstream_key_id": key.id,
+                                "mode": "historical_revalidation",
+                            }
+                        )
+                        key = client.reveal_key(key)
+                        record_mutation(
+                            {
+                                "phase": "done",
+                                "kind": "reveal_probe_key",
+                                "provider_id": resource.provider_id,
+                                "resource_id": resource.resource_id,
+                                "upstream_key_id": key.id,
+                                "mode": "historical_revalidation",
+                            }
+                        )
+                keychain_set(_keychain_resource_account(resource), key.secret)
+                attempt_count = int((cached or {}).get("attempt_count") or 0) + 1
+                record_mutation(
+                    {
+                        "phase": "intent",
+                        "kind": "probe_upstream_resource",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "upstream_key_id": key.id,
+                        "mode": "historical_revalidation",
+                    }
+                )
+                probe = client.probe_resource(resource, key)
+                record_mutation(
+                    {
+                        "phase": "done",
+                        "kind": "probe_upstream_resource",
+                        "provider_id": resource.provider_id,
+                        "resource_id": resource.resource_id,
+                        "upstream_key_id": key.id,
+                        "mode": "historical_revalidation",
+                        "compatible": probe.compatible,
+                        "code": probe.code,
+                    }
+                )
+                record = _completed_probe_record(
+                    provider_config,
+                    resource,
+                    key,
+                    probe,
+                    attempt_count=attempt_count,
+                    mode="historical_revalidation",
+                )
+                records[state_id] = record
+                state_entry["probe"] = dict(record)
+                persist_state(state)
+                safe_result = {
+                    "provider_id": resource.provider_id,
+                    "resource_id": resource.resource_id,
+                    **probe.safe_dict(),
+                    "mode": "historical_revalidation",
+                    "routing_preserved": True,
+                }
+                results.append(safe_result)
+                append_audit(
+                    audit_path,
+                    {"event": "historical_probe_completed", **safe_result},
+                )
+                continue
             probe_key = _single_named_key(
                 snapshot, resource.probe_marker, label="probe"
             )
@@ -1156,25 +1403,14 @@ def _qualify_pending_resources(
                         "upstream_key_id": key.id,
                     }
                 )
-            record = {
-                "provider_id": resource.provider_id,
-                "resource_id": resource.resource_id,
-                "policy_hash": policy_hash,
-                "inference_base": _normalized_inference_base(provider_config),
-                "outcome": "compatible" if probe.compatible else "retry",
-                "code": probe.code,
-                "retryable": probe.retryable,
-                "http_status": probe.http_status,
-                "model": probe.model,
-                "model_count": probe.model_count,
-                "upstream_key_id": key.id,
-                "key_fingerprint": key.fingerprint,
-                "group_ref": resource.group_ref,
-                "marker": key.name,
-                "probe_marker": resource.probe_marker,
-                "attempt_count": attempt_count,
-                "last_attempt_at": utc_now(),
-            }
+            record = _completed_probe_record(
+                provider_config,
+                resource,
+                key,
+                probe,
+                attempt_count=attempt_count,
+                mode="new_resource_admission",
+            )
             records[state_id] = record
             _write_candidate_resource_state(
                 state_resources,
@@ -1183,6 +1419,7 @@ def _qualify_pending_resources(
                 record,
                 compatible=probe.compatible,
             )
+            persist_state(state)
             safe_result = {
                 "provider_id": resource.provider_id,
                 "resource_id": resource.resource_id,
@@ -1276,9 +1513,15 @@ def build_inventory(config: dict[str, Any], state: dict[str, Any]) -> Inventory:
             resources.append(resource)
 
     if resources:
-        resources = assign_priorities(resources)
+        resources = assign_priorities(
+            resources,
+            subscription_priority=int(config.get("target", {}).get("subscription_priority", 40)),
+        )
     elif not skipped_resources and not state_resources:
-        resources = assign_priorities(resources)
+        resources = assign_priorities(
+            resources,
+            subscription_priority=int(config.get("target", {}).get("subscription_priority", 40)),
+        )
     bindings: list[Binding] = []
     for resource in resources:
         provider_config = provider_configs[resource.provider_id]
@@ -1883,6 +2126,9 @@ def _apply_active_resources(
     for binding in inventory.bindings:
         assert binding.target_account is not None
         account_id = int(binding.target_account["id"])
+        state_id = resource_state_id(
+            binding.resource.provider_id, binding.resource.resource_id
+        )
         if binding.target_account.get("schedulable") is not True:
             record(
                 {
@@ -1901,13 +2147,15 @@ def _apply_active_resources(
                     "schedulable": True,
                 }
             )
+        proof = candidate_records.get(state_id)
+        if isinstance(proof, dict) and binding.resource.key is not None:
+            proof["marker"] = binding.resource.key.name
+            proof["upstream_key_id"] = binding.resource.key.id
+            proof["key_fingerprint"] = binding.resource.key.fingerprint
+            proof["group_ref"] = binding.resource.group_ref
         _write_resource_state(state_resources, binding, account_id)
-        candidate_records.pop(
-            resource_state_id(
-                binding.resource.provider_id, binding.resource.resource_id
-            ),
-            None,
-        )
+        if isinstance(proof, dict):
+            state_resources[state_id]["probe"] = dict(proof)
 
 
 def _parse_when(value: str | None) -> datetime | None:
