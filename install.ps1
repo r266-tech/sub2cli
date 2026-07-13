@@ -2,7 +2,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $DefaultModel = "gpt-5.6-sol"
-$DefaultApiBaseUrl = "https://api.openai.com/v1"
+$OfficialApiBaseUrl = "https://api.openai.com/v1"
+$RelayProvider = "sub2api"
 
 function Test-Truthy {
     param([string]$Value)
@@ -28,7 +29,11 @@ function Normalize-ApiUrl {
 function Read-ApiKey {
     $RawKey = [Environment]::GetEnvironmentVariable("SUB2CLI_API_KEY")
     if (-not [string]::IsNullOrWhiteSpace($RawKey)) {
-        return $RawKey
+        $Key = $RawKey.Trim()
+        if ($Key.Contains("`r") -or $Key.Contains("`n") -or $Key.IndexOf([char]0) -ge 0) {
+            throw "SUB2CLI_API_KEY must be a single line."
+        }
+        return $Key
     }
 
     $Secure = Read-Host "API key" -AsSecureString
@@ -38,7 +43,14 @@ function Read-ApiKey {
 
     $Ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
     try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($Ptr)
+        $Key = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($Ptr).Trim()
+        if ([string]::IsNullOrWhiteSpace($Key)) {
+            throw "SUB2CLI_API_KEY is required."
+        }
+        if ($Key.Contains("`r") -or $Key.Contains("`n") -or $Key.IndexOf([char]0) -ge 0) {
+            throw "SUB2CLI_API_KEY must be a single line."
+        }
+        return $Key
     }
     finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Ptr)
@@ -104,18 +116,148 @@ function Assert-NoProviderPoolState {
 }
 
 function Assert-DirectBootstrapSafe {
+    param([string]$CodexHome)
+    Assert-NoProviderPoolState $CodexHome
+}
+
+function Get-TopLevelTomlString {
     param(
-        [string]$CodexHome,
-        [string]$ConfigToml
+        [string]$Content,
+        [string]$Key
     )
 
-    if ($null -ne (Get-ItemIfExists $ConfigToml)) {
-        throw ("Existing config.toml/custom configuration detected; the one-line setup refused to overwrite it.`n" +
-            "No ChatGPT/Codex configuration or pool state was changed.`n" +
-            "Open ChatGPT Settings to edit the existing profile, or use this installer with a fresh Windows profile.")
+    $TableMatch = [regex]::Match($Content, '(?m)^[ \t]*\[')
+    $Head = if ($TableMatch.Success) {
+        $Content.Substring(0, $TableMatch.Index)
+    }
+    else {
+        $Content
+    }
+    $EscapedKey = [regex]::Escape($Key)
+    $KeyPattern = '(?:"{0}"|''{0}''|{0})' -f $EscapedKey
+    $Pattern = '(?m)^[ \t]*{0}[ \t]*=[ \t]*([^\r\n]*?)[ \t]*\r?$' -f $KeyPattern
+    $Match = [regex]::Match($Head, $Pattern)
+    if (-not $Match.Success) {
+        return [pscustomobject]@{ Present = $false; Value = $null }
+    }
+    $RawValue = $Match.Groups[1].Value
+    $BasicString = [regex]::Match($RawValue, '^"([^"\\]*)"[ \t]*(?:#.*)?$')
+    if ($BasicString.Success) {
+        return [pscustomobject]@{ Present = $true; Value = $BasicString.Groups[1].Value }
+    }
+    $LiteralString = [regex]::Match($RawValue, "^'([^']*)'[ \t]*(?:#.*)?$")
+    if ($LiteralString.Success) {
+        return [pscustomobject]@{ Present = $true; Value = $LiteralString.Groups[1].Value }
+    }
+    throw ("Existing config.toml uses an unsupported value syntax for '$Key'; " +
+        "the one-line setup refused to overwrite it.")
+}
+
+function Remove-TomlProviderBlock {
+    param(
+        [string]$Content,
+        [string]$Provider
+    )
+
+    $EscapedProvider = [regex]::Escape($Provider)
+    $Pattern = ('(?ms)^[ \t]*\[[ \t]*model_providers[ \t]*\.[ \t]*' +
+        '(?:"{0}"|''{0}''|{0})[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?' +
+        '(?=^[ \t]*\[[^\r\n]*\][ \t]*(?:#[^\r\n]*)?\r?$|\z)') -f $EscapedProvider
+    return [regex]::Replace(
+        $Content,
+        $Pattern,
+        "",
+        [Text.RegularExpressions.RegexOptions]::Multiline -bor
+            [Text.RegularExpressions.RegexOptions]::Singleline
+    )
+}
+
+function New-MergedConfigContent {
+    param(
+        [string]$ExistingContent,
+        [string]$Model,
+        [string]$ApiUrl
+    )
+
+    $ProviderSetting = Get-TopLevelTomlString $ExistingContent "model_provider"
+    $ExistingProvider = if ($ProviderSetting.Present) { $ProviderSetting.Value } else { $null }
+    if (-not [string]::IsNullOrWhiteSpace($ExistingProvider) -and
+        $ExistingProvider -cnotin @("openai", "OpenAI", $RelayProvider)) {
+        throw ("Existing config.toml selects custom provider '$ExistingProvider'; " +
+            "the one-line setup refused to overwrite that provider selection.")
     }
 
-    Assert-NoProviderPoolState $CodexHome
+    $OpenAiBaseUrlSetting = Get-TopLevelTomlString $ExistingContent "openai_base_url"
+    $ExistingOpenAiBaseUrl = if ($OpenAiBaseUrlSetting.Present) { $OpenAiBaseUrlSetting.Value } else { $null }
+    $ManagedBaseUrls = @(
+        $OfficialApiBaseUrl.TrimEnd([char]"/"),
+        $ApiUrl.TrimEnd([char]"/")
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ExistingOpenAiBaseUrl) -and
+        $ExistingOpenAiBaseUrl.TrimEnd([char]"/") -notin $ManagedBaseUrls -and
+        $ExistingProvider -cnotin @("OpenAI", $RelayProvider)) {
+        throw ("Existing config.toml already routes the built-in openai provider to another base URL; " +
+            "the one-line setup refused to overwrite it.")
+    }
+
+    $ApiBaseUrlSetting = Get-TopLevelTomlString $ExistingContent "api_base_url"
+    $ExistingApiBaseUrl = if ($ApiBaseUrlSetting.Present) { $ApiBaseUrlSetting.Value } else { $null }
+    if (-not [string]::IsNullOrWhiteSpace($ExistingApiBaseUrl) -and
+        $ExistingApiBaseUrl.TrimEnd([char]"/") -notin $ManagedBaseUrls) {
+        throw ("Existing config.toml already sets api_base_url to another base URL; " +
+            "the one-line setup refused to overwrite it.")
+    }
+
+    $TableMatch = [regex]::Match($ExistingContent, '(?m)^[ \t]*\[')
+    if ($TableMatch.Success) {
+        $Head = $ExistingContent.Substring(0, $TableMatch.Index)
+        $Tables = $ExistingContent.Substring($TableMatch.Index)
+    }
+    else {
+        $Head = $ExistingContent
+        $Tables = ""
+    }
+
+    foreach ($Key in @("model", "model_provider", "openai_base_url", "api_base_url", "disable_response_storage")) {
+        $EscapedKey = [regex]::Escape($Key)
+        $KeyPattern = '(?:"{0}"|''{0}''|{0})' -f $EscapedKey
+        $Pattern = '(?m)^[ \t]*{0}[ \t]*=.*(?:\r?\n|\z)' -f $KeyPattern
+        $Head = [regex]::Replace($Head, $Pattern, "")
+    }
+
+    $Tables = Remove-TomlProviderBlock $Tables $RelayProvider
+    if ($ExistingProvider -ceq "OpenAI") {
+        $Tables = Remove-TomlProviderBlock $Tables "OpenAI"
+    }
+
+$ManagedHead = @"
+model = "$(Escape-TomlString $Model)"
+model_provider = "$RelayProvider"
+openai_base_url = "$(Escape-TomlString $ApiUrl)"
+disable_response_storage = true
+"@
+    $ManagedHead = $ManagedHead.Trim()
+
+    $ProviderBlock = @"
+[model_providers.$RelayProvider]
+name = "Sub2API"
+base_url = "$(Escape-TomlString $ApiUrl)"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+"@
+    $ProviderBlock = $ProviderBlock.Trim()
+
+    $Parts = [Collections.Generic.List[string]]::new()
+    $Parts.Add($ManagedHead)
+    if (-not [string]::IsNullOrWhiteSpace($Head)) {
+        $Parts.Add($Head.Trim())
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Tables)) {
+        $Parts.Add($Tables.Trim())
+    }
+    $Parts.Add($ProviderBlock)
+    return ($Parts -join "`r`n`r`n") + "`r`n"
 }
 
 function Test-FileTextEquals {
@@ -176,6 +318,25 @@ function Assert-OriginalAuthState {
     }
     if ($null -ne $AuthItem) {
         throw "auth.json appeared during the one-line setup; refusing to overwrite concurrent state."
+    }
+}
+
+function Assert-OriginalConfigState {
+    param(
+        [string]$ConfigToml,
+        [bool]$ConfigExisted,
+        [string]$ConfigBackup
+    )
+
+    $ConfigItem = Get-ItemIfExists $ConfigToml
+    if ($ConfigExisted) {
+        if ($null -eq $ConfigItem -or -not (Test-FileBytesEqual $ConfigToml $ConfigBackup)) {
+            throw "config.toml changed during the one-line setup; refusing to overwrite concurrent state."
+        }
+        return
+    }
+    if ($null -ne $ConfigItem) {
+        throw "config.toml appeared during the one-line setup; refusing to overwrite concurrent state."
     }
 }
 
@@ -333,6 +494,7 @@ $ConfigFinalContent = $null
 $AuthStage = $null
 $ConfigStage = $null
 $AuthOriginalHeldPath = $null
+$ConfigOriginalHeldPath = $null
 $AuthRollbackQuarantine = $null
 $ConfigRollbackQuarantine = $null
 $FailureException = $null
@@ -342,23 +504,27 @@ try {
     $CodexHome = Get-CodexHome
     $AuthJson = Join-Path $CodexHome "auth.json"
     $ConfigToml = Join-Path $CodexHome "config.toml"
-    Assert-DirectBootstrapSafe $CodexHome $ConfigToml
+    Assert-DirectBootstrapSafe $CodexHome
 
     $ApiKey = Read-ApiKey
     $Model = [Environment]::GetEnvironmentVariable("SUB2CLI_API_MODEL")
     if ([string]::IsNullOrWhiteSpace($Model)) {
         $Model = $DefaultModel
     }
+    else {
+        $Model = $Model.Trim()
+    }
 
     # Read-ApiKey may be interactive. Revalidate after that wait so state
     # created by ChatGPT/Codex or sub2cli-inject in the meantime is preserved.
-    Assert-DirectBootstrapSafe $CodexHome $ConfigToml
+    Assert-DirectBootstrapSafe $CodexHome
 
     $BackupRoot = Join-Path $CodexHome "provider-switch-backups"
     $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $TransactionId = [Guid]::NewGuid().ToString("N")
     $BackupDir = Join-Path $BackupRoot "install-api-$Stamp-$PID-$TransactionId"
     $AuthBackup = Join-Path $BackupDir "auth.json"
+    $ConfigBackup = Join-Path $BackupDir "config.toml"
 
     New-Item -ItemType Directory -Force -Path $CodexHome, $BackupRoot | Out-Null
     New-Item -ItemType Directory -Path $BackupDir | Out-Null
@@ -368,10 +534,17 @@ try {
         Copy-Item -LiteralPath $AuthJson -Destination $AuthBackup
         Assert-OriginalAuthState $AuthJson $true $AuthBackup
     }
+    $ConfigExisted = $null -ne (Get-ItemIfExists $ConfigToml)
+    if ($ConfigExisted) {
+        Copy-Item -LiteralPath $ConfigToml -Destination $ConfigBackup
+        Assert-OriginalConfigState $ConfigToml $true $ConfigBackup
+    }
 
     # Recheck after backup I/O, then fully stage both files before either live
     # path is touched.
-    Assert-DirectBootstrapSafe $CodexHome $ConfigToml
+    Assert-DirectBootstrapSafe $CodexHome
+    Assert-OriginalAuthState $AuthJson $AuthExisted $AuthBackup
+    Assert-OriginalConfigState $ConfigToml $ConfigExisted $ConfigBackup
 
     $AuthObject = [ordered]@{
         OPENAI_API_KEY = $ApiKey
@@ -380,37 +553,41 @@ try {
     $AuthContent = ($AuthObject | ConvertTo-Json -Depth 3)
     $AuthFinalContent = $AuthContent + "`n"
 
-    $ConfigContent = @"
-model = "$(Escape-TomlString $Model)"
-model_provider = "OpenAI"
-api_base_url = "$DefaultApiBaseUrl"
-disable_response_storage = true
-
-[model_providers.OpenAI]
-name = "OpenAI"
-base_url = "$(Escape-TomlString $ApiUrl)"
-wire_api = "responses"
-requires_openai_auth = true
-"@
-    $ConfigFinalContent = $ConfigContent.TrimEnd() + "`n"
+    $ConfigContent = if ($ConfigExisted) {
+        [IO.File]::ReadAllText($ConfigBackup)
+    }
+    else {
+        ""
+    }
+    $ConfigFinalContent = New-MergedConfigContent $ConfigContent $Model $ApiUrl
     $AuthStage = "$AuthJson.$PID.$TransactionId.stage"
     $ConfigStage = "$ConfigToml.$PID.$TransactionId.stage"
     $AuthOriginalHeldPath = "$AuthJson.$PID.$TransactionId.original"
+    $ConfigOriginalHeldPath = "$ConfigToml.$PID.$TransactionId.original"
     $AuthRollbackQuarantine = "$AuthJson.$PID.$TransactionId.rollback"
     $ConfigRollbackQuarantine = "$ConfigToml.$PID.$TransactionId.rollback"
 
     Write-Utf8NoBom $AuthStage $AuthFinalContent
     Write-Utf8NoBom $ConfigStage $ConfigFinalContent
 
-    Assert-DirectBootstrapSafe $CodexHome $ConfigToml
+    Assert-DirectBootstrapSafe $CodexHome
     Assert-OriginalAuthState $AuthJson $AuthExisted $AuthBackup
+    Assert-OriginalConfigState $ConfigToml $ConfigExisted $ConfigBackup
 
     $ConfigCommitted = $false
+    $ConfigOriginalHeld = $false
     $AuthOriginalHeld = $false
     $AuthCommitted = $false
     try {
-        # Move-Item without -Force is an atomic same-volume rename on Windows
-        # and refuses an existing destination. A concurrent config wins safely.
+        if ($ConfigExisted) {
+            Move-Item -LiteralPath $ConfigToml -Destination $ConfigOriginalHeldPath
+            $ConfigOriginalHeld = $true
+            if (-not (Test-FileBytesEqual $ConfigOriginalHeldPath $ConfigBackup)) {
+                throw "config.toml changed during the one-line setup; refusing to overwrite concurrent state."
+            }
+        }
+        # Move-Item without -Force is an atomic same-volume rename on Windows.
+        # A concurrently created replacement wins safely and triggers rollback.
         Move-Item -LiteralPath $ConfigStage -Destination $ConfigToml
         $ConfigStage = $null
         $ConfigCommitted = $true
@@ -437,10 +614,6 @@ requires_openai_auth = true
         Assert-FileTextEquals $ConfigToml $ConfigFinalContent "config.toml"
         Assert-FileTextEquals $AuthJson $AuthFinalContent "auth.json"
 
-        if ($AuthOriginalHeld) {
-            Remove-Item -LiteralPath $AuthOriginalHeldPath -Force
-            $AuthOriginalHeld = $false
-        }
     }
     catch {
         $CommitFailure = $_.Exception
@@ -468,9 +641,16 @@ requires_openai_auth = true
         try {
             if ($ConfigCommitted) {
                 Rollback-OwnedLiveFile `
-                    $ConfigToml $ConfigFinalContent $ConfigRollbackQuarantine "" `
+                    $ConfigToml $ConfigFinalContent $ConfigRollbackQuarantine `
+                    $(if ($ConfigOriginalHeld) { $ConfigOriginalHeldPath } else { "" }) `
                     $BackupDir "config.toml" $TransactionId
                 $ConfigCommitted = $false
+                $ConfigOriginalHeld = $false
+            }
+            elseif ($ConfigOriginalHeld) {
+                Restore-HeldFileWithoutOverwrite `
+                    $ConfigOriginalHeldPath $ConfigToml $BackupDir "config.toml" $TransactionId
+                $ConfigOriginalHeld = $false
             }
         }
         catch {
@@ -483,6 +663,22 @@ requires_openai_auth = true
         }
         throw $CommitFailure
     }
+
+    # The live files are fully committed. Cleanup failures must not trigger a
+    # rollback after either rollback source has already been deleted.
+    foreach ($HeldPath in @(
+        $(if ($AuthOriginalHeld) { $AuthOriginalHeldPath } else { "" }),
+        $(if ($ConfigOriginalHeld) { $ConfigOriginalHeldPath } else { "" })
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($HeldPath)) {
+            Remove-Item -LiteralPath $HeldPath -Force -ErrorAction SilentlyContinue
+            if ($null -ne (Get-ItemIfExists $HeldPath)) {
+                Write-Warning "Committed configuration, but could not remove temporary original: $HeldPath"
+            }
+        }
+    }
+    $AuthOriginalHeld = $false
+    $ConfigOriginalHeld = $false
 
     Write-Host "ChatGPT API configured."
     Write-Host "  url: $ApiUrl"

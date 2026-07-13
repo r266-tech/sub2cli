@@ -11,6 +11,11 @@ import time
 import unittest
 
 try:
+    import tomllib
+except ImportError:
+    tomllib = None
+
+try:
     import fcntl
     import pty
     import termios
@@ -128,6 +133,8 @@ class InstallBootstrapTests(unittest.TestCase):
             config = (codex_home / "config.toml").read_text()
             self.assertIn('model = "gpt-test"', config)
             self.assertIn('model_provider = "OpenAI"', config)
+            self.assertIn('api_base_url = "https://api.openai.com/v1"', config)
+            self.assertIn('[model_providers.OpenAI]', config)
             self.assertIn('base_url = "https://relay.example/v1"', config)
             self.assertIn('wire_api = "responses"', config)
             self.assertIn('requires_openai_auth = true', config)
@@ -847,7 +854,7 @@ class InstallBootstrapTests(unittest.TestCase):
                     "CODEX_HOME": str(codex_home),
                     "SUB2CLI_API_NO_RESTART": "1",
                     "SUB2CLI_API_URL": "https://relay.example///",
-                    "SUB2CLI_API_KEY": 'sk-test"quote\\slash',
+                    "SUB2CLI_API_KEY": '  sk-test"quote\\slash  ',
                     "SUB2CLI_API_MODEL": "gpt-test",
                 }
             )
@@ -883,10 +890,15 @@ class InstallBootstrapTests(unittest.TestCase):
 
             config = (codex_home / "config.toml").read_text()
             self.assertIn('model = "gpt-test"', config)
-            self.assertIn('model_provider = "OpenAI"', config)
+            self.assertIn('model_provider = "sub2api"', config)
+            self.assertIn('openai_base_url = "https://relay.example/v1"', config)
+            self.assertIn('[model_providers.sub2api]', config)
             self.assertIn('base_url = "https://relay.example/v1"', config)
             self.assertIn('wire_api = "responses"', config)
             self.assertIn('requires_openai_auth = true', config)
+            self.assertIn('supports_websockets = false', config)
+            self.assertNotIn('[model_providers.OpenAI]', config)
+            self.assertNotIn('api_base_url = "https://api.openai.com/v1"', config)
 
             backups = list((codex_home / "provider-switch-backups").glob("install-api-*"))
             self.assertEqual(1, len(backups))
@@ -903,8 +915,7 @@ class InstallBootstrapTests(unittest.TestCase):
             codex_home = tmp_root / ".codex"
             bad_app = tmp_root / "ChatGPT.exe"
             codex_home.mkdir()
-            bad_app.write_text("not executable", encoding="utf-8")
-            bad_app.chmod(0o600)
+            bad_app.write_text("test-only placeholder", encoding="utf-8")
 
             env = os.environ.copy()
             for key in ("SUB2CLI_API_NO_RESTART", "SUB2CLI_NO_RESTART"):
@@ -915,6 +926,123 @@ class InstallBootstrapTests(unittest.TestCase):
                     "SUB2CLI_API_URL": "https://relay.example",
                     "SUB2CLI_API_KEY": "sk-test",
                     "SUB2CLI_CHATGPT_APP": str(bad_app),
+                    "SUB2CLI_TEST_INSTALL_SCRIPT": str(ROOT / "install.ps1"),
+                }
+            )
+            wrapper = (
+                "function global:Get-Process { [CmdletBinding()] "
+                "param([string[]]$Name); @() }; "
+                "function global:Start-Process { [CmdletBinding()] "
+                "param([string]$FilePath, [object]$ArgumentList); "
+                "throw 'injected restart failure' }; "
+                ". $env:SUB2CLI_TEST_INSTALL_SCRIPT"
+            )
+            result = subprocess.run(
+                [shell, "-NoProfile", "-Command", wrapper],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+
+            self.assertEqual(
+                0,
+                result.returncode,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("ChatGPT API configured", result.stdout)
+            self.assertIn("automatic restart failed", result.stdout + result.stderr)
+            self.assertTrue((codex_home / "auth.json").exists())
+            self.assertTrue((codex_home / "config.toml").exists())
+
+    def test_windows_bootstrap_rejects_multiline_api_key_before_writes(self):
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            self.skipTest("PowerShell is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / ".codex"
+            codex_home.mkdir()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CODEX_HOME": str(codex_home),
+                    "SUB2CLI_API_NO_RESTART": "1",
+                    "SUB2CLI_API_URL": "https://relay.example",
+                    "SUB2CLI_API_KEY": "sk-first\nsk-second",
+                }
+            )
+            result = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(ROOT / "install.ps1"),
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("must be a single line", result.stderr)
+            self.assertFalse((codex_home / "auth.json").exists())
+            self.assertFalse((codex_home / "config.toml").exists())
+            self.assertFalse((codex_home / "provider-switch-backups").exists())
+
+    def test_windows_bootstrap_merges_existing_desktop_config(self):
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            self.skipTest("PowerShell is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / ".codex"
+            codex_home.mkdir()
+            auth_before = b'{"auth_mode":"chatgpt","tokens":{"access_token":"keep"}}\n'
+            config_before = (
+                'model = "gpt-old"\r\n'
+                '"model_provider" = "sub2api"\r\n'
+                "'openai_base_url' = 'https://relay.example/v1'\r\n"
+                'disable_response_storage = true\r\n'
+                '\r\n'
+                'notify = ["C:\\\\OpenAI\\\\codex.exe", "turn-ended"]\r\n'
+                '\r\n'
+                '[model_providers.sub2api] # replace this managed block\r\n'
+                'name = "Old Sub2API"\r\n'
+                'base_url = "https://old-relay.example/v1"\r\n'
+                'wire_api = "responses"\r\n'
+                'requires_openai_auth = true\r\n'
+                'supports_websockets = true\r\n'
+                '\r\n'
+                '[plugins."documents@openai-primary-runtime"]\r\n'
+                'enabled = true\r\n'
+                '\r\n'
+                '[mcp_servers.node_repl]\r\n'
+                'command = \'C:\\\\OpenAI\\\\node_repl.exe\'\r\n'
+                '\r\n'
+                '[desktop]\r\n'
+                'conversationDetailMode = "STEPS_PROSE"\r\n'
+                '\r\n'
+                "[projects.'c:\\\\users\\\\lenovo\\\\项目']\r\n"
+                'trust_level = "trusted"\r\n'
+            ).encode("utf-8")
+            auth_json = codex_home / "auth.json"
+            config_toml = codex_home / "config.toml"
+            auth_json.write_bytes(auth_before)
+            config_toml.write_bytes(config_before)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CODEX_HOME": str(codex_home),
+                    "SUB2CLI_API_NO_RESTART": "1",
+                    "SUB2CLI_API_URL": "https://relay.example",
+                    "SUB2CLI_API_KEY": "sk-test",
                 }
             )
             result = subprocess.run(
@@ -938,22 +1066,34 @@ class InstallBootstrapTests(unittest.TestCase):
                 result.returncode,
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertIn("ChatGPT API configured", result.stdout)
-            self.assertTrue((codex_home / "auth.json").exists())
-            self.assertTrue((codex_home / "config.toml").exists())
+            merged = config_toml.read_text(encoding="utf-8")
+            self.assertTrue(merged.startswith('model = "gpt-5.6-sol"\n'))
+            self.assertEqual(1, merged.count('model_provider = "sub2api"'))
+            self.assertEqual(1, merged.count('[model_providers.sub2api]'))
+            self.assertIn('openai_base_url = "https://relay.example/v1"', merged)
+            self.assertIn('supports_websockets = false', merged)
+            self.assertNotIn('https://old-relay.example/v1', merged)
+            if tomllib is not None:
+                tomllib.loads(merged)
+            for preserved in (
+                '[plugins."documents@openai-primary-runtime"]\nenabled = true',
+                "[mcp_servers.node_repl]\ncommand = 'C:\\\\OpenAI\\\\node_repl.exe'",
+                '[desktop]\nconversationDetailMode = "STEPS_PROSE"',
+                "[projects.'c:\\\\users\\\\lenovo\\\\项目']\ntrust_level = \"trusted\"",
+            ):
+                self.assertIn(preserved, merged)
 
-    def test_windows_bootstrap_refuses_existing_config_or_pool_state(self):
+            backups = list((codex_home / "provider-switch-backups").glob("install-api-*"))
+            self.assertEqual(1, len(backups))
+            self.assertEqual(auth_before, (backups[0] / "auth.json").read_bytes())
+            self.assertEqual(config_before, (backups[0] / "config.toml").read_bytes())
+
+    def test_windows_bootstrap_refuses_provider_pool_state(self):
         shell = shutil.which("pwsh") or shutil.which("powershell")
         if not shell:
             self.skipTest("PowerShell is not installed")
 
         cases = {
-            "empty-config": {
-                "config.toml": b"",
-            },
-            "nonempty-config": {
-                "config.toml": b'model = "keep"\n[mcp_servers.keep]\ncommand = "keep"\n',
-            },
             "provider-slots": {
                 "provider-slots.json": b'{"current":"keep","route_pools":{"keep":{}}}\n',
             },
@@ -969,7 +1109,9 @@ class InstallBootstrapTests(unittest.TestCase):
                 codex_home = Path(tmp) / ".codex"
                 codex_home.mkdir()
                 auth_before = b'{"auth_mode":"chatgpt","tokens":{"access_token":"keep"}}\n'
+                config_before = b'[mcp_servers.keep]\ncommand = "keep"\n'
                 (codex_home / "auth.json").write_bytes(auth_before)
+                (codex_home / "config.toml").write_bytes(config_before)
                 for relative_path, content in state_files.items():
                     (codex_home / relative_path).write_bytes(content)
 
@@ -1001,11 +1143,169 @@ class InstallBootstrapTests(unittest.TestCase):
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn("Open ChatGPT Settings", result.stderr)
                 self.assertEqual(auth_before, (codex_home / "auth.json").read_bytes())
+                self.assertEqual(config_before, (codex_home / "config.toml").read_bytes())
                 for relative_path, content in state_files.items():
                     self.assertEqual(content, (codex_home / relative_path).read_bytes())
-                if "config.toml" not in state_files:
-                    self.assertFalse((codex_home / "config.toml").exists())
                 self.assertFalse((codex_home / "provider-switch-backups").exists())
+
+    def test_windows_bootstrap_refuses_conflicting_custom_routing(self):
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            self.skipTest("PowerShell is not installed")
+
+        cases = {
+            "custom-provider-basic": 'model_provider = "other"\n',
+            "custom-provider-literal": "model_provider = 'other'\n",
+            "custom-provider-quoted-basic-key": '"model_provider" = "other"\n',
+            "custom-provider-quoted-literal-key": "'model_provider' = 'other'\n",
+            "custom-openai-url-basic": (
+                'model_provider = "openai"\r\n'
+                'openai_base_url = "https://other.example/v1"\r\n'
+            ),
+            "custom-openai-url-literal": (
+                "model_provider = 'openai'\r\n"
+                "openai_base_url = 'https://other.example/v1'\r\n"
+            ),
+            "custom-api-url-basic": (
+                'model_provider = "openai"\r\n'
+                'api_base_url = "https://other.example/v1"\r\n'
+            ),
+            "custom-api-url-literal": (
+                "model_provider = 'openai'\r\n"
+                "'api_base_url' = 'https://other.example/v1'\r\n"
+            ),
+        }
+        for case_name, config_text in cases.items():
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as tmp:
+                codex_home = Path(tmp) / ".codex"
+                codex_home.mkdir()
+                auth_before = b'{"auth_mode":"chatgpt","tokens":{"access_token":"keep"}}\n'
+                config_before = (config_text + '[mcp_servers.keep]\ncommand = "keep"\n').encode()
+                (codex_home / "auth.json").write_bytes(auth_before)
+                (codex_home / "config.toml").write_bytes(config_before)
+
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "CODEX_HOME": str(codex_home),
+                        "SUB2CLI_API_NO_RESTART": "1",
+                        "SUB2CLI_API_URL": "https://relay.example",
+                        "SUB2CLI_API_KEY": "sk-test",
+                    }
+                )
+                result = subprocess.run(
+                    [
+                        shell,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(ROOT / "install.ps1"),
+                    ],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=20,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("refused to overwrite", result.stderr)
+                self.assertEqual(auth_before, (codex_home / "auth.json").read_bytes())
+                self.assertEqual(config_before, (codex_home / "config.toml").read_bytes())
+                backups = list(
+                    (codex_home / "provider-switch-backups").glob("install-api-*")
+                )
+                self.assertEqual(1, len(backups))
+                self.assertEqual(auth_before, (backups[0] / "auth.json").read_bytes())
+                self.assertEqual(config_before, (backups[0] / "config.toml").read_bytes())
+
+    def test_windows_bootstrap_migrates_legacy_provider_idempotently(self):
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            self.skipTest("PowerShell is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / ".codex"
+            codex_home.mkdir()
+            legacy_config = (
+                'model = "gpt-old"\r\n'
+                'model_provider = "OpenAI"\r\n'
+                'api_base_url = "https://api.openai.com/v1"\r\n'
+                'disable_response_storage = true\r\n'
+                '\r\n'
+                '[plugins.keep]\r\n'
+                'enabled = true\r\n'
+                '\r\n'
+                '[model_providers.OpenAI] # legacy managed block\r\n'
+                'name = "OpenAI"\r\n'
+                'base_url = "https://old-relay.example/v1"\r\n'
+                'wire_api = "responses"\r\n'
+                'requires_openai_auth = true\r\n'
+            ).encode()
+            config_toml = codex_home / "config.toml"
+            config_toml.write_bytes(legacy_config)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CODEX_HOME": str(codex_home),
+                    "SUB2CLI_API_NO_RESTART": "1",
+                    "SUB2CLI_API_URL": "https://relay.example",
+                    "SUB2CLI_API_KEY": "sk-test",
+                }
+            )
+            command = [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ROOT / "install.ps1"),
+            ]
+            first = subprocess.run(
+                command,
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+            self.assertEqual(
+                0,
+                first.returncode,
+                msg=f"stdout:\n{first.stdout}\nstderr:\n{first.stderr}",
+            )
+            first_merged = config_toml.read_bytes()
+            first_text = config_toml.read_text(encoding="utf-8")
+            self.assertNotIn('[model_providers.OpenAI]', first_text)
+            self.assertNotIn('api_base_url = "https://api.openai.com/v1"', first_text)
+            self.assertEqual(1, first_text.count('[model_providers.sub2api]'))
+            self.assertIn('[plugins.keep]\nenabled = true', first_text)
+            if tomllib is not None:
+                tomllib.loads(first_text)
+
+            second = subprocess.run(
+                command,
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+            self.assertEqual(
+                0,
+                second.returncode,
+                msg=f"stdout:\n{second.stdout}\nstderr:\n{second.stderr}",
+            )
+            self.assertEqual(first_merged, config_toml.read_bytes())
+
+            backups = sorted(
+                (codex_home / "provider-switch-backups").glob("install-api-*")
+            )
+            self.assertEqual(2, len(backups))
+            config_backups = {(path / "config.toml").read_bytes() for path in backups}
+            self.assertEqual({legacy_config, first_merged}, config_backups)
 
     def test_windows_bootstrap_backup_copy_failure_preserves_live_files(self):
         shell = shutil.which("pwsh") or shutil.which("powershell")
@@ -1048,7 +1348,7 @@ class InstallBootstrapTests(unittest.TestCase):
             self.assertEqual(auth_before, (codex_home / "auth.json").read_bytes())
             self.assertFalse((codex_home / "config.toml").exists())
 
-    def test_windows_bootstrap_rechecks_after_interactive_key_window(self):
+    def test_windows_bootstrap_adopts_config_created_during_key_window(self):
         shell = shutil.which("pwsh") or shutil.which("powershell")
         if not shell:
             self.skipTest("PowerShell is not installed")
@@ -1091,11 +1391,18 @@ class InstallBootstrapTests(unittest.TestCase):
                 timeout=20,
             )
 
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("Existing config.toml", result.stderr)
-            self.assertEqual(config_before, config_toml.read_bytes())
-            self.assertFalse((codex_home / "auth.json").exists())
-            self.assertFalse((codex_home / "provider-switch-backups").exists())
+            self.assertEqual(
+                0,
+                result.returncode,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            merged = config_toml.read_text(encoding="utf-8")
+            self.assertIn('model = "gpt-5.6-sol"', merged)
+            self.assertIn('model_provider = "sub2api"', merged)
+            self.assertIn('[model_providers.sub2api]', merged)
+            backups = list((codex_home / "provider-switch-backups").glob("install-api-*"))
+            self.assertEqual(1, len(backups))
+            self.assertEqual(config_before, (backups[0] / "config.toml").read_bytes())
 
     def test_windows_bootstrap_config_commit_race_preserves_concurrent_config(self):
         shell = shutil.which("pwsh") or shutil.which("powershell")
@@ -1205,6 +1512,66 @@ class InstallBootstrapTests(unittest.TestCase):
             self.assertEqual([], list(codex_home.glob("*.stage")))
             self.assertEqual([], list(codex_home.glob("*.original")))
             self.assertEqual([], list(codex_home.glob("*.rollback")))
+
+    def test_windows_bootstrap_auth_failure_restores_existing_config_exactly(self):
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            self.skipTest("PowerShell is not installed")
+
+        for config_before in (b"", b'[mcp_servers.keep]\ncommand = "keep"\n'):
+            with self.subTest(empty=not config_before), tempfile.TemporaryDirectory() as tmp:
+                codex_home = Path(tmp) / ".codex"
+                codex_home.mkdir()
+                auth_before = b'{"auth_mode":"chatgpt","tokens":{"access_token":"keep"}}\n'
+                auth_json = codex_home / "auth.json"
+                config_toml = codex_home / "config.toml"
+                auth_json.write_bytes(auth_before)
+                config_toml.write_bytes(config_before)
+
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "CODEX_HOME": str(codex_home),
+                        "SUB2CLI_API_NO_RESTART": "1",
+                        "SUB2CLI_API_URL": "https://relay.example",
+                        "SUB2CLI_API_KEY": "sk-test",
+                        "SUB2CLI_TEST_INSTALL_SCRIPT": str(ROOT / "install.ps1"),
+                        "SUB2CLI_TEST_AUTH_PATH": str(auth_json),
+                    }
+                )
+                wrapper = (
+                    "$script:Injected = $false; "
+                    "function global:Move-Item { [CmdletBinding()] param("
+                    "[string]$LiteralPath,[string]$Destination,[switch]$Force); "
+                    "if (-not $script:Injected -and "
+                    "$Destination -eq $env:SUB2CLI_TEST_AUTH_PATH -and "
+                    "$LiteralPath -like '*.stage') { "
+                    "$script:Injected = $true; throw 'injected auth commit failure' }; "
+                    "Microsoft.PowerShell.Management\\Move-Item @PSBoundParameters }; "
+                    ". $env:SUB2CLI_TEST_INSTALL_SCRIPT"
+                )
+                result = subprocess.run(
+                    [shell, "-NoProfile", "-Command", wrapper],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=20,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("injected auth commit failure", result.stderr)
+                self.assertEqual(auth_before, auth_json.read_bytes())
+                self.assertTrue(config_toml.exists())
+                self.assertEqual(config_before, config_toml.read_bytes())
+                backups = list(
+                    (codex_home / "provider-switch-backups").glob("install-api-*")
+                )
+                self.assertEqual(1, len(backups))
+                self.assertEqual(config_before, (backups[0] / "config.toml").read_bytes())
+                self.assertEqual([], list(codex_home.glob("*.stage")))
+                self.assertEqual([], list(codex_home.glob("*.original")))
+                self.assertEqual([], list(codex_home.glob("*.rollback")))
 
     def test_windows_bootstrap_post_commit_pool_race_rolls_back_only_own_files(self):
         shell = shutil.which("pwsh") or shutil.which("powershell")
@@ -1371,8 +1738,16 @@ class InstallBootstrapTests(unittest.TestCase):
         self.assertIn('Get-Process -Name "ChatGPT", "Codex"', script)
         self.assertIn('Where-Object { $_.Name -in @("ChatGPT", "Codex") }', script)
         self.assertIn('"shell:AppsFolder\\$($StartApp.AppID)"', script)
+        self.assertIn('$RelayProvider = "sub2api"', script)
+        self.assertIn('model_provider = "$RelayProvider"', script)
+        self.assertIn('openai_base_url = "$(Escape-TomlString $ApiUrl)"', script)
         self.assertIn('requires_openai_auth = true', script)
+        self.assertIn('supports_websockets = false', script)
         self.assertIn('provider-slots.json', script)
+        self.assertIn(
+            'Move-Item -LiteralPath $ConfigToml -Destination $ConfigOriginalHeldPath',
+            script,
+        )
         self.assertIn(
             'Move-Item -LiteralPath $ConfigStage -Destination $ConfigToml', script
         )

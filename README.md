@@ -126,10 +126,14 @@ This contract means:
 - the public `main/install.sh` and `main/install.ps1` entrypoints remain stable
   when the project version changes
 - `SUB2CLI_API_URL` and `SUB2CLI_API_KEY` retain their meaning across releases
-- changes to either installer must pass the fresh-profile, refusal, rollback,
-  transaction-race and Windows PowerShell 5.1 tests before reaching `main`
-- a fresh profile receives the minimal API-key configuration; an existing
-  `config.toml` or connection pool is never silently overwritten
+- changes to either installer must pass the relevant fresh-profile, refusal,
+  rollback and transaction-race tests; Windows changes must also pass merge and
+  Windows PowerShell 5.1 tests before reaching `main`
+- a fresh profile receives the minimal API-key configuration; on Windows, an
+  existing ChatGPT-generated `config.toml` is backed up and merged without
+  dropping its plugins, MCP servers or desktop settings, while connection-pool
+  state and conflicting custom-provider routing are still refused; the macOS
+  installer continues to refuse an existing `config.toml`
 - version-tagged commands are rollback and reproducibility tools, not the
   command distributed to ordinary users
 
@@ -149,10 +153,11 @@ For a reproducible rollback or investigation, pin both the installer URL and
 `SUB2CLI_REF` to a known release such as `v0.2.15`. Do not use a pinned command
 as the long-lived public onboarding command.
 
-The URL + API-key bootstrap writes the same minimal API-key configuration on
-every machine; installed Python versions do not change its authentication mode.
-Use `sub2cli-inject` explicitly for saved provider slots, route pools, and
-official-account switching.
+The URL + API-key bootstrap writes the same managed API-provider settings on
+every fresh profile; installed Python versions do not change its authentication
+mode. On Windows it can also merge those settings into an existing
+ChatGPT-generated desktop config. Use `sub2cli-inject` explicitly for saved
+provider slots, route pools, and official-account switching.
 
 ## CLI Install
 

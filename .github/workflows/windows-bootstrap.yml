@@ -46,8 +46,12 @@ jobs:
             throw 'auth.json does not contain the expected direct API-key mode'
           }
           $config = Get-Content (Join-Path $env:CODEX_HOME 'config.toml') -Raw
-          if ($config -notmatch 'base_url = "https://relay\.example\.test/v1"' -or
-              $config -notmatch 'requires_openai_auth = true') {
+          if ($config -notmatch 'model_provider = "sub2api"' -or
+              $config -notmatch 'openai_base_url = "https://relay\.example\.test/v1"' -or
+              $config -notmatch '\[model_providers\.sub2api\]' -or
+              $config -notmatch 'base_url = "https://relay\.example\.test/v1"' -or
+              $config -notmatch 'requires_openai_auth = true' -or
+              $config -notmatch 'supports_websockets = false') {
             throw 'config.toml does not contain the expected relay settings'
           }
           $backupAuth = Get-ChildItem (
@@ -62,32 +66,33 @@ jobs:
             throw 'transaction temporary files remained after fresh bootstrap'
           }
 
-      - name: Refuse to overwrite an existing profile
+      - name: Merge an existing desktop profile
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP 'codex-existing'
           New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null
-          $sentinel = "mcp_servers.example = { command = 'keep-me' }`n"
+          $sentinel = "[mcp_servers.example]`ncommand = 'keep-me'`n"
           $configPath = Join-Path $env:CODEX_HOME 'config.toml'
           [IO.File]::WriteAllText($configPath, $sentinel, [Text.UTF8Encoding]::new($false))
           $env:SUB2CLI_API_URL = 'https://relay.example.test'
           $env:SUB2CLI_API_KEY = 'sk-ci-placeholder'
           $env:SUB2CLI_API_NO_RESTART = '1'
 
-          $stderrPath = Join-Path $env:RUNNER_TEMP 'expected-bootstrap-refusal.stderr'
-          $installer = Start-Process `
-            -FilePath (Get-Command pwsh).Source `
-            -ArgumentList @('-NoProfile', '-File', (Resolve-Path './install.ps1').Path) `
-            -RedirectStandardError $stderrPath `
-            -Wait `
-            -PassThru
-          $installerExit = $installer.ExitCode
-          if ($installerExit -eq 0) {
-            throw 'installer unexpectedly overwrote an existing profile'
+          & ./install.ps1
+
+          $config = [IO.File]::ReadAllText($configPath)
+          if ($config -notmatch '(?ms)\[mcp_servers\.example\].*command = ''keep-me''' -or
+              $config -notmatch 'model_provider = "sub2api"' -or
+              $config -notmatch 'supports_websockets = false') {
+            throw 'existing desktop config was not preserved and merged'
           }
-          if ([IO.File]::ReadAllText($configPath) -ne $sentinel) {
-            throw 'existing config.toml changed after refused bootstrap'
+          $backupConfig = Get-ChildItem (
+            Join-Path $env:CODEX_HOME 'provider-switch-backups/*/config.toml'
+          )
+          if (@($backupConfig).Count -ne 1 -or
+              [IO.File]::ReadAllText($backupConfig[0].FullName) -ne $sentinel) {
+            throw 'existing config.toml was not preserved in the rollback backup'
           }
 
       - name: Run Windows transaction and race tests
@@ -114,6 +119,12 @@ jobs:
           $auth = Get-Content (Join-Path $env:CODEX_HOME 'auth.json') -Raw | ConvertFrom-Json
           if ($auth.OPENAI_API_KEY -ne 'sk-ci-placeholder' -or $auth.auth_mode -ne 'apikey') {
             throw 'Windows PowerShell 5.1 auth.json verification failed'
+          }
+          $config = Get-Content (Join-Path $env:CODEX_HOME 'config.toml') -Raw
+          if ($config -notmatch 'model_provider = "sub2api"' -or
+              $config -notmatch 'openai_base_url = "https://relay\.example\.test/v1"' -or
+              $config -notmatch 'supports_websockets = false') {
+            throw 'Windows PowerShell 5.1 config.toml verification failed'
           }
           if (Test-Path Env:SUB2CLI_API_KEY) { throw 'PowerShell 5.1 key env remained' }
           if (Get-Command Test-Truthy -ErrorAction SilentlyContinue) {
@@ -154,7 +165,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null
           [IO.File]::WriteAllText(
             (Join-Path $env:CODEX_HOME 'config.toml'),
-            "model = 'keep'`n",
+            "model_provider = 'other'`n",
             [Text.UTF8Encoding]::new($false)
           )
           $env:SUB2CLI_API_URL = 'https://relay.example.test'
