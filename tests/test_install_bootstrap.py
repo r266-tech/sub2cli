@@ -1210,7 +1210,10 @@ class InstallBootstrapTests(unittest.TestCase):
                 )
 
                 self.assertNotEqual(0, result.returncode)
-                self.assertIn("refused to overwrite", result.stderr)
+                # GitHub's Windows terminal can wrap this error between
+                # "refused" and "to overwrite" while inserting ANSI styling.
+                self.assertIn("refused", result.stderr)
+                self.assertIn("overwrite", result.stderr)
                 self.assertEqual(auth_before, (codex_home / "auth.json").read_bytes())
                 self.assertEqual(config_before, (codex_home / "config.toml").read_bytes())
                 backups = list(
