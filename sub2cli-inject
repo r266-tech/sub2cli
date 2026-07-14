@@ -780,22 +780,83 @@ def validate_slot(slot: str) -> str:
     return slot
 
 
+RECENT_SLOTS_MAX = 12
+
+
 def load_slots(required: bool = True) -> dict:
     if not SLOTS_FILE.exists():
         if required:
             fail(f"{SLOTS_FILE} not found. Run: sub2cli-inject init")
-        return {"version": 1, "current": None, "app_history_slot": None, "slots": {}}
+        return {
+            "version": 1,
+            "current": None,
+            "app_history_slot": None,
+            "recent_slots": [],
+            "slots": {},
+        }
     try:
         data = json.loads(SLOTS_FILE.read_text())
     except json.JSONDecodeError as exc:
         fail(f"{SLOTS_FILE} is invalid JSON: {exc}")
     data.setdefault("version", 1)
     data.setdefault("slots", {})
+    if not isinstance(data.get("recent_slots"), list):
+        data["recent_slots"] = []
     return data
 
 
 def save_slots(data: dict) -> None:
     atomic_write_json(SLOTS_FILE, data)
+
+
+def touch_recent_slot(data: dict, slot: str, *, limit: int = RECENT_SLOTS_MAX) -> None:
+    """Record slot as most-recently used (MRU). Mutates data in place."""
+    name = str(slot or "").strip()
+    if not name:
+        return
+    recent = [str(x) for x in (data.get("recent_slots") or []) if isinstance(x, str) and x]
+    recent = [name] + [x for x in recent if x != name]
+    data["recent_slots"] = recent[: max(1, int(limit))]
+
+
+def prune_recent_slots(data: dict) -> None:
+    """Drop recent entries that no longer exist as slots."""
+    slots = data.get("slots") or {}
+    recent = [str(x) for x in (data.get("recent_slots") or []) if isinstance(x, str)]
+    data["recent_slots"] = [name for name in recent if name in slots]
+
+
+def ordered_slot_names(data: dict) -> list[str]:
+    """Current first, then recent MRU, then remaining alphabetical."""
+    slots = data.get("slots") or {}
+    if not isinstance(slots, dict) or not slots:
+        return []
+    current = data.get("current")
+    recent = [str(x) for x in (data.get("recent_slots") or []) if isinstance(x, str)]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for name in ([current] if isinstance(current, str) else []) + recent:
+        if name in slots and name not in seen:
+            ordered.append(name)
+            seen.add(name)
+    for name in sorted(slots.keys()):
+        if name not in seen:
+            ordered.append(name)
+            seen.add(name)
+    return ordered
+
+
+def format_slot_menu_label(key: str, cfg: dict, *, current: str | None) -> str:
+    marker = "*" if key == current else " "
+    mode = cfg.get("mode", "oauth")
+    label = cfg.get("display_name", key)
+    if mode == "relay" and cfg.get("protocol") == "pool":
+        extra = f"pool:{len(pool_routes(cfg))} routes"
+    elif mode == "relay":
+        extra = str(cfg.get("base_url") or "")
+    else:
+        extra = "账号登录"
+    return f"{marker} {key:<16} [{mode}] {label}  {extra}"
 
 
 def _parse_pid_lines(text: str) -> list[int]:
@@ -2310,6 +2371,15 @@ def chat_completion_to_response(body: dict) -> dict:
 
 
 def _sse(event: str, data: object) -> str:
+    """Encode one SSE frame for the Responses API.
+
+    Codex requires every JSON payload to include a top-level ``type`` field
+    (e.g. ``response.completed``). Callers often pass only the event body; when
+    ``data`` is a dict without ``type``, inject the event name so chat→responses
+    synthesis stays compatible with modern Codex SSE parsers.
+    """
+    if isinstance(data, dict) and "type" not in data:
+        data = {"type": event, **data}
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
@@ -2350,7 +2420,7 @@ def response_json_to_sse(response: dict) -> bytes:
             }))
         chunks.append(_sse("response.output_item.done", {"output_index": output_index, "item": item}))
     chunks.append(_sse("response.completed", {"response": response}))
-    chunks.append("data: [DONE]\n\n")
+    # Prefer OpenAI Responses framing: terminal is response.completed, not chat-style [DONE].
     return "".join(chunks).encode("utf-8")
 
 
@@ -6759,6 +6829,9 @@ def cmd_switch(
 
         if slot_is_clean(data, target_slot) and refreshed_oauth_slot != target_slot:
             print(f"当前已是：{cfg.get('display_name', target_slot)} ({target_slot}) [{mode}]")
+            touch_recent_slot(data, target_slot)
+            prune_recent_slots(data)
+            save_slots(data)
             if mode == "relay":
                 if ensure_protocol_proxy():
                     print(f"  本地代理已启动: {PROTOCOL_PROXY_BASE_URL}")
@@ -6895,6 +6968,8 @@ def cmd_switch(
             data.setdefault("app_history_slot", identity_slot if mode == "relay" else target_slot)
         if mode == "oauth":
             data["preferred_official_slot"] = target_slot
+        touch_recent_slot(data, target_slot)
+        prune_recent_slots(data)
         save_slots(data)
         if mode == "relay":
             if ensure_protocol_proxy():
@@ -7413,14 +7488,20 @@ def cmd_oauth(
 def cmd_list() -> int:
     data = load_slots(required=False)
     current = data.get("current")
-    slots = data.get("slots", {})
+    slots = data.get("slots", {}) or {}
     if not slots:
         print("还没有渠道")
         print("  添加 API：  printf '%s' \"$OPENAI_API_KEY\" | sub2cli-inject add-api https://relay.example.com/v1 --api-key-stdin")
         print("  添加账号： sub2cli-inject add-account work")
         return 0
-    for key, cfg in slots.items():
-        marker = "*" if key == current else " "
+    recent = {
+        name
+        for name in (data.get("recent_slots") or [])
+        if isinstance(name, str) and name in slots
+    }
+    for key in ordered_slot_names(data):
+        cfg = slots[key]
+        marker = "*" if key == current else ("·" if key in recent else " ")
         mode = cfg.get("mode", "oauth")
         label = cfg.get("display_name", key)
         if mode == "relay" and cfg.get("protocol") == "pool":
@@ -7428,6 +7509,8 @@ def cmd_list() -> int:
         else:
             extra = cfg.get("base_url", "") if mode == "relay" else "(账号登录)"
         print(f"{marker} {key:<16} [{mode:<5}] {label:<32} {extra}")
+    if recent:
+        print("  (* 当前  · 最近使用)")
     return 0
 
 
@@ -7493,8 +7576,14 @@ def cmd_remove(slot: str, *, hard: bool = False) -> int:
     if slot == active_identity and (data.get("slots", {}).get(data.get("current")) or {}).get("mode") == "relay":
         fail(f"{slot!r} is the ChatGPT identity backing the current relay; switch to another account first")
     cfg = data["slots"].pop(slot)
+    display = cfg.get("display_name") or slot
+    prune_recent_slots(data)
     save_slots(data)
-    print(f"removed slot: {slot}")
+    print(f"✓ 已删除渠道：{slot}")
+    print(f"  名称：{display}")
+    print(f"  类型：{cfg.get('mode', 'oauth')}")
+    if cfg.get("mode") == "relay" and cfg.get("base_url"):
+        print(f"  URL： {cfg.get('base_url')}")
     if hard:
         auth_path = Path(cfg.get("auth_file", "")).expanduser()
         profile_path = Path(cfg.get("app_profile_dir", "")).expanduser()
@@ -7665,17 +7754,38 @@ def select_menu(
         print(title)
         if subtitle:
             print(subtitle)
-        for idx, (label, _) in enumerate(options, start=1):
+        actionable = [
+            (label, value)
+            for label, value in options
+            if not str(value).startswith("__hdr_")
+        ]
+        for idx, (label, _) in enumerate(actionable, start=1):
             print(f"{idx}. {label}")
         choice = input("> ").strip()
         if not choice:
             return "back"
         try:
-            return options[int(choice) - 1][1]
+            return actionable[int(choice) - 1][1]
         except (ValueError, IndexError):
             return "back"
 
-    selected = 0
+    def _is_header(value: str) -> bool:
+        return str(value).startswith("__hdr_")
+
+    selectable = [i for i, (_, value) in enumerate(options) if not _is_header(value)]
+    if not selectable:
+        return "back"
+    selected = selectable[0]
+
+    def _move(delta: int) -> None:
+        nonlocal selected
+        try:
+            pos = selectable.index(selected)
+        except ValueError:
+            selected = selectable[0]
+            return
+        selected = selectable[(pos + delta) % len(selectable)]
+
     while True:
         clear_screen()
         if branded:
@@ -7690,18 +7800,22 @@ def select_menu(
             if subtitle:
                 print(subtitle)
             print("")
-        for idx, (label, _) in enumerate(options):
+        for idx, (label, value) in enumerate(options):
+            if _is_header(value):
+                print(f"  {label}")
+                continue
             marker = "➤" if idx == selected else " "
-            print(f"{marker} {idx + 1}. {label}")
+            # Number only selectable rows for non-TTY digit entry consistency
+            print(f"{marker} {label}")
         if branded:
             print("\n↑↓  |  Enter 确认  |  Q 退出")
         else:
             print("\n↑↓  |  Enter 确认  |  B 返回  |  Q 退出")
         key = read_key()
         if key == "up":
-            selected = (selected - 1) % len(options)
+            _move(-1)
         elif key == "down":
-            selected = (selected + 1) % len(options)
+            _move(1)
         elif key == "enter":
             return options[selected][1]
         elif key in ("back", "quit"):
@@ -7746,80 +7860,237 @@ def menu_init() -> None:
 
 
 def menu_add_relay() -> None:
+    """Interactive add-api: always Responses, direct third-party URL+key."""
     clear_screen()
-    print("新增 API 渠道\n")
+    print("新增 API\n")
+    print("把第三方网关 URL + API key 存为一条渠道，并可立即切换。")
+    print("协议固定为 responses（原生 Responses API，推荐 Codex 使用）。\n")
     base_url = prompt_line("API base URL（站点根或 /v1 都可）", required=True)
+    try:
+        base_url = normalize_base_url(base_url)
+    except SystemExit:
+        pause()
+        return
     api_key = getpass.getpass("API key（隐藏输入）: ").strip()
+    if not api_key:
+        print("API key 不能为空。")
+        pause()
+        return
+    if any(ch.isspace() for ch in api_key):
+        print("API key 不能包含空白字符。")
+        pause()
+        return
     slot = prompt_line("渠道名（空着则自动从域名取）", default="")
+    if slot:
+        try:
+            slot = validate_slot(slot)
+        except SystemExit:
+            pause()
+            return
+    display = prompt_line("显示名称（可空）", default="")
+    model = prompt_line("默认模型（可空=自动）", default="")
     switch_now = yes_no("现在切到这个渠道", default=True)
+    skip_probe = not yes_no("先探测 URL/key 是否可用", default=True)
     clear_screen()
-    cmd_relay(
+    rc = cmd_relay(
         base_url,
         api_key,
         slot=slot or None,
+        model=model or None,
+        display=display or None,
+        protocol="responses",
+        skip_probe=skip_probe,
         no_switch=not switch_now,
     )
+    if rc != 0:
+        print(f"\n新增 API 未完成（exit {rc}）。")
     pause()
 
 
 def menu_add_oauth() -> None:
+    """Interactive add-account: register a Codex login slot."""
     clear_screen()
-    print("新增账号渠道\n")
+    print("新增账号\n")
+    print("添加一个 Codex 官方登录账号槽位。")
+    print("切换过去后若尚未登录，请运行 `codex login`。\n")
     slot = prompt_line("渠道名，例如 personal 或 work", required=True)
+    try:
+        slot = validate_slot(slot)
+    except SystemExit:
+        pause()
+        return
+    data = load_slots(required=False)
+    existing = (data.get("slots") or {}).get(slot)
+    if existing and existing.get("mode") not in (None, "oauth"):
+        print(f"渠道 {slot!r} 已存在且不是账号渠道（mode={existing.get('mode')}）。")
+        pause()
+        return
+    if existing and existing.get("mode") == "oauth":
+        if not yes_no(f"渠道 {slot!r} 已存在，继续将更新它", default=False):
+            return
+    display = prompt_line("显示名称（可空）", default="")
+    auth_path = prompt_line("已有 auth.json 路径（可空=稍后 codex login）", default="")
+    if auth_path:
+        auth_file = Path(auth_path).expanduser()
+        if not auth_file.is_file():
+            print(f"找不到 auth 文件: {auth_file}")
+            pause()
+            return
+    else:
+        auth_file = None
     switch_now = yes_no("现在切到这个账号", default=True)
     clear_screen()
-    cmd_oauth(slot, no_switch=not switch_now)
+    rc = cmd_oauth(
+        slot,
+        display=display or None,
+        auth_file=str(auth_file) if auth_file else None,
+        no_switch=not switch_now,
+    )
+    if rc != 0:
+        print(f"\n新增账号未完成（exit {rc}）。")
     pause()
 
 
 def menu_switch() -> None:
-    data = load_slots(required=False)
-    slots = data.get("slots", {})
-    current = data.get("current")
-    if not slots:
-        clear_screen()
-        print("还没有渠道。请先新增账号或 API。")
-        pause()
-        return
-    options = []
-    for key, cfg in slots.items():
-        marker = "*" if key == current else " "
-        mode = cfg.get("mode", "oauth")
-        label = cfg.get("display_name", key)
-        extra = cfg.get("base_url", "账号登录") if mode == "relay" else "账号登录"
-        options.append((f"{marker} {key:<16} [{mode}] {label}  {extra}", key))
-    options.append(("← 返回", "back"))
-    choice = select_menu("切换渠道", options)
-    if choice in ("back", "quit"):
-        return
-    clear_screen()
-    cmd_switch(choice)
-    pause()
+    """Pick a saved channel. Recent first; delete unused without leaving the flow."""
+    while True:
+        data = load_slots(required=False)
+        prune_recent_slots(data)
+        # Persist prune if it cleaned anything (best-effort, no lock for soft cleanup).
+        try:
+            save_slots(data)
+        except Exception:
+            pass
+        slots = data.get("slots", {}) or {}
+        current = data.get("current")
+        if not slots:
+            clear_screen()
+            print("还没有渠道。请先「新增 API」或「新增账号」。")
+            pause()
+            return
+
+        ordered = ordered_slot_names(data)
+        recent = [
+            name
+            for name in (data.get("recent_slots") or [])
+            if isinstance(name, str) and name in slots
+        ][:8]
+        recent_set = set(recent)
+
+        options: list[tuple[str, str]] = []
+        # Section: 最近 (includes current if it was used)
+        if recent:
+            options.append(("── 最近 ──", "__hdr_recent__"))
+            for key in recent:
+                cfg = slots[key]
+                options.append((format_slot_menu_label(key, cfg, current=current), f"use:{key}"))
+        # Section: 全部 (or remaining)
+        rest = [k for k in ordered if k not in recent_set]
+        if rest:
+            options.append(("── 全部 ──" if recent else "── 渠道 ──", "__hdr_all__"))
+            for key in rest:
+                cfg = slots[key]
+                options.append((format_slot_menu_label(key, cfg, current=current), f"use:{key}"))
+        options.append(("删除渠道…     清理不用的渠道", "delete"))
+        options.append(("← 返回", "back"))
+
+        subtitle = None
+        if current in slots:
+            cfg = slots[current]
+            subtitle = f"当前：{cfg.get('display_name', current)} ({current})"
+        choice = select_menu("切换渠道", options, subtitle=subtitle)
+        if choice in ("back", "quit"):
+            return
+        if choice in ("__hdr_recent__", "__hdr_all__"):
+            continue
+        if choice == "delete":
+            menu_remove()
+            continue
+        if choice.startswith("use:"):
+            slot = choice.split(":", 1)[1]
+            clear_screen()
+            cmd_switch(slot)
+            pause()
+            return
 
 
 def menu_remove() -> None:
     data = load_slots(required=False)
-    slots = data.get("slots", {})
+    slots = data.get("slots", {}) or {}
     current = data.get("current")
-    removable = [(key, cfg) for key, cfg in slots.items() if key != current]
+    removable = [(key, slots[key]) for key in ordered_slot_names(data) if key != current]
     if not removable:
         clear_screen()
-        print("没有可删除的渠道。当前渠道不能删除。")
+        print("没有可删除的渠道。")
+        print("提示：当前正在使用的渠道不能删除，请先切换到其他渠道。")
         pause()
         return
-    options = [
-        (f"{key:<16} [{cfg.get('mode', 'oauth')}] {cfg.get('display_name', key)}", key)
-        for key, cfg in removable
-    ]
-    options.append(("← 返回", "back"))
-    choice = select_menu("删除渠道", options)
-    if choice in ("back", "quit"):
-        return
-    if not yes_no(f"从列表中删除渠道 {choice!r}", default=False):
-        return
-    clear_screen()
-    cmd_remove(choice)
-    pause()
+
+    last_feedback = "删除后仅从列表移除；可选清理本地 auth / App profile"
+    while removable:
+        options = [
+            (format_slot_menu_label(key, cfg, current=current), key)
+            for key, cfg in removable
+        ]
+        options.append(("← 返回", "back"))
+        choice = select_menu(
+            "删除渠道",
+            options,
+            subtitle=last_feedback,
+        )
+        if choice in ("back", "quit"):
+            return
+
+        display = (slots.get(choice) or {}).get("display_name") or choice
+        print()
+        print(f"将删除：{choice}  ({display})")
+        hard = yes_no("同时删除本地 auth / App profile", default=False)
+        if not yes_no(f"确认删除 {choice!r}", default=False):
+            last_feedback = f"已取消删除 {choice}"
+            print(f"\n  · {last_feedback}")
+            pause()
+            continue
+
+        clear_screen()
+        print("删除渠道\n")
+        ok = False
+        try:
+            rc = cmd_remove(choice, hard=hard)
+            ok = rc == 0
+        except SystemExit as exc:
+            # fail() aborts with SystemExit — stay in menu instead of killing REPL
+            code = getattr(exc, "code", 1)
+            if code not in (0, None):
+                last_feedback = f"删除失败：{choice}"
+                print(f"\n  ✗ {last_feedback}")
+                pause()
+                continue
+            ok = True
+        except Exception as exc:
+            last_feedback = f"删除失败：{exc}"
+            print(f"\n  ✗ {last_feedback}")
+            pause()
+            continue
+
+        # Refresh list for multi-delete in one visit
+        data = load_slots(required=False)
+        slots = data.get("slots", {}) or {}
+        current = data.get("current")
+        removable = [(key, slots[key]) for key in ordered_slot_names(data) if key != current]
+
+        if ok:
+            last_feedback = f"✓ 已删除 {choice}  · 剩余可删 {len(removable)} 个"
+            print()
+            print(f"  {last_feedback}")
+            if hard:
+                print("  （已按选择清理本地 auth / profile）")
+            else:
+                print("  （仅从渠道列表移除；本地文件仍保留）")
+            if not removable:
+                print("  没有更多可删渠道了。")
+                pause()
+                return
+        pause()
 
 
 def menu_normalize() -> None:
@@ -7868,7 +8139,7 @@ def cmd_menu() -> int:
     while True:
         data = load_slots(required=False)
         current = data.get("current")
-        slots = data.get("slots", {})
+        slots = data.get("slots", {}) or {}
         if current in slots:
             cfg = slots[current]
             current_label = f"{cfg.get('display_name', current)} ({current}) [{cfg.get('mode', 'oauth')}]"
@@ -7877,10 +8148,9 @@ def cmd_menu() -> int:
         choice = select_menu(
             "Codex 渠道切换",
             [
-                ("切换渠道      选择已保存的渠道", "switch"),
+                ("切换渠道      选择已保存的渠道（最近 / 删除）", "switch"),
                 ("新增 API      添加第三方 API key", "add-relay"),
                 ("新增账号      添加 Codex 登录账号", "add-oauth"),
-                ("当前状态      查看正在使用的渠道", "status"),
                 ("退出          关闭工具", "quit"),
             ],
             subtitle=f"当前：{current_label}",
@@ -7889,9 +8159,7 @@ def cmd_menu() -> int:
         if choice in ("quit", "back"):
             clear_screen()
             return 0
-        if choice == "status":
-            menu_status()
-        elif choice == "add-relay":
+        if choice == "add-relay":
             menu_add_relay()
         elif choice == "add-oauth":
             menu_add_oauth()

@@ -5,7 +5,11 @@
 一条命令配置到本机 Codex CLI / Codex App 用。
 
 用法:
-    sub2cli                # 进入 REPL
+    sub2cli                # 打开 Codex 渠道切换菜单
+    sub2cli relay          # 进入中转站管理 REPL
+    sub2cli codex          # 管理/切换 Codex 官方账号、单独 API、连接池
+    sub2cli codex switch NAME
+    sub2cli codex api URL  # API key 使用隐藏输入或 --api-key-stdin
     sub2cli --help
 
 REPL 菜单:
@@ -1701,6 +1705,38 @@ def _inject_subprocess_env() -> dict[str, str]:
     return env
 
 
+CODEX_COMMAND_ALIASES = {
+    "api": "add-api",
+    "official": "add-account",
+    "switch": "use",
+    "channels": "list",
+}
+
+
+def cmd_codex_cli(argv: list[str]) -> int:
+    """Run the Codex channel switcher without requiring a relay login."""
+    inject_bin = _resolve_inject_bin()
+    if not inject_bin:
+        here = os.path.dirname(os.path.abspath(__file__))
+        print(color("缺少配置器脚本 sub2cli-inject:", C_RED), file=sys.stderr)
+        print(color(f"  预期位置: {os.path.join(here, 'sub2cli-inject')}", C_DIM), file=sys.stderr)
+        return 127
+
+    args = list(argv)
+    if args:
+        args[0] = CODEX_COMMAND_ALIASES.get(args[0], args[0])
+    try:
+        proc = subprocess.run(
+            [inject_bin, *args],
+            env=_inject_subprocess_env(),
+            check=False,
+        )
+    except OSError as exc:
+        print(color(f"启动 Codex 渠道切换器失败: {exc}", C_RED), file=sys.stderr)
+        return 1
+    return proc.returncode
+
+
 def _run_inject(inject_bin: str, url: str, api_key: str, source_label: str) -> None:
     print(color("配置 codex:", C_BOLD))
     print(f"  url:     {url}")
@@ -2029,9 +2065,19 @@ def run_wizard(
 # ==================== 主循环 ====================
 
 def main() -> int:
-    if "--help" in sys.argv or "-h" in sys.argv:
+    argv = sys.argv[1:]
+    if not argv:
+        return cmd_codex_cli([])
+    if argv and argv[0] == "codex":
+        return cmd_codex_cli(argv[1:])
+
+    if argv[0] in ("--help", "-h"):
         print(__doc__.strip())
         return 0
+    if argv[0] != "relay":
+        print(color(f"未知命令: {argv[0]}", C_RED), file=sys.stderr)
+        print("运行 `sub2cli --help` 查看用法。", file=sys.stderr)
+        return 2
 
     config_path = default_config_path()
     cdp_host = DEFAULT_CDP_HOST

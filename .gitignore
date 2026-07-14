@@ -32,6 +32,7 @@ desktop/build/
 desktop/dist/
 
 # local research / tool output
+.playwright-cli/
 .playwright-mcp/
 _references/
 docs/audit/

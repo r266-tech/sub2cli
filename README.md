@@ -126,14 +126,20 @@ This contract means:
 - the public `main/install.sh` and `main/install.ps1` entrypoints remain stable
   when the project version changes
 - `SUB2CLI_API_URL` and `SUB2CLI_API_KEY` retain their meaning across releases
-- changes to either installer must pass the relevant fresh-profile, refusal,
-  rollback and transaction-race tests; Windows changes must also pass merge and
-  Windows PowerShell 5.1 tests before reaching `main`
-- a fresh profile receives the minimal API-key configuration; on Windows, an
-  existing ChatGPT-generated `config.toml` is backed up and merged without
-  dropping its plugins, MCP servers or desktop settings, while connection-pool
-  state and conflicting custom-provider routing are still refused; the macOS
-  installer continues to refuse an existing `config.toml`
+- **one mode only**: model requests go **directly** to that URL + key
+  (`base_url = <SUB2CLI_API_URL>`, no connection pool, no `127.0.0.1` proxy)
+- **if already logged in to OpenAI/ChatGPT** (macOS `install.sh`): keep the
+  official account identity / OAuth tokens; only rewrite model routing to the
+  provided URL + key
+- **if not logged in** (fresh or no ChatGPT auth): write API-key auth and the
+  same direct provider `base_url` so CLI/App use the API immediately
+- changes to either installer must pass the relevant fresh-profile, existing-
+  login, no-login, rollback and transaction-race tests; Windows changes must
+  also pass merge and Windows PowerShell 5.1 tests before reaching `main`
+- on Windows, an existing ChatGPT-generated `config.toml` is backed up and
+  merged without dropping plugins/MCP/desktop settings when the direct path is
+  used; connection-pool state and conflicting custom-provider routing remain
+  refused by the PowerShell direct writer
 - version-tagged commands are rollback and reproducibility tools, not the
   command distributed to ordinary users
 
@@ -186,15 +192,22 @@ sub2cli-inject   Codex config switcher
 
 Override the install destination with `SUB2CLI_INSTALL_DIR`.
 
-Start the REPL:
+Open the Codex channel switcher. This default path does not require an Edge
+relay login:
 
 ```bash
 sub2cli
 ```
 
+Open the original relay/account management REPL explicitly:
+
+```bash
+sub2cli relay
+```
+
 ## CLI Workflow
 
-Inside `sub2cli`, use arrow keys and Enter:
+Inside `sub2cli relay`, use arrow keys and Enter:
 
 ```text
 sub2cli - www.codex2api.com 控制台
@@ -217,11 +230,11 @@ sub2cli - www.codex2api.com 控制台
 Non-interactive examples:
 
 ```bash
-# Add/switch to a relay API channel. The key is read from stdin so it does not land in shell history.
-printf '%s' "$OPENAI_API_KEY" | sub2cli-inject add-api https://www.codex2api.com/v1 --api-key-stdin
+# Add/switch to one API directly. The key is read from stdin so it does not land in shell history.
+printf '%s' "$OPENAI_API_KEY" | sub2cli codex api https://www.codex2api.com/v1 --api-key-stdin
 
 # Interactive hidden API key prompt.
-sub2cli-inject add-api https://www.codex2api.com/v1
+sub2cli codex api https://www.codex2api.com/v1
 
 # Add/switch to a local route pool. Codex points at one local proxy URL;
 # the proxy chooses routes by priority and fails over without relaunching Codex.
@@ -273,16 +286,20 @@ JSON
 sub2cli-inject add-pool work-pool --routes-json /tmp/sub2cli-routes.json
 
 # Add/import an official Codex account slot.
-sub2cli-inject add-account work --auth-file ~/.codex/auth.json
+sub2cli codex official work --auth-file ~/.codex/auth.json
 
-# Switch to a saved channel or account.
-sub2cli-inject use work
+# Switch directly to a saved API, pool, or official account.
+sub2cli codex switch work
 
 # Inspect state and recover.
-sub2cli-inject current
-sub2cli-inject list
-sub2cli-inject rollback latest
+sub2cli codex current
+sub2cli codex channels
+sub2cli codex rollback latest
 ```
+
+`sub2cli codex` delegates to the same channel registry as `sub2cli-inject`, so
+desktop and CLI switches share saved official accounts, single APIs, pools, and
+rollback points. The original `sub2cli-inject` commands remain supported.
 
 `sub2cli-inject` rejects positional API keys intentionally. Use `--api-key-stdin` or the hidden prompt.
 

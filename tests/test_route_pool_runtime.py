@@ -3963,5 +3963,57 @@ for line in sys.stdin:
             tmp.cleanup()
 
 
+class ResponseSseTypeFieldTests(unittest.TestCase):
+    """Codex requires top-level ``type`` on every Responses SSE JSON payload."""
+
+    def test_sse_injects_type_when_missing(self):
+        frame = sub2cli_inject._sse("response.completed", {"response": {"id": "resp_1", "status": "completed"}})
+        self.assertIn("event: response.completed\n", frame)
+        payload = json.loads(frame.split("data: ", 1)[1].strip())
+        self.assertEqual(payload["type"], "response.completed")
+        self.assertEqual(payload["response"]["id"], "resp_1")
+
+    def test_sse_preserves_explicit_type(self):
+        frame = sub2cli_inject._sse(
+            "response.completed",
+            {"type": "response.completed", "response": {"id": "resp_2"}},
+        )
+        payload = json.loads(frame.split("data: ", 1)[1].strip())
+        self.assertEqual(payload["type"], "response.completed")
+        self.assertEqual(list(payload.keys()).count("type"), 1)
+
+    def test_response_json_to_sse_includes_type_on_every_event(self):
+        raw = sub2cli_inject.response_json_to_sse({
+            "id": "resp_hello",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.6-sol",
+            "output": [{
+                "id": "msg_1",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "你好", "annotations": []}],
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        })
+        self.assertNotIn(b"data: [DONE]", raw)
+        types = []
+        for block in raw.decode("utf-8").split("\n\n"):
+            if not block.strip():
+                continue
+            data_line = next((line for line in block.splitlines() if line.startswith("data: ")), None)
+            event_line = next((line for line in block.splitlines() if line.startswith("event: ")), None)
+            self.assertIsNotNone(data_line)
+            self.assertIsNotNone(event_line)
+            payload = json.loads(data_line[len("data: "):])
+            self.assertIn("type", payload)
+            self.assertEqual(payload["type"], event_line[len("event: "):].strip())
+            types.append(payload["type"])
+        self.assertIn("response.created", types)
+        self.assertIn("response.completed", types)
+        self.assertIn("response.output_text.delta", types)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -102,22 +102,30 @@ function Get-ItemIfExists {
     }
 }
 
-function Assert-NoProviderPoolState {
-    param([string]$CodexHome)
+function Test-AuthLooksLikeChatGpt {
+    param([string]$Path)
 
-    # Only a definite not-found result is safe to ignore. Permission and I/O
-    # errors must bubble to the outer catch and stop before any overwrite.
-    $ProviderSlots = Join-Path $CodexHome "provider-slots.json"
-    if ($null -ne (Get-ItemIfExists $ProviderSlots)) {
-        throw ("Existing provider-slots.json/connection-pool state detected; the one-line setup refused to overwrite it.`n" +
-            "No ChatGPT/Codex configuration or pool state was changed.`n" +
-            "Open ChatGPT Settings to edit the existing profile, or use this installer with a fresh Windows profile.")
+    $Item = Get-ItemIfExists $Path
+    if ($null -eq $Item) {
+        return $false
     }
+    try {
+        $Text = [IO.File]::ReadAllText($Path)
+    }
+    catch {
+        return $false
+    }
+    # Keep official login identity when present (same contract as install.sh).
+    return ($Text -match '"auth_mode"\s*:\s*"chatgpt"') -or ($Text -match '"tokens"\s*:')
 }
 
 function Assert-DirectBootstrapSafe {
     param([string]$CodexHome)
-    Assert-NoProviderPoolState $CodexHome
+    # One-line setup no longer refuses provider-slots.json: model routing is
+    # rewritten directly onto config.toml. Multi-slot state is left untouched.
+    if ([string]::IsNullOrWhiteSpace($CodexHome)) {
+        throw "CODEX_HOME is required."
+    }
 }
 
 function Get-TopLevelTomlString {
@@ -176,7 +184,8 @@ function New-MergedConfigContent {
     param(
         [string]$ExistingContent,
         [string]$Model,
-        [string]$ApiUrl
+        [string]$ApiUrl,
+        [string]$ApiKey
     )
 
     $ProviderSetting = Get-TopLevelTomlString $ExistingContent "model_provider"
@@ -195,7 +204,7 @@ function New-MergedConfigContent {
     )
     if (-not [string]::IsNullOrWhiteSpace($ExistingOpenAiBaseUrl) -and
         $ExistingOpenAiBaseUrl.TrimEnd([char]"/") -notin $ManagedBaseUrls -and
-        $ExistingProvider -cnotin @("OpenAI", $RelayProvider)) {
+        $ExistingProvider -cnotin @("openai", "OpenAI", $RelayProvider)) {
         throw ("Existing config.toml already routes the built-in openai provider to another base URL; " +
             "the one-line setup refused to overwrite it.")
     }
@@ -226,10 +235,11 @@ function New-MergedConfigContent {
     }
 
     $Tables = Remove-TomlProviderBlock $Tables $RelayProvider
-    if ($ExistingProvider -ceq "OpenAI") {
+    if ($ExistingProvider -cin @("OpenAI", "openai")) {
         $Tables = Remove-TomlProviderBlock $Tables "OpenAI"
     }
 
+    # Direct URL + key (no local proxy / no connection pool). Same product mode as install.sh.
 $ManagedHead = @"
 model = "$(Escape-TomlString $Model)"
 model_provider = "$RelayProvider"
@@ -245,6 +255,7 @@ base_url = "$(Escape-TomlString $ApiUrl)"
 wire_api = "responses"
 requires_openai_auth = true
 supports_websockets = false
+experimental_bearer_token = "$(Escape-TomlString $ApiKey)"
 "@
     $ProviderBlock = $ProviderBlock.Trim()
 
@@ -546,12 +557,20 @@ try {
     Assert-OriginalAuthState $AuthJson $AuthExisted $AuthBackup
     Assert-OriginalConfigState $ConfigToml $ConfigExisted $ConfigBackup
 
-    $AuthObject = [ordered]@{
-        OPENAI_API_KEY = $ApiKey
-        auth_mode = "apikey"
+    $KeepChatGptAuth = $AuthExisted -and (Test-AuthLooksLikeChatGpt $AuthJson)
+    $AuthObject = $null
+    $AuthContent = $null
+    $AuthFinalContent = $null
+    $RewriteAuth = -not $KeepChatGptAuth
+
+    if ($RewriteAuth) {
+        $AuthObject = [ordered]@{
+            OPENAI_API_KEY = $ApiKey
+            auth_mode = "apikey"
+        }
+        $AuthContent = ($AuthObject | ConvertTo-Json -Depth 3)
+        $AuthFinalContent = $AuthContent + "`n"
     }
-    $AuthContent = ($AuthObject | ConvertTo-Json -Depth 3)
-    $AuthFinalContent = $AuthContent + "`n"
 
     $ConfigContent = if ($ConfigExisted) {
         [IO.File]::ReadAllText($ConfigBackup)
@@ -559,15 +578,17 @@ try {
     else {
         ""
     }
-    $ConfigFinalContent = New-MergedConfigContent $ConfigContent $Model $ApiUrl
-    $AuthStage = "$AuthJson.$PID.$TransactionId.stage"
+    $ConfigFinalContent = New-MergedConfigContent $ConfigContent $Model $ApiUrl $ApiKey
+    $AuthStage = if ($RewriteAuth) { "$AuthJson.$PID.$TransactionId.stage" } else { $null }
     $ConfigStage = "$ConfigToml.$PID.$TransactionId.stage"
     $AuthOriginalHeldPath = "$AuthJson.$PID.$TransactionId.original"
     $ConfigOriginalHeldPath = "$ConfigToml.$PID.$TransactionId.original"
     $AuthRollbackQuarantine = "$AuthJson.$PID.$TransactionId.rollback"
     $ConfigRollbackQuarantine = "$ConfigToml.$PID.$TransactionId.rollback"
 
-    Write-Utf8NoBom $AuthStage $AuthFinalContent
+    if ($RewriteAuth) {
+        Write-Utf8NoBom $AuthStage $AuthFinalContent
+    }
     Write-Utf8NoBom $ConfigStage $ConfigFinalContent
 
     Assert-DirectBootstrapSafe $CodexHome
@@ -591,28 +612,28 @@ try {
         Move-Item -LiteralPath $ConfigStage -Destination $ConfigToml
         $ConfigStage = $null
         $ConfigCommitted = $true
-        Assert-NoProviderPoolState $CodexHome
         Assert-FileTextEquals $ConfigToml $ConfigFinalContent "config.toml"
         Assert-OriginalAuthState $AuthJson $AuthExisted $AuthBackup
 
-        if ($AuthExisted) {
-            # Hold the exact original with a no-clobber rename, validate it
-            # against the backup, then create the new auth path without Force.
-            Move-Item -LiteralPath $AuthJson -Destination $AuthOriginalHeldPath
-            $AuthOriginalHeld = $true
-            if (-not (Test-FileBytesEqual $AuthOriginalHeldPath $AuthBackup)) {
-                throw "auth.json changed during the one-line setup; refusing to overwrite concurrent state."
+        if ($RewriteAuth) {
+            if ($AuthExisted) {
+                # Hold the exact original with a no-clobber rename, validate it
+                # against the backup, then create the new auth path without Force.
+                Move-Item -LiteralPath $AuthJson -Destination $AuthOriginalHeldPath
+                $AuthOriginalHeld = $true
+                if (-not (Test-FileBytesEqual $AuthOriginalHeldPath $AuthBackup)) {
+                    throw "auth.json changed during the one-line setup; refusing to overwrite concurrent state."
+                }
             }
+            Move-Item -LiteralPath $AuthStage -Destination $AuthJson
+            $AuthStage = $null
+            $AuthCommitted = $true
+            Assert-FileTextEquals $AuthJson $AuthFinalContent "auth.json"
         }
-        Move-Item -LiteralPath $AuthStage -Destination $AuthJson
-        $AuthStage = $null
-        $AuthCommitted = $true
-
-        # A pool/config writer may race after either commit. Success is only
-        # reported while both live files are still exactly the staged versions.
-        Assert-NoProviderPoolState $CodexHome
-        Assert-FileTextEquals $ConfigToml $ConfigFinalContent "config.toml"
-        Assert-FileTextEquals $AuthJson $AuthFinalContent "auth.json"
+        else {
+            # Official login kept; model traffic uses experimental_bearer_token.
+            Assert-OriginalAuthState $AuthJson $AuthExisted $AuthBackup
+        }
 
     }
     catch {
@@ -680,8 +701,14 @@ try {
     $AuthOriginalHeld = $false
     $ConfigOriginalHeld = $false
 
-    Write-Host "ChatGPT API configured."
+    Write-Host "ChatGPT API configured (direct URL, no local proxy / pool)."
     Write-Host "  url: $ApiUrl"
+    if ($KeepChatGptAuth) {
+        Write-Host "  identity: kept existing ChatGPT/OpenAI login"
+    }
+    else {
+        Write-Host "  identity: API-key auth written"
+    }
     Write-Host "  auth: $AuthJson"
     Write-Host "  config: $ConfigToml"
     Write-Host "  backup: $BackupDir"

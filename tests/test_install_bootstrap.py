@@ -136,30 +136,32 @@ class InstallBootstrapTests(unittest.TestCase):
             self.assertIn('api_base_url = "https://api.openai.com/v1"', config)
             self.assertIn('[model_providers.OpenAI]', config)
             self.assertIn('base_url = "https://relay.example/v1"', config)
+            self.assertNotIn("127.0.0.1:18765", config)
             self.assertIn('wire_api = "responses"', config)
             self.assertIn('requires_openai_auth = true', config)
+            self.assertIn('experimental_bearer_token = "sk-test\\"quote\\\\slash"', config)
 
             backups = list((codex_home / "provider-switch-backups").glob("install-api-*"))
             self.assertEqual(1, len(backups))
             self.assertEqual(0o700, stat.S_IMODE(backups[0].stat().st_mode))
             self.assertEqual([], list(backups[0].iterdir()))
 
-    def test_direct_bootstrap_refuses_existing_config_or_pool_state(self):
+    def test_existing_login_bootstraps_direct_api_without_proxy_or_pool(self):
+        """Logged-in / existing config: keep identity, direct base_url (no 18765)."""
         cases = {
-            "empty-config": {
-                "config.toml": b"",
-            },
+            "chatgpt-only-auth": {},
             "nonempty-config": {
-                "config.toml": b'model = "keep"\n[mcp_servers.keep]\ncommand = "keep"\n',
+                "config.toml": (
+                    b'model = "keep"\n'
+                    b"[mcp_servers.keep]\n"
+                    b'command = "keep"\n'
+                    b"[model_providers.OpenAI]\n"
+                    b'base_url = "http://127.0.0.1:18765/v1"\n'
+                    b'wire_api = "responses"\n'
+                ),
             },
             "provider-slots": {
-                "provider-slots.json": b'{"current":"keep","route_pools":{"keep":{}}}\n',
-            },
-            "empty-provider-slots": {
-                "provider-slots.json": b"",
-            },
-            "malformed-provider-slots": {
-                "provider-slots.json": b"{not-json\n",
+                "provider-slots.json": b'{"current":"keep","slots":{"keep":{"mode":"oauth"}}}\n',
             },
         }
 
@@ -182,6 +184,7 @@ class InstallBootstrapTests(unittest.TestCase):
                     "SUB2CLI_API_MODEL",
                     "SUB2CLI_CODEX_APP",
                     "SUB2CLI_FORCE_DIRECT_CONFIG",
+                    "SUB2CLI_INJECT_BIN",
                 ):
                     env.pop(key, None)
                 env.update(
@@ -190,7 +193,8 @@ class InstallBootstrapTests(unittest.TestCase):
                         "SUB2CLI_INSTALL_DIR": str(dest),
                         "SUB2CLI_API_NO_RESTART": "1",
                         "SUB2CLI_API_URL": "https://relay.example",
-                        "SUB2CLI_API_KEY": "sk-test",
+                        "SUB2CLI_API_KEY": "sk-test-existing",
+                        "SUB2CLI_API_MODEL": "gpt-test",
                     }
                 )
 
@@ -203,15 +207,79 @@ class InstallBootstrapTests(unittest.TestCase):
                     timeout=20,
                 )
 
-                self.assertNotEqual(0, result.returncode)
-                self.assertIn("sub2cli-inject", result.stderr)
-                self.assertIn("add-api", result.stderr)
+                self.assertEqual(
+                    0,
+                    result.returncode,
+                    msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertIn("mode: direct API", result.stdout)
+                self.assertIn("keep existing ChatGPT", result.stdout)
+                # Official login must not be clobbered.
                 self.assertEqual(auth_before, (codex_home / "auth.json").read_bytes())
-                for relative_path, content in state_files.items():
-                    self.assertEqual(content, (codex_home / relative_path).read_bytes())
-                if "config.toml" not in state_files:
-                    self.assertFalse((codex_home / "config.toml").exists())
-                self.assertFalse((codex_home / "provider-switch-backups").exists())
+                config = (codex_home / "config.toml").read_text()
+                self.assertIn('base_url = "https://relay.example/v1"', config)
+                self.assertNotIn("127.0.0.1:18765", config)
+                self.assertIn('experimental_bearer_token = "sk-test-existing"', config)
+                self.assertIn('wire_api = "responses"', config)
+                self.assertIn('model = "gpt-test"', config)
+                # Unrelated config sections stay.
+                if case_name == "nonempty-config":
+                    self.assertIn("[mcp_servers.keep]", config)
+                    self.assertIn('command = "keep"', config)
+
+    def test_no_login_existing_empty_auth_writes_apikey_and_direct_url(self):
+        """No official login: write apikey auth and direct base_url."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            home = tmp_root / "home"
+            dest = tmp_root / "bin"
+            codex_home = home / ".codex"
+            codex_home.mkdir(parents=True)
+            # Existing junk config without chatgpt login.
+            (codex_home / "config.toml").write_text('model = "old"\n', encoding="utf-8")
+
+            env = os.environ.copy()
+            for key in (
+                "CODEX_HOME",
+                "CODEX_PROVIDER_HOME",
+                "SUB2CLI_API_MODEL",
+                "SUB2CLI_CODEX_APP",
+                "SUB2CLI_FORCE_DIRECT_CONFIG",
+            ):
+                env.pop(key, None)
+            env.update(
+                {
+                    "HOME": str(home),
+                    "SUB2CLI_INSTALL_DIR": str(dest),
+                    "SUB2CLI_API_NO_RESTART": "1",
+                    "SUB2CLI_API_URL": "https://relay.example",
+                    "SUB2CLI_API_KEY": "sk-newbie",
+                    "SUB2CLI_API_MODEL": "gpt-test",
+                }
+            )
+
+            result = subprocess.run(
+                ["sh", str(ROOT / "install.sh")],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+            self.assertEqual(
+                0,
+                result.returncode,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            auth = json.loads((codex_home / "auth.json").read_text())
+            self.assertEqual(
+                {"OPENAI_API_KEY": "sk-newbie", "auth_mode": "apikey"},
+                auth,
+            )
+            config = (codex_home / "config.toml").read_text()
+            self.assertIn('base_url = "https://relay.example/v1"', config)
+            self.assertNotIn("127.0.0.1", config)
+            self.assertIn('experimental_bearer_token = "sk-newbie"', config)
 
     def test_direct_bootstrap_stops_before_overwrite_when_backup_step_fails(self):
         for failing_command in ("cp", "chmod"):
@@ -315,6 +383,7 @@ class InstallBootstrapTests(unittest.TestCase):
                     "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
                     "SUB2CLI_INSTALL_DIR": str(dest),
                     "SUB2CLI_API_NO_RESTART": "1",
+                        "SUB2CLI_FORCE_DIRECT_CONFIG": "1",
                     "SUB2CLI_API_URL": "https://relay.example",
                     "SUB2CLI_API_KEY": "sk-test",
                     "SUB2CLI_TEST_CONFIG": str(config_toml),
@@ -370,6 +439,7 @@ class InstallBootstrapTests(unittest.TestCase):
                     "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
                     "SUB2CLI_INSTALL_DIR": str(dest),
                     "SUB2CLI_API_NO_RESTART": "1",
+                        "SUB2CLI_FORCE_DIRECT_CONFIG": "1",
                     "SUB2CLI_API_URL": "https://relay.example",
                     "SUB2CLI_API_KEY": "sk-test",
                     "SUB2CLI_TEST_AUTH": str(auth_json),
@@ -430,6 +500,7 @@ class InstallBootstrapTests(unittest.TestCase):
                     "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
                     "SUB2CLI_INSTALL_DIR": str(dest),
                     "SUB2CLI_API_NO_RESTART": "1",
+                        "SUB2CLI_FORCE_DIRECT_CONFIG": "1",
                     "SUB2CLI_API_URL": "https://relay.example",
                     "SUB2CLI_API_KEY": "sk-test",
                     "SUB2CLI_TEST_AUTH": str(auth_json),
@@ -494,6 +565,7 @@ class InstallBootstrapTests(unittest.TestCase):
                     "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
                     "SUB2CLI_INSTALL_DIR": str(dest),
                     "SUB2CLI_API_NO_RESTART": "1",
+                        "SUB2CLI_FORCE_DIRECT_CONFIG": "1",
                     "SUB2CLI_API_URL": "https://relay.example",
                     "SUB2CLI_API_KEY": "sk-test",
                     "SUB2CLI_TEST_AUTH": str(auth_json),
@@ -561,6 +633,7 @@ class InstallBootstrapTests(unittest.TestCase):
                         "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
                         "SUB2CLI_INSTALL_DIR": str(dest),
                         "SUB2CLI_API_NO_RESTART": "1",
+                        "SUB2CLI_FORCE_DIRECT_CONFIG": "1",
                         "SUB2CLI_API_URL": "https://relay.example",
                         "SUB2CLI_API_KEY": "sk-test",
                         "SUB2CLI_TEST_RACE_TARGET": str(race_target),
@@ -624,6 +697,7 @@ class InstallBootstrapTests(unittest.TestCase):
                         "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
                         "SUB2CLI_INSTALL_DIR": str(dest),
                         "SUB2CLI_API_NO_RESTART": "1",
+                        "SUB2CLI_FORCE_DIRECT_CONFIG": "1",
                         "SUB2CLI_API_URL": "https://relay.example",
                         "SUB2CLI_API_KEY": "sk-test",
                         "SUB2CLI_TEST_AUTH": str(auth_json),
@@ -1066,11 +1140,16 @@ class InstallBootstrapTests(unittest.TestCase):
                 result.returncode,
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
+            # Keep official login; only rewrite model routing.
+            self.assertEqual(auth_before, auth_json.read_bytes())
             merged = config_toml.read_text(encoding="utf-8")
             self.assertTrue(merged.startswith('model = "gpt-5.6-sol"\n'))
             self.assertEqual(1, merged.count('model_provider = "sub2api"'))
             self.assertEqual(1, merged.count('[model_providers.sub2api]'))
             self.assertIn('openai_base_url = "https://relay.example/v1"', merged)
+            self.assertIn('base_url = "https://relay.example/v1"', merged)
+            self.assertIn('experimental_bearer_token = "sk-test"', merged)
+            self.assertNotIn("127.0.0.1:18765", merged)
             self.assertIn('supports_websockets = false', merged)
             self.assertNotIn('https://old-relay.example/v1', merged)
             if tomllib is not None:
@@ -1088,7 +1167,8 @@ class InstallBootstrapTests(unittest.TestCase):
             self.assertEqual(auth_before, (backups[0] / "auth.json").read_bytes())
             self.assertEqual(config_before, (backups[0] / "config.toml").read_bytes())
 
-    def test_windows_bootstrap_refuses_provider_pool_state(self):
+    def test_windows_bootstrap_keeps_chatgpt_when_provider_slots_exist(self):
+        """Parity with install.sh: slots/pool file no longer blocks one-line setup."""
         shell = shutil.which("pwsh") or shutil.which("powershell")
         if not shell:
             self.skipTest("PowerShell is not installed")
@@ -1140,13 +1220,19 @@ class InstallBootstrapTests(unittest.TestCase):
                     timeout=20,
                 )
 
-                self.assertNotEqual(0, result.returncode)
-                self.assertIn("Open ChatGPT Settings", result.stderr)
+                self.assertEqual(
+                    0,
+                    result.returncode,
+                    msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
                 self.assertEqual(auth_before, (codex_home / "auth.json").read_bytes())
-                self.assertEqual(config_before, (codex_home / "config.toml").read_bytes())
+                config = (codex_home / "config.toml").read_text(encoding="utf-8")
+                self.assertIn('base_url = "https://relay.example/v1"', config)
+                self.assertIn('experimental_bearer_token = "sk-test"', config)
+                self.assertIn("[mcp_servers.keep]", config)
+                self.assertNotIn("127.0.0.1:18765", config)
                 for relative_path, content in state_files.items():
                     self.assertEqual(content, (codex_home / relative_path).read_bytes())
-                self.assertFalse((codex_home / "provider-switch-backups").exists())
 
     def test_windows_bootstrap_refuses_conflicting_custom_routing(self):
         shell = shutil.which("pwsh") or shutil.which("powershell")
@@ -1576,7 +1662,8 @@ class InstallBootstrapTests(unittest.TestCase):
                 self.assertEqual([], list(codex_home.glob("*.original")))
                 self.assertEqual([], list(codex_home.glob("*.rollback")))
 
-    def test_windows_bootstrap_post_commit_pool_race_rolls_back_only_own_files(self):
+    def test_windows_bootstrap_ignores_concurrent_provider_slots_and_keeps_chatgpt(self):
+        """Slots may appear mid-run; direct URL setup must still keep ChatGPT identity."""
         shell = shutil.which("pwsh") or shutil.which("powershell")
         if not shell:
             self.skipTest("PowerShell is not installed")
@@ -1590,6 +1677,7 @@ class InstallBootstrapTests(unittest.TestCase):
             )
             auth_json = codex_home / "auth.json"
             slots_json = codex_home / "provider-slots.json"
+            config_toml = codex_home / "config.toml"
             auth_json.write_bytes(auth_before)
 
             env = os.environ.copy()
@@ -1600,17 +1688,18 @@ class InstallBootstrapTests(unittest.TestCase):
                     "SUB2CLI_API_URL": "https://relay.example",
                     "SUB2CLI_API_KEY": "sk-test",
                     "SUB2CLI_TEST_INSTALL_SCRIPT": str(ROOT / "install.ps1"),
-                    "SUB2CLI_TEST_AUTH_PATH": str(auth_json),
+                    "SUB2CLI_TEST_CONFIG_PATH": str(config_toml),
                     "SUB2CLI_TEST_POOL_PATH": str(slots_json),
                 }
             )
+            # Inject slots while config is being committed — should not fail.
             wrapper = (
                 "$script:Injected = $false; "
                 "function global:Move-Item { [CmdletBinding()] param("
                 "[string]$LiteralPath,[string]$Destination,[switch]$Force); "
                 "Microsoft.PowerShell.Management\\Move-Item @PSBoundParameters; "
                 "if (-not $script:Injected -and "
-                "$Destination -eq $env:SUB2CLI_TEST_AUTH_PATH -and "
+                "$Destination -eq $env:SUB2CLI_TEST_CONFIG_PATH -and "
                 "$LiteralPath -like '*.stage') { "
                 "$script:Injected = $true; "
                 "[IO.File]::WriteAllText($env:SUB2CLI_TEST_POOL_PATH, "
@@ -1627,10 +1716,15 @@ class InstallBootstrapTests(unittest.TestCase):
                 timeout=20,
             )
 
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("provider-slots.json", result.stderr)
+            self.assertEqual(
+                0,
+                result.returncode,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
             self.assertEqual(auth_before, auth_json.read_bytes())
-            self.assertFalse((codex_home / "config.toml").exists())
+            config = config_toml.read_text(encoding="utf-8")
+            self.assertIn('base_url = "https://relay.example/v1"', config)
+            self.assertIn('experimental_bearer_token = "sk-test"', config)
             self.assertEqual(pool_concurrent, slots_json.read_bytes())
             self.assertEqual([], list(codex_home.glob("*.stage")))
             self.assertEqual([], list(codex_home.glob("*.original")))

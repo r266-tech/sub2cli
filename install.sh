@@ -7,9 +7,12 @@
 # One-liner (curl-piped):
 #   curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh | sh
 #
-# One-command ChatGPT API setup:
+# One-command direct API setup (NOT connection pool, NOT local 127.0.0.1 proxy):
 #   curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh \
-#     | SUB2CLI_API_URL='https://www.codex2api.com/v1' sh
+#     | SUB2CLI_API_URL='https://sub2api.babata.icu' SUB2CLI_API_KEY='sk-...' sh
+# - Already logged in to OpenAI/ChatGPT → keep login; model base_url = URL + key
+# - Not logged in → write API-key auth; model base_url = URL + key
+# In both cases Codex talks directly to the URL (wire_api=responses).
 #
 # Integrity:
 #   These binaries write ~/.codex credentials and shell out to codex/osascript,
@@ -425,6 +428,7 @@ write_direct_codex_api_config() {
 
   api_key_json="$(escape_json_string "$api_key")"
   api_url_toml="$(escape_toml_string "$api_url")"
+  api_key_toml="$(escape_toml_string "$api_key")"
   model_toml="$(escape_toml_string "$model")"
   DIRECT_AUTH_TMP="$(mktemp "$backup_dir/auth.stage.XXXXXX")" || return 1
   DIRECT_AUTH_COMMIT_TMP="$(mktemp "$backup_dir/auth.commit.XXXXXX")" || return 1
@@ -452,6 +456,9 @@ write_direct_codex_api_config() {
     printf 'base_url = "%s"\n' "$api_url_toml"
     printf 'wire_api = "responses"\n'
     printf 'requires_openai_auth = true\n'
+    # Direct API: key on the provider so Codex talks to the URL itself —
+    # no 127.0.0.1 local proxy, no connection pool.
+    printf 'experimental_bearer_token = "%s"\n' "$api_key_toml"
   } > "$DIRECT_CONFIG_TMP"
   chmod 600 "$DIRECT_CONFIG_TMP" || return 1
   cp "$DIRECT_CONFIG_TMP" "$DIRECT_CONFIG_COMMIT_TMP" || return 1
@@ -540,6 +547,132 @@ write_direct_codex_api_config() {
   restart_codex_if_needed
 }
 
+# One public mode only: Codex talks DIRECTLY to SUB2CLI_API_URL with the key.
+# Never installs a connection pool and never points base_url at 127.0.0.1.
+#
+# - No official login yet  → write API-key auth + direct provider base_url
+# - Already logged in to OpenAI/ChatGPT → keep auth tokens / identity;
+#   only rewrite model routing to the URL + key (experimental_bearer_token)
+auth_looks_like_chatgpt() {
+  auth_path="$1"
+  [ -f "$auth_path" ] || return 1
+  # Cheap string check; avoids requiring Python just to detect identity.
+  grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"chatgpt"' "$auth_path" 2>/dev/null \
+    || grep -q '"tokens"' "$auth_path" 2>/dev/null
+}
+
+# Patch an existing config.toml so model traffic goes straight to api_url.
+# Preserves unrelated sections (MCP, projects, plugins, …).
+patch_config_direct_api() {
+  config_path="$1"
+  api_url="$2"
+  api_key="$3"
+  model="${4:-gpt-5.6-sol}"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "✗ 需要 python3 才能在已有 config.toml 上写入直达 API 配置" >&2
+    return 1
+  fi
+
+  CODEX_PATCH_CONFIG="$config_path" \
+  CODEX_PATCH_URL="$api_url" \
+  CODEX_PATCH_KEY="$api_key" \
+  CODEX_PATCH_MODEL="$model" \
+  python3 - <<'PY'
+import os, re
+from pathlib import Path
+
+path = Path(os.environ["CODEX_PATCH_CONFIG"])
+url = os.environ["CODEX_PATCH_URL"].strip()
+key = os.environ["CODEX_PATCH_KEY"]
+model = os.environ.get("CODEX_PATCH_MODEL") or "gpt-5.6-sol"
+text = path.read_text(encoding="utf-8") if path.exists() else ""
+
+def set_top(text: str, key: str, value: str) -> str:
+    pattern = re.compile(rf'(?m)^[ \t]*{re.escape(key)}[ \t]*=[ \t]*".*?"[ \t]*$')
+    line = f'{key} = "{value}"'
+    if pattern.search(text):
+        return pattern.sub(line, text, count=1)
+    # Insert after first top-level model= if present, else at file head.
+    m = re.search(r'(?m)^[ \t]*model[ \t]*=.*$', text)
+    if m and key != "model":
+        i = m.end()
+        return text[:i] + "\n" + line + text[i:]
+    return line + ("\n" if text and not text.startswith("\n") else "") + text
+
+text = set_top(text, "model", model)
+text = set_top(text, "model_provider", "OpenAI")
+
+block = (
+    "[model_providers.OpenAI]\n"
+    'name = "OpenAI"\n'
+    f'base_url = "{url}"\n'
+    'wire_api = "responses"\n'
+    "requires_openai_auth = true\n"
+    f'experimental_bearer_token = "{key}"\n'
+)
+pat = re.compile(
+    r"(?ms)^[ \t]*\[model_providers\.OpenAI\][ \t]*\n.*?(?=^[ \t]*\[|\Z)"
+)
+if pat.search(text):
+    text = pat.sub(block + "\n", text, count=1)
+else:
+    text = text.rstrip() + ("\n\n" if text.strip() else "") + block
+
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(text, encoding="utf-8")
+print(f"  patched: {path}")
+print(f"  base_url: {url}")
+print("  route: direct (no local proxy)")
+PY
+}
+
+# Existing profile: keep ChatGPT login if present; always direct URL+key for models.
+bootstrap_existing_direct_api() {
+  api_url="$1"
+  api_key="$2"
+  model="${SUB2CLI_API_MODEL:-gpt-5.6-sol}"
+  codex_home="${CODEX_HOME:-${HOME}/.codex}"
+  auth_json="$codex_home/auth.json"
+  config_toml="$codex_home/config.toml"
+  backup_root="$codex_home/provider-switch-backups"
+  stamp="$(date +%Y%m%d-%H%M%S 2>/dev/null || date +%s 2>/dev/null || echo now)"
+
+  umask 077
+  mkdir -p "$codex_home" "$backup_root" || return 1
+  backup_dir="$(mktemp -d "$backup_root/install-api-direct-$stamp.XXXXXX")" || return 1
+  chmod 700 "$backup_dir" || return 1
+
+  if [ -e "$config_toml" ] || [ -L "$config_toml" ]; then
+    backup_file_or_die "$config_toml" "$backup_dir/config.toml" "config.toml" || return 1
+  fi
+  if [ -e "$auth_json" ] || [ -L "$auth_json" ]; then
+    backup_file_or_die "$auth_json" "$backup_dir/auth.json" "auth.json" || return 1
+  fi
+
+  echo "  mode: direct API (no proxy, no pool)"
+  echo "  protocol: responses"
+
+  if auth_looks_like_chatgpt "$auth_json"; then
+    echo "  identity: keep existing ChatGPT/OpenAI login"
+  else
+    echo "  identity: write API-key auth (no official login found)"
+    api_key_json="$(escape_json_string "$api_key")"
+    {
+      printf '{\n'
+      printf '  "OPENAI_API_KEY": "%s",\n' "$api_key_json"
+      printf '  "auth_mode": "apikey"\n'
+      printf '}\n'
+    } > "$auth_json"
+    chmod 600 "$auth_json" || return 1
+    echo "  已写入: $auth_json"
+  fi
+
+  patch_config_direct_api "$config_toml" "$api_url" "$api_key" "$model" || return 1
+  echo "  备份目录: $backup_dir"
+  restart_codex_if_needed
+}
+
 bootstrap_codex_api() {
   raw_url="${SUB2CLI_API_URL:-}"
   [ -n "$raw_url" ] || return 0
@@ -559,13 +692,32 @@ bootstrap_codex_api() {
   fi
 
   echo ""
-  echo "ChatGPT API 一键配置:"
+  echo "ChatGPT API 一键配置（直达 URL，不走连接池 / 本地代理）:"
   echo "  url: $api_url"
-  # Fresh-machine URL + key setup must have one deterministic auth shape.
-  # Advanced saved-provider and route-pool workflows remain available through
-  # explicit sub2cli-inject commands after installation.
-  echo "  mode: direct ~/.codex config"
-  write_direct_codex_api_config "$api_url" "$api_key"
+
+  # Optional: force the fresh-profile writer even on non-empty homes (tests).
+  if is_truthy "${SUB2CLI_FORCE_DIRECT_CONFIG:-}"; then
+    echo "  mode: direct ~/.codex config (forced fresh writer)"
+    write_direct_codex_api_config "$api_url" "$api_key"
+    return $?
+  fi
+
+  codex_home="${CODEX_HOME:-${HOME}/.codex}"
+  config_toml="$codex_home/config.toml"
+  auth_json="$codex_home/auth.json"
+  slots_json="$codex_home/provider-slots.json"
+
+  # Brand-new profile: empty home → pure API-key + direct base_url.
+  if [ ! -e "$config_toml" ] && [ ! -L "$config_toml" ] && \
+     [ ! -e "$auth_json" ] && [ ! -L "$auth_json" ] && \
+     [ ! -e "$slots_json" ] && [ ! -L "$slots_json" ]; then
+    echo "  mode: direct ~/.codex config (fresh profile)"
+    write_direct_codex_api_config "$api_url" "$api_key"
+    return $?
+  fi
+
+  # Logged-in users and anyone with existing Codex files: still direct URL+key.
+  bootstrap_existing_direct_api "$api_url" "$api_key"
 }
 
 rc=0
