@@ -112,13 +112,13 @@ URLs. The only per-relay inputs are `SUB2CLI_API_URL` and `SUB2CLI_API_KEY`.
 Babata Relay on macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh | SUB2CLI_API_URL='https://sub2api.babata.icu' SUB2CLI_API_KEY='sk-REPLACE_ME' sh
+curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh | SUB2CLI_API_URL='https://relay.example' SUB2CLI_API_KEY='sk-REPLACE_ME' sh
 ```
 
 Babata Relay on Windows PowerShell:
 
 ```powershell
-$env:SUB2CLI_API_URL='https://sub2api.babata.icu'; $env:SUB2CLI_API_KEY='sk-REPLACE_ME'; try { & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.ps1'))) } finally { Remove-Item -Path Env:SUB2CLI_API_URL,Env:SUB2CLI_API_KEY -ErrorAction SilentlyContinue }
+$env:SUB2CLI_API_URL='https://relay.example'; $env:SUB2CLI_API_KEY='sk-REPLACE_ME'; try { & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.ps1'))) } finally { Remove-Item -Path Env:SUB2CLI_API_URL,Env:SUB2CLI_API_KEY -ErrorAction SilentlyContinue }
 ```
 
 This contract means:

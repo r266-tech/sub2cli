@@ -1,8 +1,0 @@
-#!/usr/bin/env python3
-"""Private read-only Sub2API release audit entrypoint."""
-
-from sub2api_release_audit.cli import main
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

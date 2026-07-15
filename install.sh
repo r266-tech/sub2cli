@@ -9,7 +9,7 @@
 #
 # One-command direct API setup (NOT connection pool, NOT local 127.0.0.1 proxy):
 #   curl -fsSL https://raw.githubusercontent.com/r266-tech/sub2cli/main/install.sh \
-#     | SUB2CLI_API_URL='https://sub2api.babata.icu' SUB2CLI_API_KEY='sk-...' sh
+#     | SUB2CLI_API_URL='https://relay.example' SUB2CLI_API_KEY='sk-...' sh
 # - Already logged in to OpenAI/ChatGPT → keep login; model base_url = URL + key
 # - Not logged in → write API-key auth; model base_url = URL + key
 # In both cases Codex talks directly to the URL (wire_api=responses).

@@ -74,14 +74,14 @@ class RecentSlotsHelpersTests(unittest.TestCase):
             {
                 "mode": "relay",
                 "display_name": "Codex - babata",
-                "base_url": "https://sub2api.babata.icu/v1",
+                "base_url": "https://relay.example/v1",
                 "protocol": "responses",
             },
             current="babata",
         )
         self.assertTrue(label.startswith("*"))
         self.assertIn("babata", label)
-        self.assertIn("sub2api.babata.icu", label)
+        self.assertIn("relay.example", label)
 
     def test_cmd_menu_options_exclude_status(self):
         """Main menu must not expose redundant '当前状态'."""

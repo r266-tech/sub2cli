@@ -1,8 +1,0 @@
-#!/usr/bin/env python3
-"""Private ops entrypoint for deterministic upstream-key reconciliation."""
-
-from upstream_reconciler.cli import main
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
