@@ -1,194 +1,63 @@
-name: Windows bootstrap
+name: Retired repository guard
 
 on:
-  push:
-    paths:
-      - install.ps1
-      - README.md
-      - tests/test_install_bootstrap.py
-      - .github/workflows/windows-bootstrap.yml
-  pull_request:
-    paths:
-      - install.ps1
-      - README.md
-      - tests/test_install_bootstrap.py
-      - .github/workflows/windows-bootstrap.yml
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  fresh-profile:
+  shell-tombstones:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify fail-closed shell entry points
+        shell: bash
+        run: |
+          set -u
+          probe_home="$RUNNER_TEMP/sub2cli-eol-home"
+          mkdir -p "$probe_home"
+          for entry in ./install.sh ./desktop/build.sh; do
+            set +e
+            output=$(HOME="$probe_home" SUB2CLI_INSTALL_DIR="$probe_home/bin" sh "$entry" 2>&1)
+            status=$?
+            set -e
+            test "$status" -eq 64
+            grep -F 'sub2cli is retired' <<<"$output"
+          done
+          test -z "$(find "$probe_home" -mindepth 1 -print -quit)"
+
+      - name: Verify fail-closed Python entry points
+        shell: bash
+        run: |
+          for entry in ./sub2cli ./sub2cli-inject ./desktop/main.py; do
+            set +e
+            output=$(python3 "$entry" 2>&1)
+            status=$?
+            set -e
+            test "$status" -eq 64
+            grep -F 'sub2cli is retired' <<<"$output"
+          done
+
+  powershell-tombstone:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Configure an isolated fresh profile
+      - name: Verify fail-closed PowerShell installer
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP 'codex-fresh'
-          New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null
-          $oldAuth = '{"old":"keep-for-rollback"}' + "`n"
-          [IO.File]::WriteAllText(
-            (Join-Path $env:CODEX_HOME 'auth.json'),
-            $oldAuth,
-            [Text.UTF8Encoding]::new($false)
-          )
-          $env:SUB2CLI_API_URL = 'https://relay.example.test'
-          $env:SUB2CLI_API_KEY = 'sk-ci-placeholder'
-          $env:SUB2CLI_API_NO_RESTART = '1'
-
-          & ./install.ps1
-
-          $auth = Get-Content (Join-Path $env:CODEX_HOME 'auth.json') -Raw | ConvertFrom-Json
-          if ($auth.OPENAI_API_KEY -ne 'sk-ci-placeholder' -or $auth.auth_mode -ne 'apikey') {
-            throw 'auth.json does not contain the expected direct API-key mode'
-          }
-          $config = Get-Content (Join-Path $env:CODEX_HOME 'config.toml') -Raw
-          if ($config -notmatch 'model_provider = "sub2api"' -or
-              $config -notmatch 'openai_base_url = "https://relay\.example\.test/v1"' -or
-              $config -notmatch '\[model_providers\.sub2api\]' -or
-              $config -notmatch 'base_url = "https://relay\.example\.test/v1"' -or
-              $config -notmatch 'requires_openai_auth = true' -or
-              $config -notmatch 'supports_websockets = false') {
-            throw 'config.toml does not contain the expected relay settings'
-          }
-          $backupAuth = Get-ChildItem (
-            Join-Path $env:CODEX_HOME 'provider-switch-backups/*/auth.json'
-          )
-          if (@($backupAuth).Count -ne 1 -or [IO.File]::ReadAllText($backupAuth[0].FullName) -ne $oldAuth) {
-            throw 'existing auth.json was not preserved in the rollback backup'
-          }
-          if (Get-ChildItem $env:CODEX_HOME -File -Force | Where-Object {
-              $_.Name -match '\.(stage|original|rollback)$'
-          }) {
-            throw 'transaction temporary files remained after fresh bootstrap'
-          }
-
-      - name: Merge an existing desktop profile
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP 'codex-existing'
-          New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null
-          $sentinel = "[mcp_servers.example]`ncommand = 'keep-me'`n"
-          $configPath = Join-Path $env:CODEX_HOME 'config.toml'
-          [IO.File]::WriteAllText($configPath, $sentinel, [Text.UTF8Encoding]::new($false))
-          $env:SUB2CLI_API_URL = 'https://relay.example.test'
-          $env:SUB2CLI_API_KEY = 'sk-ci-placeholder'
-          $env:SUB2CLI_API_NO_RESTART = '1'
-
-          & ./install.ps1
-
-          $config = [IO.File]::ReadAllText($configPath)
-          if ($config -notmatch '(?ms)\[mcp_servers\.example\].*command = ''keep-me''' -or
-              $config -notmatch 'model_provider = "sub2api"' -or
-              $config -notmatch 'supports_websockets = false') {
-            throw 'existing desktop config was not preserved and merged'
-          }
-          $backupConfig = Get-ChildItem (
-            Join-Path $env:CODEX_HOME 'provider-switch-backups/*/config.toml'
-          )
-          if (@($backupConfig).Count -ne 1 -or
-              [IO.File]::ReadAllText($backupConfig[0].FullName) -ne $sentinel) {
-            throw 'existing config.toml was not preserved in the rollback backup'
-          }
-
-      - name: Run Windows transaction and race tests
-        shell: pwsh
-        run: python tests/test_install_bootstrap.py -v -k windows
-
-      - name: Configure a fresh profile with inbox Windows PowerShell 5.1
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if ($PSVersionTable.PSVersion.Major -ne 5) {
-            throw "expected Windows PowerShell 5.1, got $($PSVersionTable.PSVersion)"
-          }
-          $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP 'codex-windows-powershell-51'
-          $env:SUB2CLI_API_URL = 'https://relay.example.test'
-          $env:SUB2CLI_API_KEY = 'sk-ci-placeholder'
-          $env:SUB2CLI_API_NO_RESTART = '1'
+          $probeHome = Join-Path $env:RUNNER_TEMP 'sub2cli-eol-home'
+          $env:CODEX_HOME = $probeHome
+          $caught = $null
           try {
-            & ([scriptblock]::Create([IO.File]::ReadAllText((Resolve-Path './install.ps1').Path)))
-          }
-          finally {
-            Remove-Item -Path Env:SUB2CLI_API_URL,Env:SUB2CLI_API_KEY -ErrorAction SilentlyContinue
-          }
-          $auth = Get-Content (Join-Path $env:CODEX_HOME 'auth.json') -Raw | ConvertFrom-Json
-          if ($auth.OPENAI_API_KEY -ne 'sk-ci-placeholder' -or $auth.auth_mode -ne 'apikey') {
-            throw 'Windows PowerShell 5.1 auth.json verification failed'
-          }
-          $config = Get-Content (Join-Path $env:CODEX_HOME 'config.toml') -Raw
-          if ($config -notmatch 'model_provider = "sub2api"' -or
-              $config -notmatch 'openai_base_url = "https://relay\.example\.test/v1"' -or
-              $config -notmatch 'supports_websockets = false') {
-            throw 'Windows PowerShell 5.1 config.toml verification failed'
-          }
-          if (Test-Path Env:SUB2CLI_API_KEY) { throw 'PowerShell 5.1 key env remained' }
-          if (Get-Command Test-Truthy -ErrorAction SilentlyContinue) {
-            throw 'PowerShell 5.1 installer function leaked into caller scope'
-          }
-          $null = $sub2cliUndefinedAfterWindowsPowerShell51
-
-      - name: Exercise the documented one-line wrapper
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP 'codex-wrapper'
-          $env:SUB2CLI_API_URL = 'https://relay.example.test'
-          $env:SUB2CLI_API_KEY = 'sk-ci-placeholder'
-          $env:SUB2CLI_API_NO_RESTART = '1'
-          $installerUri = 'https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install.ps1'
-          try {
-            & ([scriptblock]::Create((Invoke-RestMethod $installerUri)))
-          }
-          finally {
-            Remove-Item -Path Env:SUB2CLI_API_URL,Env:SUB2CLI_API_KEY -ErrorAction SilentlyContinue
-          }
-          if (Test-Path Env:SUB2CLI_API_URL) { throw 'URL remained in the process environment' }
-          if (Test-Path Env:SUB2CLI_API_KEY) { throw 'API key remained in the process environment' }
-          if (Get-Command Test-Truthy -ErrorAction SilentlyContinue) {
-            throw 'installer function leaked into the caller scope'
-          }
-          if (Get-Variable ApiKey -ErrorAction SilentlyContinue) {
-            throw 'installer plaintext variable leaked into the caller scope'
-          }
-          $null = $sub2cliUndefinedAfterSuccessfulWrapper
-
-      - name: Keep caller alive and clean after wrapper failure
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP 'codex-wrapper-failure'
-          New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null
-          [IO.File]::WriteAllText(
-            (Join-Path $env:CODEX_HOME 'config.toml'),
-            "model_provider = 'other'`n",
-            [Text.UTF8Encoding]::new($false)
-          )
-          $env:SUB2CLI_API_URL = 'https://relay.example.test'
-          $env:SUB2CLI_API_KEY = 'sk-ci-placeholder'
-          $env:SUB2CLI_API_NO_RESTART = '1'
-          $caught = $false
-          try {
-            & ([scriptblock]::Create([IO.File]::ReadAllText((Resolve-Path './install.ps1').Path)))
+            & ./install.ps1
           }
           catch {
-            $caught = $true
+            $caught = $_.Exception.Message
           }
-          finally {
-            Remove-Item -Path Env:SUB2CLI_API_URL,Env:SUB2CLI_API_KEY -ErrorAction SilentlyContinue
+          if ($caught -notmatch 'sub2cli is retired') {
+            throw "unexpected installer result: $caught"
           }
-          if (-not $caught) { throw 'failing wrapper did not propagate an error' }
-          if (Test-Path Env:SUB2CLI_API_URL) { throw 'URL remained after failed wrapper' }
-          if (Test-Path Env:SUB2CLI_API_KEY) { throw 'API key remained after failed wrapper' }
-          if (Get-Command Test-Truthy -ErrorAction SilentlyContinue) {
-            throw 'installer function leaked after failed wrapper'
+          if (Test-Path $probeHome) {
+            throw 'retired installer created profile state'
           }
-          if (Get-Variable ApiKey -ErrorAction SilentlyContinue) {
-            throw 'installer plaintext variable leaked after failed wrapper'
-          }
-          $null = $sub2cliUndefinedAfterFailedWrapper
-          Write-Host 'caller remained alive after failed installer'
